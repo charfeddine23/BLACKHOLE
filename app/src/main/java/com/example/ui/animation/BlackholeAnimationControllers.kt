@@ -65,7 +65,7 @@ fun rememberBlackholeAnimationController(
 
     val waveDuration = when (phase) {
         DownloadPhase.ABSORBING -> 1400
-        DownloadPhase.DOWNLOADING -> 1900
+        DownloadPhase.DOWNLOADING, DownloadPhase.MERGING -> 1900
         DownloadPhase.CLIPBOARD_ARMED -> 2600
         else -> 3400
     }
@@ -111,7 +111,7 @@ fun rememberBlackholeAnimationController(
     }
 
     val orbitDuration = when (phase) {
-        DownloadPhase.ABSORBING -> 2200
+        DownloadPhase.ABSORBING, DownloadPhase.MERGING -> 2200
         DownloadPhase.DOWNLOADING -> 3800
         else -> 8000
     }

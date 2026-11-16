@@ -1,12 +1,14 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.BlackholeDatabase
 import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
 import com.example.engine.clipboard.ClipboardDetector
+import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.DownloadPhase
 import com.example.engine.model.DownloadTelemetry
 import com.example.engine.model.PlatformBadge
@@ -14,13 +16,14 @@ import com.example.engine.service.DownloadStateCoordinator
 import com.example.engine.updater.AppUpdateManager
 import com.example.engine.updater.UpdateCheckState
 import com.example.service.BlackholeDownloadService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class BlackholeUiState(
     val inputUrl: String = "",
@@ -30,12 +33,17 @@ data class BlackholeUiState(
     val clipboardFeedback: String? = null,
     val updateState: UpdateCheckState = UpdateCheckState.Idle,
     val showUpdateDialog: Boolean = false,
+    val syncedDomains: List<String> = emptyList(),
+    val showCookieVault: Boolean = false,
+    val authWebViewUrl: String? = null,
+    val cookieStatusMessage: String? = null,
 )
 
 class BlackholeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
     private val clipboardDetector = ClipboardDetector(context)
+    private val cookieVault = CookieVaultManager.getInstance(context)
     private val appUpdateManager = AppUpdateManager()
     private val repository = VideoVaultRepository(
         context = context,
@@ -46,6 +54,9 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _clipboardFeedback = MutableStateFlow<String?>(null)
     private val _updateState = MutableStateFlow<UpdateCheckState>(UpdateCheckState.Idle)
     private val _showUpdateDialog = MutableStateFlow(false)
+    private val _showCookieVault = MutableStateFlow(false)
+    private val _authWebViewUrl = MutableStateFlow<String?>(null)
+    private val _cookieStatusMessage = MutableStateFlow<String?>(null)
 
     val videos: StateFlow<List<DownloadedVideoEntity>> = repository.allVideos
         .stateIn(
@@ -69,14 +80,28 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
-    val uiState: StateFlow<BlackholeUiState> = combine(
-        baseStateFlow,
+    private val metaStateFlow = combine(
         _updateState,
         _showUpdateDialog,
-    ) { base, update, showDialog ->
+        cookieVault.syncedDomains,
+        _showCookieVault,
+        _authWebViewUrl,
+    ) { update, showUpdate, domains, showCookies, authUrl ->
+        Triple(update to showUpdate, domains, showCookies to authUrl)
+    }
+
+    val uiState: StateFlow<BlackholeUiState> = combine(
+        baseStateFlow,
+        metaStateFlow,
+        _cookieStatusMessage,
+    ) { base, meta, cookieMsg ->
         base.copy(
-            updateState = update,
-            showUpdateDialog = showDialog,
+            updateState = meta.first.first,
+            showUpdateDialog = meta.first.second,
+            syncedDomains = meta.second,
+            showCookieVault = meta.third.first,
+            authWebViewUrl = meta.third.second,
+            cookieStatusMessage = cookieMsg,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -96,18 +121,9 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             val result = appUpdateManager.checkLatestRelease()
             _updateState.value = result
             when (result) {
-                is UpdateCheckState.UpdateAvailable -> {
-                    _showUpdateDialog.value = true
-                }
-                is UpdateCheckState.UpToDate -> {
-                    if (!silent) {
-                        _showUpdateDialog.value = true
-                    }
-                }
-                is UpdateCheckState.Error -> {
-                    if (!silent) {
-                        _showUpdateDialog.value = true
-                    }
+                is UpdateCheckState.UpdateAvailable -> _showUpdateDialog.value = true
+                is UpdateCheckState.UpToDate, is UpdateCheckState.Error -> {
+                    if (!silent) _showUpdateDialog.value = true
                 }
                 else -> Unit
             }
@@ -127,9 +143,66 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         _showUpdateDialog.value = false
     }
 
+    fun openCookieVault(authUrl: String? = null) {
+        _cookieStatusMessage.value = null
+        _authWebViewUrl.value = authUrl
+        _showCookieVault.value = true
+    }
+
+    fun dismissCookieVault() {
+        _showCookieVault.value = false
+        _authWebViewUrl.value = null
+    }
+
+    fun importCookiesFromUri(uri: Uri) {
+        viewModelScope.launch {
+            val importedCount = withContext(Dispatchers.IO) {
+                val content = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use {
+                    it.readText()
+                }.orEmpty()
+                cookieVault.importNetscapeCookiesTxt(content)
+            }
+            _cookieStatusMessage.value = if (importedCount > 0) {
+                "Imported $importedCount session cookies cleanly."
+            } else {
+                "No valid Netscape/JSON cookies found in selected file."
+            }
+        }
+    }
+
+    fun syncWebViewSession(url: String, retriggerPull: Boolean) {
+        viewModelScope.launch {
+            val count = cookieVault.syncFromWebView(url)
+            _cookieStatusMessage.value = if (count > 0) {
+                "Synced $count cookies from active WebView session."
+            } else {
+                "Session synced."
+            }
+            _showCookieVault.value = false
+            val targetToPull = _authWebViewUrl.value ?: _inputUrl.value
+            _authWebViewUrl.value = null
+            if (retriggerPull && targetToPull.isNotBlank()) {
+                _inputUrl.value = targetToPull
+                val platform = PlatformBadge.fromUrl(targetToPull)
+                DownloadStateCoordinator.setAbsorbing(targetToPull, platform)
+                BlackholeDownloadService.startGravityPull(context, targetToPull)
+            }
+        }
+    }
+
+    fun clearAllCookies() {
+        viewModelScope.launch {
+            cookieVault.clearAllCookies()
+            _cookieStatusMessage.value = "All stored session cookies cleared."
+        }
+    }
+
     fun refreshClipboardOnLaunch() {
         val currentPhase = DownloadStateCoordinator.telemetry.value.phase
-        if (currentPhase == DownloadPhase.ABSORBING || currentPhase == DownloadPhase.DOWNLOADING) {
+        if (currentPhase == DownloadPhase.ABSORBING ||
+            currentPhase == DownloadPhase.DOWNLOADING ||
+            currentPhase == DownloadPhase.MERGING
+        ) {
             return
         }
         val detected = clipboardDetector.readClipboardUrl()
@@ -138,47 +211,17 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             DownloadStateCoordinator.armClipboardUrl(detected.url, detected.platform)
             _clipboardFeedback.value = null
         }
-    }
-
-    fun pasteFromClipboard() {
-        val detected = clipboardDetector.readClipboardUrl()
-        if (detected != null) {
-            _inputUrl.value = detected.url
-            DownloadStateCoordinator.armClipboardUrl(detected.url, detected.platform)
-            _clipboardFeedback.value = null
-        } else {
-            _clipboardFeedback.value = "No valid video URL found on clipboard"
-        }
-    }
-
-    fun onUrlEdited(newUrl: String) {
-        _inputUrl.value = newUrl
-        _clipboardFeedback.value = null
-        val trimmed = newUrl.trim()
-        if (clipboardDetector.isSupportedVideoCandidate(trimmed)) {
-            DownloadStateCoordinator.armClipboardUrl(trimmed, PlatformBadge.fromUrl(trimmed))
-        } else {
-            DownloadStateCoordinator.armClipboardUrl("", PlatformBadge.WEB_MEDIA)
-        }
-    }
-
-    fun clearUrl() {
-        _inputUrl.value = ""
-        _clipboardFeedback.value = null
-        DownloadStateCoordinator.resetToArmedOrIdle("", PlatformBadge.WEB_MEDIA)
-    }
-
-    fun dismissFeedback() {
-        _clipboardFeedback.value = null
     }
 
     fun triggerGravityPull() {
         val activePhase = DownloadStateCoordinator.telemetry.value.phase
-        if (activePhase == DownloadPhase.ABSORBING || activePhase == DownloadPhase.DOWNLOADING) {
+        if (activePhase == DownloadPhase.ABSORBING ||
+            activePhase == DownloadPhase.DOWNLOADING ||
+            activePhase == DownloadPhase.MERGING
+        ) {
             return
         }
 
-        // Read fresh clipboard link directly on tap (falling back to any armed URL)
         val candidateRaw = clipboardDetector.readClipboardUrl()?.url
             ?: _inputUrl.value.trim()
         val validUrl = clipboardDetector.extractFirstValidUrl(candidateRaw)

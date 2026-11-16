@@ -23,29 +23,41 @@ import com.example.R
 import com.example.data.local.BlackholeDatabase
 import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
+import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.extractor.VideoStreamExtractor
+import com.example.engine.extractor.WebViewStreamSniffer
+import com.example.engine.media.HlsSegmentDownloader
+import com.example.engine.media.LocalMediaMuxer
 import com.example.engine.model.ExtractedStream
 import com.example.engine.model.ExtractionResult
 import com.example.engine.model.PlatformBadge
+import com.example.engine.network.ClientSpoofer
 import com.example.engine.service.DownloadStateCoordinator
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 class BlackholeDownloadService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val okHttpClient: OkHttpClient by lazy { VideoStreamExtractor.defaultOkHttpClient() }
-    private val extractor: VideoStreamExtractor by lazy { VideoStreamExtractor(okHttpClient) }
+    private val cookieVault: CookieVaultManager by lazy { CookieVaultManager.getInstance(applicationContext) }
+    private val okHttpClient: OkHttpClient by lazy { VideoStreamExtractor.createWithVault(cookieVault) }
+    private val sniffer: WebViewStreamSniffer by lazy { WebViewStreamSniffer(applicationContext, cookieVault) }
+    private val extractor: VideoStreamExtractor by lazy { VideoStreamExtractor(okHttpClient, sniffer) }
+    private val hlsDownloader: HlsSegmentDownloader by lazy { HlsSegmentDownloader(okHttpClient) }
     private val repository: VideoVaultRepository by lazy {
         val db = BlackholeDatabase.getInstance(applicationContext)
         VideoVaultRepository(applicationContext, db.downloadedVideoDao())
@@ -82,7 +94,7 @@ class BlackholeDownloadService : Service() {
                 startForegroundWithNotification(
                     buildNotification(
                         title = "Blackhole Core Active",
-                        text = "Absorbing stream metadata...",
+                        text = "Running multi-strategy extraction...",
                         progress = 0,
                         indeterminate = true,
                     ),
@@ -100,14 +112,18 @@ class BlackholeDownloadService : Service() {
         DownloadStateCoordinator.setAbsorbing(sourceUrl, platform)
         try {
             when (val extraction = extractor.extractHighestQuality(sourceUrl)) {
+                is ExtractionResult.NeedsAuth -> {
+                    DownloadStateCoordinator.setNeedsAuth(sourceUrl, platform, extraction.reason)
+                    postTerminalNotification("Session Required", extraction.reason)
+                }
+
                 is ExtractionResult.Error -> {
                     DownloadStateCoordinator.setError(sourceUrl, platform, extraction.message)
                     postTerminalNotification("Blackhole Extraction Failed", extraction.message)
                 }
 
                 is ExtractionResult.Success -> {
-                    val stream = extraction.bestStream
-                    streamAndSaveVideo(sourceUrl, stream)
+                    streamAndSaveVideo(sourceUrl, extraction.bestStream)
                 }
             }
         } catch (_: CancellationException) {
@@ -126,158 +142,352 @@ class BlackholeDownloadService : Service() {
     }
 
     private suspend fun streamAndSaveVideo(sourceUrl: String, stream: ExtractedStream) {
-        val requestBuilder = Request.Builder()
-            .url(stream.streamUrl)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        val extension = if (stream.isHls) "mp4" else extensionForMime(stream.mimeType)
+        val safeFileBase = stream.title
+            .replace(Regex("""[^A-Za-z0-9_\-]"""), "_")
+            .trim('_')
+            .take(40)
+            .ifBlank { "Blackhole" }
+        val fileName = "${safeFileBase}_${System.currentTimeMillis()}.$extension"
+
+        val vaultDir = File(filesDir, "blackhole_videos").apply { mkdirs() }
+        val localFile = File(vaultDir, fileName)
+        val mergedHeaders = ClientSpoofer.buildHeadersForUrl(
+            targetUrl = stream.streamUrl,
+            profile = ClientSpoofer.profiles.first(),
+        ) + stream.headers
+
+        val succeeded = when {
+            stream.isHls -> {
+                downloadHlsStream(sourceUrl, stream, mergedHeaders, localFile)
+            }
+
+            !stream.audioStreamUrl.isNullOrBlank() -> {
+                downloadAndMuxSplitStreams(
+                    sourceUrl = sourceUrl,
+                    stream = stream,
+                    audioUrl = stream.audioStreamUrl,
+                    headers = mergedHeaders,
+                    outputFile = localFile,
+                )
+            }
+
+            else -> {
+                downloadProgressiveStream(
+                    sourceUrl = sourceUrl,
+                    stream = stream,
+                    streamUrl = stream.streamUrl,
+                    headers = mergedHeaders,
+                    outputFile = localFile,
+                )
+            }
+        }
+
+        if (!succeeded || !localFile.exists() || localFile.length() <= 0L) {
+            localFile.delete()
+            if (DownloadStateCoordinator.telemetry.value.phase !=
+                com.example.engine.model.DownloadPhase.ERROR
+            ) {
+                DownloadStateCoordinator.setError(
+                    sourceUrl,
+                    stream.platform,
+                    "Stream yielded 0 bytes or was rejected by upstream server.",
+                )
+            }
+            return
+        }
+
+        val exportedUri = exportToMediaStoreIfSupported(localFile, fileName, stream.mimeType)
+        val contentUri = exportedUri ?: FileProvider.getUriForFile(
+            applicationContext,
+            "${packageName}.fileprovider",
+            localFile,
+        )
+
+        val metadata = extractLocalVideoMetadata(localFile, stream.qualityLabel)
+        val entity = DownloadedVideoEntity(
+            title = stream.title,
+            sourceUrl = sourceUrl,
+            streamUrl = stream.streamUrl,
+            platform = stream.platform.label,
+            qualityLabel = stream.qualityLabel,
+            resolution = metadata.resolution,
+            mimeType = "video/mp4",
+            fileSizeBytes = localFile.length(),
+            durationMs = metadata.durationMs,
+            contentUri = contentUri.toString(),
+            filePath = localFile.absolutePath,
+            thumbnailPath = metadata.thumbnailPath,
+        )
+        val insertedId = repository.insertVideo(entity)
+
+        DownloadStateCoordinator.setCompleted(
+            sourceUrl = sourceUrl,
+            title = stream.title,
+            platform = stream.platform,
+            qualityLabel = stream.qualityLabel,
+            totalBytes = localFile.length(),
+            videoId = insertedId,
+        )
+        postTerminalNotification(
+            title = "Captured in Vault",
+            text = "${stream.title} (${stream.qualityLabel})",
+        )
+    }
+
+    private suspend fun downloadHlsStream(
+        sourceUrl: String,
+        stream: ExtractedStream,
+        headers: Map<String, String>,
+        outputFile: File,
+    ): Boolean {
+        var lastNotificationTick = 0L
+        return hlsDownloader.downloadHlsToFile(
+            playlistUrl = stream.streamUrl,
+            headers = headers,
+            outputFile = outputFile,
+            isCancelled = { DownloadStateCoordinator.cancelRequested },
+            onProgress = { downloaded, estimatedTotal, speed ->
+                val eta = if (estimatedTotal > downloaded && speed > 0L) {
+                    (estimatedTotal - downloaded) / speed
+                } else {
+                    -1L
+                }
+                DownloadStateCoordinator.updateDownloading(
+                    sourceUrl = sourceUrl,
+                    title = stream.title,
+                    platform = stream.platform,
+                    qualityLabel = stream.qualityLabel,
+                    bytesDownloaded = downloaded,
+                    totalBytes = estimatedTotal,
+                    speedBytesPerSec = speed,
+                    etaSeconds = eta,
+                )
+                val now = System.currentTimeMillis()
+                if (now - lastNotificationTick >= 700L) {
+                    val pct = if (estimatedTotal > 0L) {
+                        ((downloaded * 100L) / estimatedTotal).toInt().coerceIn(0, 100)
+                    } else {
+                        0
+                    }
+                    updateProgressNotification(
+                        title = stream.title,
+                        text = buildNotificationTelemetryLine(stream.qualityLabel, pct, speed, eta, downloaded),
+                        progress = pct,
+                        indeterminate = estimatedTotal <= 0L,
+                    )
+                    lastNotificationTick = now
+                }
+            },
+        )
+    }
+
+    private suspend fun downloadAndMuxSplitStreams(
+        sourceUrl: String,
+        stream: ExtractedStream,
+        audioUrl: String,
+        headers: Map<String, String>,
+        outputFile: File,
+    ): Boolean = coroutineScope {
+        val tempDir = File(cacheDir, "mux_staging").apply { mkdirs() }
+        val videoTemp = File(tempDir, "video_${System.currentTimeMillis()}.mp4")
+        val audioTemp = File(tempDir, "audio_${System.currentTimeMillis()}.mp4")
+
+        val videoBytes = AtomicLong(0L)
+        val audioBytes = AtomicLong(0L)
+        val videoTotal = AtomicLong(0L)
+        val audioTotal = AtomicLong(0L)
+        val lastUiTick = AtomicLong(System.currentTimeMillis())
+        val lastTickBytes = AtomicLong(0L)
+        val lastNotifTick = AtomicLong(0L)
+
+        fun reportCombinedProgress() {
+            val now = System.currentTimeMillis()
+            val prevTick = lastUiTick.get()
+            val elapsed = now - prevTick
+            if (elapsed >= 220L && lastUiTick.compareAndSet(prevTick, now)) {
+                val downloaded = videoBytes.get() + audioBytes.get()
+                val total = (videoTotal.get() + audioTotal.get()).takeIf { it > 0L } ?: -1L
+                val prevBytes = lastTickBytes.getAndSet(downloaded)
+                val speed = if (elapsed > 0L) ((downloaded - prevBytes) * 1000L) / elapsed else 0L
+                val eta = if (total > downloaded && speed > 0L) (total - downloaded) / speed else -1L
+
+                DownloadStateCoordinator.updateDownloading(
+                    sourceUrl = sourceUrl,
+                    title = stream.title,
+                    platform = stream.platform,
+                    qualityLabel = stream.qualityLabel,
+                    bytesDownloaded = downloaded,
+                    totalBytes = total,
+                    speedBytesPerSec = speed,
+                    etaSeconds = eta,
+                )
+
+                val prevNotif = lastNotifTick.get()
+                if (now - prevNotif >= 700L && lastNotifTick.compareAndSet(prevNotif, now)) {
+                    val pct = if (total > 0L) ((downloaded * 100L) / total).toInt().coerceIn(0, 100) else 0
+                    updateProgressNotification(
+                        title = stream.title,
+                        text = buildNotificationTelemetryLine(stream.qualityLabel, pct, speed, eta, downloaded),
+                        progress = pct,
+                        indeterminate = total <= 0L,
+                    )
+                }
+            }
+        }
+
+        try {
+            val videoDeferred = async(Dispatchers.IO) {
+                streamToFile(stream.streamUrl, headers, videoTemp) { read, total ->
+                    videoBytes.set(read)
+                    if (total > 0L) videoTotal.set(total)
+                    reportCombinedProgress()
+                }
+            }
+            val audioDeferred = async(Dispatchers.IO) {
+                streamToFile(audioUrl, headers, audioTemp) { read, total ->
+                    audioBytes.set(read)
+                    if (total > 0L) audioTotal.set(total)
+                    reportCombinedProgress()
+                }
+            }
+
+            val videoOk = videoDeferred.await()
+            val audioOk = audioDeferred.await()
+            if (!videoOk) return@coroutineScope false
+
+            if (!audioOk || !audioTemp.exists() || audioTemp.length() <= 0L) {
+                videoTemp.copyTo(outputFile, overwrite = true)
+                return@coroutineScope true
+            }
+
+            DownloadStateCoordinator.setMerging(
+                sourceUrl = sourceUrl,
+                title = stream.title,
+                platform = stream.platform,
+                qualityLabel = stream.qualityLabel,
+                totalBytes = videoTemp.length() + audioTemp.length(),
             )
-        stream.headers.forEach { (k, v) -> requestBuilder.header(k, v) }
+            updateProgressNotification(
+                title = stream.title,
+                text = "Merging ${stream.qualityLabel} video + audio...",
+                progress = 96,
+                indeterminate = true,
+            )
 
-        val call = okHttpClient.newCall(requestBuilder.build())
-        call.execute().use { response ->
-            if (!response.isSuccessful) {
-                DownloadStateCoordinator.setError(
-                    sourceUrl,
-                    stream.platform,
-                    "Upstream media server returned HTTP ${response.code}",
-                )
-                return
+            val muxed = LocalMediaMuxer.mergeVideoAndAudio(videoTemp, audioTemp, outputFile)
+            if (!muxed) {
+                videoTemp.copyTo(outputFile, overwrite = true)
             }
-            val body = response.body ?: run {
-                DownloadStateCoordinator.setError(
-                    sourceUrl,
-                    stream.platform,
-                    "Empty response stream from server",
+            outputFile.exists() && outputFile.length() > 0L
+        } finally {
+            runCatching { videoTemp.delete() }
+            runCatching { audioTemp.delete() }
+        }
+    }
+
+    private suspend fun downloadProgressiveStream(
+        sourceUrl: String,
+        stream: ExtractedStream,
+        streamUrl: String,
+        headers: Map<String, String>,
+        outputFile: File,
+    ): Boolean {
+        var lastUiTick = System.currentTimeMillis()
+        var lastTickBytes = 0L
+        var lastNotifTick = 0L
+
+        return streamToFile(streamUrl, headers, outputFile) { bytesDownloaded, reportedTotal ->
+            val totalBytes = reportedTotal.takeIf { it > 0L } ?: stream.estimatedBytes
+            val now = System.currentTimeMillis()
+            val elapsedMs = now - lastUiTick
+            if (elapsedMs >= 200L) {
+                val deltaBytes = bytesDownloaded - lastTickBytes
+                val speed = if (elapsedMs > 0) (deltaBytes * 1000L) / elapsedMs else 0L
+                val eta = if (totalBytes > 0 && speed > 0) {
+                    (totalBytes - bytesDownloaded).coerceAtLeast(0L) / speed
+                } else {
+                    -1L
+                }
+                DownloadStateCoordinator.updateDownloading(
+                    sourceUrl = sourceUrl,
+                    title = stream.title,
+                    platform = stream.platform,
+                    qualityLabel = stream.qualityLabel,
+                    bytesDownloaded = bytesDownloaded,
+                    totalBytes = totalBytes,
+                    speedBytesPerSec = speed,
+                    etaSeconds = eta,
                 )
-                return
+                lastUiTick = now
+                lastTickBytes = bytesDownloaded
+
+                if (now - lastNotifTick >= 700L) {
+                    val pct = if (totalBytes > 0) {
+                        ((bytesDownloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                    } else {
+                        0
+                    }
+                    updateProgressNotification(
+                        title = stream.title,
+                        text = buildNotificationTelemetryLine(stream.qualityLabel, pct, speed, eta, bytesDownloaded),
+                        progress = pct,
+                        indeterminate = totalBytes <= 0L,
+                    )
+                    lastNotifTick = now
+                }
             }
+        }
+    }
 
-            val totalBytes = body.contentLength().takeIf { it > 0L } ?: stream.estimatedBytes
-            val extension = extensionForMime(stream.mimeType)
-            val safeFileBase = stream.title
-                .replace(Regex("""[^A-Za-z0-9_\-]"""), "_")
-                .trim('_')
-                .take(40)
-                .ifBlank { "Blackhole" }
-            val fileName = "${safeFileBase}_${System.currentTimeMillis()}.$extension"
+    private fun streamToFile(
+        url: String,
+        headers: Map<String, String>,
+        destination: File,
+        onBytes: (downloaded: Long, contentLength: Long) -> Unit,
+    ): Boolean {
+        val requestBuilder = Request.Builder().url(url)
+        headers.forEach { (k, v) -> requestBuilder.header(k, v) }
 
-            // Always stage into app-private vault first for guaranteed MediaMetadataRetriever + FileProvider reliability,
-            // and mirror into public MediaStore Movies/Blackhole on Android 10+ (zero-permission).
-            val vaultDir = File(filesDir, "blackhole_videos").apply { mkdirs() }
-            val localFile = File(vaultDir, fileName)
-
+        return okHttpClient.newCall(requestBuilder.build()).execute().use { response ->
+            if (!response.isSuccessful) return@use false
+            val body = response.body ?: return@use false
+            val totalBytes = body.contentLength()
             var bytesDownloaded = 0L
-            var lastUiTick = System.currentTimeMillis()
-            var lastTickBytes = 0L
-            var lastNotificationTick = 0L
 
             body.byteStream().use { input ->
-                FileOutputStream(localFile).use { output ->
+                FileOutputStream(destination).use { output ->
                     val buffer = ByteArray(16 * 1024)
                     while (true) {
                         if (DownloadStateCoordinator.cancelRequested) {
-                            localFile.delete()
+                            destination.delete()
                             throw CancellationException("User cancelled pull")
                         }
                         val read = input.read(buffer)
                         if (read == -1) break
                         output.write(buffer, 0, read)
                         bytesDownloaded += read
-
-                        val now = System.currentTimeMillis()
-                        val elapsedMs = now - lastUiTick
-                        if (elapsedMs >= 200L) {
-                            val deltaBytes = bytesDownloaded - lastTickBytes
-                            val speed = if (elapsedMs > 0) (deltaBytes * 1000L) / elapsedMs else 0L
-                            val eta = if (totalBytes > 0 && speed > 0) {
-                                (totalBytes - bytesDownloaded).coerceAtLeast(0L) / speed
-                            } else {
-                                -1L
-                            }
-                            DownloadStateCoordinator.updateDownloading(
-                                sourceUrl = sourceUrl,
-                                title = stream.title,
-                                platform = stream.platform,
-                                qualityLabel = stream.qualityLabel,
-                                bytesDownloaded = bytesDownloaded,
-                                totalBytes = totalBytes,
-                                speedBytesPerSec = speed,
-                                etaSeconds = eta,
-                            )
-                            lastUiTick = now
-                            lastTickBytes = bytesDownloaded
-
-                            if (now - lastNotificationTick >= 700L) {
-                                val pct = if (totalBytes > 0) {
-                                    ((bytesDownloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
-                                } else {
-                                    0
-                                }
-                                updateProgressNotification(
-                                    title = stream.title,
-                                    text = if (totalBytes > 0) {
-                                        "${stream.qualityLabel} · $pct% · ${formatSpeed(speed)}"
-                                    } else {
-                                        "${stream.qualityLabel} · ${formatSize(bytesDownloaded)}"
-                                    },
-                                    progress = pct,
-                                    indeterminate = totalBytes <= 0L,
-                                )
-                                lastNotificationTick = now
-                            }
-                        }
+                        onBytes(bytesDownloaded, totalBytes)
                     }
                     output.flush()
                 }
             }
+            bytesDownloaded > 0L
+        }
+    }
 
-            if (bytesDownloaded <= 0L) {
-                localFile.delete()
-                DownloadStateCoordinator.setError(
-                    sourceUrl,
-                    stream.platform,
-                    "Downloaded stream contained 0 bytes.",
-                )
-                return
-            }
-
-            val exportedUri = exportToMediaStoreIfSupported(localFile, fileName, stream.mimeType)
-            val contentUri = exportedUri ?: FileProvider.getUriForFile(
-                applicationContext,
-                "${packageName}.fileprovider",
-                localFile,
-            )
-
-            val metadata = extractLocalVideoMetadata(localFile, stream.qualityLabel)
-            val entity = DownloadedVideoEntity(
-                title = stream.title,
-                sourceUrl = sourceUrl,
-                streamUrl = stream.streamUrl,
-                platform = stream.platform.label,
-                qualityLabel = stream.qualityLabel,
-                resolution = metadata.resolution,
-                mimeType = stream.mimeType,
-                fileSizeBytes = localFile.length(),
-                durationMs = metadata.durationMs,
-                contentUri = contentUri.toString(),
-                filePath = localFile.absolutePath,
-                thumbnailPath = metadata.thumbnailPath,
-            )
-            val insertedId = repository.insertVideo(entity)
-
-            DownloadStateCoordinator.setCompleted(
-                sourceUrl = sourceUrl,
-                title = stream.title,
-                platform = stream.platform,
-                qualityLabel = stream.qualityLabel,
-                totalBytes = localFile.length(),
-                videoId = insertedId,
-            )
-            postTerminalNotification(
-                title = "Captured in Vault",
-                text = "${stream.title} (${stream.qualityLabel})",
-            )
+    private fun buildNotificationTelemetryLine(
+        qualityLabel: String,
+        percent: Int,
+        speedBytesPerSec: Long,
+        etaSeconds: Long,
+        downloadedBytes: Long,
+    ): String {
+        val etaPart = if (etaSeconds > 0L) " · ETA ${formatEta(etaSeconds)}" else ""
+        return if (percent > 0) {
+            "$qualityLabel · $percent% · ${formatSpeed(speedBytesPerSec)}$etaPart"
+        } else {
+            "$qualityLabel · ${formatSize(downloadedBytes)} · ${formatSpeed(speedBytesPerSec)}"
         }
     }
 
@@ -452,7 +662,7 @@ class BlackholeDownloadService : Service() {
     private fun formatSpeed(bytesPerSec: Long): String {
         val mb = bytesPerSec / (1024.0 * 1024.0)
         return if (mb >= 1.0) {
-            String.format("%.1f MB/s", mb)
+            String.format(Locale.US, "%.1f MB/s", mb)
         } else {
             "${(bytesPerSec / 1024L).coerceAtLeast(1L)} KB/s"
         }
@@ -460,7 +670,13 @@ class BlackholeDownloadService : Service() {
 
     private fun formatSize(bytes: Long): String {
         val mb = bytes / (1024.0 * 1024.0)
-        return String.format("%.1f MB", mb)
+        return String.format(Locale.US, "%.1f MB", mb)
+    }
+
+    private fun formatEta(seconds: Long): String {
+        val mins = seconds / 60L
+        val secs = seconds % 60L
+        return String.format(Locale.US, "%02d:%02d", mins, secs)
     }
 
     override fun onDestroy() {

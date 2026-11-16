@@ -36,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Cookie
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material.icons.rounded.CheckCircleOutline
@@ -78,6 +79,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.engine.model.DownloadPhase
 import com.example.ui.animation.rememberBlackholeAnimationController
 import com.example.ui.components.BlackholeCoreButton
+import com.example.ui.components.CookieVaultDialog
 import com.example.ui.components.LiquidGlassCard
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
@@ -141,6 +143,8 @@ fun BlackholeScreen(
         onAbortPull = viewModel::abortGravityPull,
         onOpenVideosDrawer = onOpenVideosDrawer,
         onOpenUpdateDialog = viewModel::openUpdateDialog,
+        onOpenCookieVault = { viewModel.openCookieVault(null) },
+        onSignInToUnlock = { authUrl -> viewModel.openCookieVault(authUrl) },
         modifier = modifier,
     )
 
@@ -158,6 +162,18 @@ fun BlackholeScreen(
             onDismiss = viewModel::dismissUpdateDialog,
         )
     }
+
+    if (uiState.showCookieVault) {
+        CookieVaultDialog(
+            initialAuthUrl = uiState.authWebViewUrl,
+            syncedDomains = uiState.syncedDomains,
+            statusMessage = uiState.cookieStatusMessage,
+            onImportCookiesUri = viewModel::importCookiesFromUri,
+            onSyncWebViewSession = viewModel::syncWebViewSession,
+            onClearCookies = viewModel::clearAllCookies,
+            onDismiss = viewModel::dismissCookieVault,
+        )
+    }
 }
 
 @Composable
@@ -167,11 +183,14 @@ private fun BlackholeScreenContent(
     onAbortPull: () -> Unit,
     onOpenVideosDrawer: () -> Unit,
     onOpenUpdateDialog: () -> Unit,
+    onOpenCookieVault: () -> Unit,
+    onSignInToUnlock: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val telemetry = uiState.telemetry
     val isBusy = telemetry.phase == DownloadPhase.ABSORBING ||
-        telemetry.phase == DownloadPhase.DOWNLOADING
+        telemetry.phase == DownloadPhase.DOWNLOADING ||
+        telemetry.phase == DownloadPhase.MERGING
 
     val animationController = rememberBlackholeAnimationController(
         phase = telemetry.phase,
@@ -298,6 +317,40 @@ private fun BlackholeScreenContent(
                                 )
                             }
                         }
+
+                        val hasCookies = uiState.syncedDomains.isNotEmpty()
+                        Surface(
+                            color = if (hasCookies) CyanGlowSoft.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.04f),
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.75.dp,
+                                if (hasCookies) NeonCyan.copy(alpha = 0.5f) else GlassStrokeBright.copy(alpha = 0.24f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable(onClick = onOpenCookieVault)
+                                .testTag("session_vault_pill"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Cookie,
+                                    contentDescription = "Session and Cookie Vault",
+                                    tint = if (hasCookies) NeonCyan else MutedSlate,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                                if (hasCookies) {
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "${uiState.syncedDomains.size}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NeonCyan,
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -322,7 +375,9 @@ private fun BlackholeScreenContent(
                     AnimatedVisibility(
                         visible = telemetry.phase == DownloadPhase.ABSORBING ||
                             telemetry.phase == DownloadPhase.DOWNLOADING ||
+                            telemetry.phase == DownloadPhase.MERGING ||
                             telemetry.phase == DownloadPhase.COMPLETED ||
+                            telemetry.phase == DownloadPhase.NEEDS_AUTH ||
                             telemetry.phase == DownloadPhase.ERROR ||
                             !uiState.clipboardFeedback.isNullOrBlank(),
                         enter = fadeIn() + slideInVertically { it / 3 },
@@ -332,6 +387,7 @@ private fun BlackholeScreenContent(
                             uiState = uiState,
                             onAbortPull = onAbortPull,
                             onOpenVideosDrawer = onOpenVideosDrawer,
+                            onSignInToUnlock = onSignInToUnlock,
                         )
                     }
                 }
@@ -351,6 +407,7 @@ private fun TelemetryStatusPanel(
     uiState: BlackholeUiState,
     onAbortPull: () -> Unit,
     onOpenVideosDrawer: () -> Unit,
+    onSignInToUnlock: (String) -> Unit,
 ) {
     val telemetry = uiState.telemetry
 
@@ -358,6 +415,7 @@ private fun TelemetryStatusPanel(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
         highlighted = telemetry.phase == DownloadPhase.DOWNLOADING ||
+            telemetry.phase == DownloadPhase.MERGING ||
             telemetry.phase == DownloadPhase.COMPLETED,
     ) {
         Column(
@@ -368,7 +426,7 @@ private fun TelemetryStatusPanel(
             when {
                 telemetry.phase == DownloadPhase.ABSORBING -> {
                     Text(
-                        text = "RESOLVING HIGHEST STREAM QUALITY...",
+                        text = "RUNNING MULTI-STRATEGY STREAM EXTRACTION...",
                         style = MaterialTheme.typography.labelSmall,
                         color = NeonCyan,
                     )
@@ -379,6 +437,23 @@ private fun TelemetryStatusPanel(
                             .height(4.dp)
                             .clip(RoundedCornerShape(50)),
                         color = NeonCyan,
+                        trackColor = Color.White.copy(alpha = 0.08f),
+                    )
+                }
+
+                telemetry.phase == DownloadPhase.MERGING -> {
+                    Text(
+                        text = "MUXING HIGHEST VIDEO & AUDIO TRACKS...",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = PlasmaViolet,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(50)),
+                        color = PlasmaViolet,
                         trackColor = Color.White.copy(alpha = 0.08f),
                     )
                 }
@@ -436,8 +511,13 @@ private fun TelemetryStatusPanel(
                         } else {
                             "${formatMb(telemetry.bytesDownloaded)} pulled"
                         }
+                        val etaText = if (telemetry.etaSeconds > 0L) {
+                            " · ETA ${formatEtaText(telemetry.etaSeconds)}"
+                        } else {
+                            ""
+                        }
                         Text(
-                            text = "$sizeText · ${telemetry.qualityLabel}",
+                            text = "$sizeText · ${telemetry.qualityLabel}$etaText",
                             style = MaterialTheme.typography.labelSmall,
                             color = MutedSlate,
                         )
@@ -496,6 +576,47 @@ private fun TelemetryStatusPanel(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = NeonCyan,
                             )
+                        }
+                    }
+                }
+
+                telemetry.phase == DownloadPhase.NEEDS_AUTH -> {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = "SESSION AUTHENTICATION REQUIRED",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = PlasmaViolet,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = telemetry.errorMessage ?: "Sign in via WebView or import cookies.txt to bypass login gate.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = ChromeSilver,
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            Button(
+                                onClick = {
+                                    onSignInToUnlock(telemetry.needsAuthUrl ?: telemetry.sourceUrl)
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = NeonCyan,
+                                    contentColor = ObsidianVoid,
+                                ),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("sign_in_unlock_button"),
+                            ) {
+                                Text(
+                                    text = "SIGN IN & SYNC",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = ObsidianVoid,
+                                )
+                            }
                         }
                     }
                 }
@@ -595,6 +716,12 @@ private fun formatTransferSpeed(bytesPerSec: Long): String {
     } else {
         "${(bytesPerSec / 1024L).coerceAtLeast(1L)} KB/s"
     }
+}
+
+private fun formatEtaText(seconds: Long): String {
+    val mins = seconds / 60L
+    val secs = seconds % 60L
+    return String.format("%02d:%02d", mins, secs)
 }
 
 @Composable

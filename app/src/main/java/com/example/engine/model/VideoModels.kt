@@ -15,7 +15,7 @@ enum class PlatformBadge(val label: String) {
             val lower = url.lowercase()
             return when {
                 lower.contains(".mp4") || lower.contains(".webm") || lower.contains(".mov") ||
-                    lower.contains(".mkv") || lower.contains(".m4v") -> DIRECT
+                    lower.contains(".mkv") || lower.contains(".m4v") || lower.contains(".m3u8") -> DIRECT
                 lower.contains("youtube.com") || lower.contains("youtu.be") -> YOUTUBE
                 lower.contains("tiktok.com") -> TIKTOK
                 lower.contains("instagram.com") -> INSTAGRAM
@@ -37,12 +37,19 @@ data class ExtractedStream(
     val mimeType: String,
     val estimatedBytes: Long,
     val headers: Map<String, String> = emptyMap(),
+    val audioStreamUrl: String? = null,
+    val isHls: Boolean = false,
 )
 
 sealed class ExtractionResult {
     data class Success(
         val bestStream: ExtractedStream,
         val candidates: List<ExtractedStream>,
+    ) : ExtractionResult()
+
+    data class NeedsAuth(
+        val url: String,
+        val reason: String,
     ) : ExtractionResult()
 
     data class Error(val message: String) : ExtractionResult()
@@ -53,7 +60,9 @@ enum class DownloadPhase {
     CLIPBOARD_ARMED,
     ABSORBING,
     DOWNLOADING,
+    MERGING,
     COMPLETED,
+    NEEDS_AUTH,
     ERROR,
 }
 
@@ -70,4 +79,5 @@ data class DownloadTelemetry(
     val etaSeconds: Long = -1L,
     val errorMessage: String? = null,
     val completedVideoId: Long? = null,
+    val needsAuthUrl: String? = null,
 )

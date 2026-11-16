@@ -74,8 +74,9 @@ fun BlackholeCoreButton(
     val primaryGlow = when (phase) {
         DownloadPhase.COMPLETED -> EmeraldPulse
         DownloadPhase.ERROR -> CrimsonAlert
-        DownloadPhase.ABSORBING, DownloadPhase.DOWNLOADING -> NeonCyan
+        DownloadPhase.ABSORBING, DownloadPhase.DOWNLOADING, DownloadPhase.MERGING -> NeonCyan
         DownloadPhase.CLIPBOARD_ARMED -> NeonCyan
+        DownloadPhase.NEEDS_AUTH -> PlasmaViolet
         DownloadPhase.IDLE -> ElectricBlue
     }
 
@@ -348,6 +349,29 @@ fun BlackholeCoreButton(
                                 text = "4K · 1080P",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = NeonCyan.copy(alpha = 0.85f),
+                            )
+                        }
+
+                        DownloadPhase.MERGING -> {
+                            Icon(
+                                imageVector = Icons.Rounded.Bolt,
+                                contentDescription = null,
+                                tint = PlasmaViolet,
+                                modifier = Modifier.size(34.dp),
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "MERGING A/V",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = ChromeSilver,
+                            )
+                        }
+
+                        DownloadPhase.NEEDS_AUTH -> {
+                            Text(
+                                text = "AUTH NEEDED",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = PlasmaViolet,
                             )
                         }
 

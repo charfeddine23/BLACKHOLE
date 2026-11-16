@@ -18,7 +18,10 @@ object DownloadStateCoordinator {
 
     fun armClipboardUrl(url: String, platform: PlatformBadge) {
         val current = _telemetry.value
-        if (current.phase == DownloadPhase.ABSORBING || current.phase == DownloadPhase.DOWNLOADING) {
+        if (current.phase == DownloadPhase.ABSORBING ||
+            current.phase == DownloadPhase.DOWNLOADING ||
+            current.phase == DownloadPhase.MERGING
+        ) {
             return
         }
         _telemetry.value = DownloadTelemetry(
@@ -34,7 +37,7 @@ object DownloadStateCoordinator {
             phase = DownloadPhase.ABSORBING,
             sourceUrl = url,
             platform = platform,
-            title = "Scanning singularity streams...",
+            title = "Running multi-strategy stream extraction...",
         )
     }
 
@@ -67,6 +70,25 @@ object DownloadStateCoordinator {
         )
     }
 
+    fun setMerging(
+        sourceUrl: String,
+        title: String,
+        platform: PlatformBadge,
+        qualityLabel: String,
+        totalBytes: Long,
+    ) {
+        _telemetry.value = DownloadTelemetry(
+            phase = DownloadPhase.MERGING,
+            sourceUrl = sourceUrl,
+            title = title,
+            platform = platform,
+            qualityLabel = qualityLabel,
+            bytesDownloaded = totalBytes,
+            totalBytes = totalBytes,
+            progressFraction = 0.96f,
+        )
+    }
+
     fun setCompleted(
         sourceUrl: String,
         title: String,
@@ -85,6 +107,16 @@ object DownloadStateCoordinator {
             totalBytes = totalBytes,
             progressFraction = 1f,
             completedVideoId = videoId,
+        )
+    }
+
+    fun setNeedsAuth(sourceUrl: String, platform: PlatformBadge, reason: String) {
+        _telemetry.value = DownloadTelemetry(
+            phase = DownloadPhase.NEEDS_AUTH,
+            sourceUrl = sourceUrl,
+            platform = platform,
+            errorMessage = reason,
+            needsAuthUrl = sourceUrl,
         )
     }
 
