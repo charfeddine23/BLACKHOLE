@@ -8,6 +8,9 @@ import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -15,8 +18,10 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -38,7 +43,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Cookie
 import androidx.compose.material.icons.outlined.SystemUpdate
-import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
@@ -53,13 +57,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
-import androidx.compose.ui.window.Dialog
-import com.example.BuildConfig
-import com.example.engine.updater.AppUpdateManager
-import com.example.engine.updater.UpdateCheckState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -67,19 +70,33 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.BuildConfig
+import com.example.data.local.DownloadedVideoEntity
 import com.example.engine.model.DownloadPhase
+import com.example.engine.updater.AppUpdateManager
+import com.example.engine.updater.UpdateCheckState
 import com.example.ui.animation.rememberBlackholeAnimationController
 import com.example.ui.components.BlackholeCoreButton
 import com.example.ui.components.CookieVaultDialog
+import com.example.ui.components.DownloadedVideosSwipeUpSheet
 import com.example.ui.components.LiquidGlassCard
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
@@ -92,26 +109,40 @@ import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeUiState
 import com.example.ui.viewmodel.BlackholeViewModel
+import kotlinx.coroutines.launch
 
 @Composable
 fun BlackholeScreen(
     viewModel: BlackholeViewModel,
-    onOpenVideosDrawer: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val videos by viewModel.videos.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Auto-detect clipboard whenever app launches or returns to foreground
+    // Check clipboard and check for updates every time the user enters / resumes the app
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 viewModel.refreshClipboardOnLaunch()
+                viewModel.checkForUpdatesOnEntry()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Automatically open the APK / release download link when a new update is found
+    LaunchedEffect(viewModel) {
+        viewModel.autoLaunchUpdateUrl.collect { updateUrl ->
+            runCatching {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateUrl)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+            }
+        }
     }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -139,9 +170,10 @@ fun BlackholeScreen(
 
     BlackholeScreenContent(
         uiState = uiState,
+        videos = videos,
         onTapBlackhole = initiatePullWithPermissionCheck,
         onAbortPull = viewModel::abortGravityPull,
-        onOpenVideosDrawer = onOpenVideosDrawer,
+        onDeleteVideo = viewModel::deleteVideo,
         onOpenUpdateDialog = viewModel::openUpdateDialog,
         onOpenCookieVault = { viewModel.openCookieVault(null) },
         onSignInToUnlock = { authUrl -> viewModel.openCookieVault(authUrl) },
@@ -151,6 +183,7 @@ fun BlackholeScreen(
     if (uiState.showUpdateDialog) {
         LiquidGlassUpdateDialog(
             updateState = uiState.updateState,
+            autoDownloadTriggered = uiState.autoDownloadTriggered,
             onDownloadUpdate = { url ->
                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -158,7 +191,7 @@ fun BlackholeScreen(
                 context.startActivity(intent)
                 viewModel.dismissUpdateDialog()
             },
-            onRetryCheck = { viewModel.checkForUpdates(silent = false) },
+            onRetryCheck = { viewModel.checkForUpdates(silent = false, autoDownloadIfFound = true) },
             onDismiss = viewModel::dismissUpdateDialog,
         )
     }
@@ -179,9 +212,10 @@ fun BlackholeScreen(
 @Composable
 private fun BlackholeScreenContent(
     uiState: BlackholeUiState,
+    videos: List<DownloadedVideoEntity>,
     onTapBlackhole: () -> Unit,
     onAbortPull: () -> Unit,
-    onOpenVideosDrawer: () -> Unit,
+    onDeleteVideo: (DownloadedVideoEntity) -> Unit,
     onOpenUpdateDialog: () -> Unit,
     onOpenCookieVault: () -> Unit,
     onSignInToUnlock: (String) -> Unit,
@@ -197,43 +231,137 @@ private fun BlackholeScreenContent(
         targetProgress = telemetry.progressFraction,
     )
 
+    val drawerProgress = remember { Animatable(0f) }
+    val coroutineScope = rememberCoroutineScope()
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = ObsidianVoid,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { _ ->
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
-                .background(ObsidianVoid)
-                .drawBehind {
-                    // Deep atmospheric obsidian & subtle cyan/violet singularity aura
-                    drawCircle(
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                NeonCyan.copy(alpha = 0.08f),
-                                PlasmaViolet.copy(alpha = 0.05f),
-                                Color.Transparent,
-                            ),
-                            center = Offset(size.width * 0.5f, size.height * 0.48f),
-                            radius = size.minDimension * 0.72f,
-                        ),
-                        radius = size.minDimension * 0.72f,
-                        center = Offset(size.width * 0.5f, size.height * 0.48f),
-                    )
-                },
-            contentAlignment = Alignment.Center,
+                .background(ObsidianVoid),
         ) {
-            Column(
+            val density = LocalDensity.current
+            val maxHeightPx = remember(maxHeight, density) {
+                with(density) { maxHeight.toPx().coerceAtLeast(1f) }
+            }
+
+            val snapDrawer: (Boolean) -> Unit = remember(coroutineScope) {
+                { shouldOpen ->
+                    coroutineScope.launch {
+                        drawerProgress.animateTo(
+                            targetValue = if (shouldOpen) 1f else 0f,
+                            animationSpec = spring(
+                                dampingRatio = 0.86f,
+                                stiffness = Spring.StiffnessMediumLow,
+                            ),
+                        )
+                    }
+                }
+            }
+
+            val applyDragDeltaPx: (Float) -> Unit = remember(coroutineScope, maxHeightPx) {
+                { deltaY ->
+                    coroutineScope.launch {
+                        val next = (drawerProgress.value - deltaY / maxHeightPx).coerceIn(0f, 1f)
+                        drawerProgress.snapTo(next)
+                    }
+                }
+            }
+
+            val finishDragWithVelocity: (Float) -> Unit = remember(snapDrawer) {
+                { velocityY ->
+                    val current = drawerProgress.value
+                    val shouldOpen = when {
+                        velocityY < -420f -> true
+                        velocityY > 420f -> false
+                        else -> current > 0.25f
+                    }
+                    snapDrawer(shouldOpen)
+                }
+            }
+
+            val scrollState = rememberScrollState()
+            val homeNestedScroll = remember(maxHeightPx, scrollState) {
+                object : NestedScrollConnection {
+                    override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                        if (source != NestedScrollSource.UserInput) return Offset.Zero
+                        val atBottom = scrollState.maxValue == 0 || scrollState.value >= scrollState.maxValue
+                        if (drawerProgress.value > 0.001f || (available.y < 0f && atBottom)) {
+                            applyDragDeltaPx(available.y)
+                            return Offset(0f, available.y)
+                        }
+                        return Offset.Zero
+                    }
+
+                    override suspend fun onPreFling(available: Velocity): Velocity {
+                        if (drawerProgress.value > 0.001f) {
+                            finishDragWithVelocity(available.y)
+                            return available
+                        }
+                        return Velocity.Zero
+                    }
+                }
+            }
+
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .widthIn(max = 600.dp)
-                    .statusBarsPadding()
-                    .navigationBarsPadding()
-                    .padding(horizontal = 24.dp, vertical = 16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.SpaceBetween,
+                    .graphicsLayer {
+                        val p = drawerProgress.value
+                        val scale = 1f - 0.05f * p
+                        scaleX = scale
+                        scaleY = scale
+                        alpha = 1f - 0.42f * p
+                    }
+                    .pointerInput(maxHeightPx) {
+                        val velocityTracker = VelocityTracker()
+                        detectVerticalDragGestures(
+                            onDragStart = { velocityTracker.resetTracking() },
+                            onVerticalDrag = { change, dragAmount ->
+                                change.consume()
+                                velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                applyDragDeltaPx(dragAmount)
+                            },
+                            onDragEnd = {
+                                finishDragWithVelocity(velocityTracker.calculateVelocity().y)
+                            },
+                            onDragCancel = {
+                                finishDragWithVelocity(0f)
+                            },
+                        )
+                    }
+                    .drawBehind {
+                        // Deep atmospheric obsidian & subtle cyan/violet singularity aura
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    NeonCyan.copy(alpha = 0.08f),
+                                    PlasmaViolet.copy(alpha = 0.05f),
+                                    Color.Transparent,
+                                ),
+                                center = Offset(size.width * 0.5f, size.height * 0.48f),
+                                radius = size.minDimension * 0.72f,
+                            ),
+                            radius = size.minDimension * 0.72f,
+                            center = Offset(size.width * 0.5f, size.height * 0.48f),
+                        )
+                    },
+                contentAlignment = Alignment.Center,
             ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .widthIn(max = 600.dp)
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .padding(horizontal = 24.dp, vertical = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.SpaceBetween,
+                ) {
                 // Minimalist Header
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -359,7 +487,8 @@ private fun BlackholeScreenContent(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .nestedScroll(homeNestedScroll)
+                        .verticalScroll(scrollState),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
@@ -386,16 +515,34 @@ private fun BlackholeScreenContent(
                         TelemetryStatusPanel(
                             uiState = uiState,
                             onAbortPull = onAbortPull,
-                            onOpenVideosDrawer = onOpenVideosDrawer,
+                            onOpenVideosSheet = { snapDrawer(true) },
                             onSignInToUnlock = onSignInToUnlock,
                         )
                     }
                 }
 
-                // Minimalist Bottom Footer Drawer Trigger
-                VideosDrawerFooterButton(
+                // Minimalist Swipe-Up Indicator
+                SwipeUpVaultIndicator(
                     videoCount = uiState.videoCount,
-                    onClick = onOpenVideosDrawer,
+                    onSwipeTap = { snapDrawer(true) },
+                )
+            }
+            }
+
+            if (drawerProgress.value > 0.001f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(ObsidianVoid.copy(alpha = 0.72f * drawerProgress.value)),
+                )
+                DownloadedVideosSwipeUpSheet(
+                    videos = videos,
+                    drawerProgress = drawerProgress.value,
+                    maxHeightPx = maxHeightPx,
+                    onDragByPx = applyDragDeltaPx,
+                    onDragFinish = finishDragWithVelocity,
+                    onCollapse = { snapDrawer(false) },
+                    onDeleteVideo = onDeleteVideo,
                 )
             }
         }
@@ -406,7 +553,7 @@ private fun BlackholeScreenContent(
 private fun TelemetryStatusPanel(
     uiState: BlackholeUiState,
     onAbortPull: () -> Unit,
-    onOpenVideosDrawer: () -> Unit,
+    onOpenVideosSheet: () -> Unit,
     onSignInToUnlock: (String) -> Unit,
 ) {
     val telemetry = uiState.telemetry
@@ -566,7 +713,7 @@ private fun TelemetryStatusPanel(
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                         TextButton(
-                            onClick = onOpenVideosDrawer,
+                            onClick = onOpenVideosSheet,
                             modifier = Modifier
                                 .minimumInteractiveComponentSize()
                                 .testTag("open_vault_cta"),
@@ -647,60 +794,44 @@ private fun TelemetryStatusPanel(
 }
 
 @Composable
-private fun VideosDrawerFooterButton(
+private fun SwipeUpVaultIndicator(
     videoCount: Int,
-    onClick: () -> Unit,
+    onSwipeTap: () -> Unit,
 ) {
-    Surface(
-        color = Color.White.copy(alpha = 0.04f),
-        shape = RoundedCornerShape(28.dp),
-        border = BorderStroke(1.dp, GlassStrokeBright.copy(alpha = 0.25f)),
+    Column(
         modifier = Modifier
-            .clip(RoundedCornerShape(28.dp))
-            .clickable(onClick = onClick)
-            .minimumInteractiveComponentSize()
-            .testTag("videos_drawer_button"),
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onSwipeTap)
+            .padding(vertical = 6.dp)
+            .testTag("swipe_up_videos_indicator"),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.KeyboardArrowUp,
-                contentDescription = null,
-                tint = MutedSlate,
-                modifier = Modifier.size(18.dp),
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Icon(
-                imageVector = Icons.Outlined.VideoLibrary,
-                contentDescription = "Open Videos Gallery Drawer",
-                tint = NeonCyan,
-                modifier = Modifier.size(18.dp),
-            )
-            Spacer(modifier = Modifier.width(10.dp))
-            Text(
-                text = "VIDEOS",
-                style = MaterialTheme.typography.labelLarge,
-                color = ChromeSilver,
-            )
-            if (videoCount > 0) {
-                Spacer(modifier = Modifier.width(10.dp))
-                Surface(
-                    color = CyanGlowSoft.copy(alpha = 0.35f),
-                    shape = CircleShape,
-                    border = BorderStroke(0.75.dp, NeonCyan.copy(alpha = 0.6f)),
-                ) {
-                    Text(
-                        text = videoCount.toString(),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = NeonCyan,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                    )
-                }
-            }
-        }
+        Icon(
+            imageVector = Icons.Rounded.KeyboardArrowUp,
+            contentDescription = "Swipe up to view downloaded videos",
+            tint = if (videoCount > 0) NeonCyan.copy(alpha = 0.72f) else MutedSlate.copy(alpha = 0.65f),
+            modifier = Modifier.size(18.dp),
+        )
+        Box(
+            modifier = Modifier
+                .width(44.dp)
+                .height(3.5.dp)
+                .clip(CircleShape)
+                .background(
+                    if (videoCount > 0) {
+                        NeonCyan.copy(alpha = 0.55f)
+                    } else {
+                        GlassStrokeBright.copy(alpha = 0.35f)
+                    },
+                ),
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = if (videoCount > 0) "SWIPE UP · $videoCount" else "SWIPE UP",
+            style = MaterialTheme.typography.labelSmall,
+            color = MutedSlate.copy(alpha = 0.72f),
+        )
     }
 }
 
@@ -727,6 +858,7 @@ private fun formatEtaText(seconds: Long): String {
 @Composable
 private fun LiquidGlassUpdateDialog(
     updateState: UpdateCheckState,
+    autoDownloadTriggered: Boolean,
     onDownloadUpdate: (String) -> Unit,
     onRetryCheck: () -> Unit,
     onDismiss: () -> Unit,
@@ -754,7 +886,11 @@ private fun LiquidGlassUpdateDialog(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "UPDATE AVAILABLE",
+                                text = if (autoDownloadTriggered) {
+                                    "AUTO-DOWNLOADING UPDATE"
+                                } else {
+                                    "UPDATE AVAILABLE"
+                                },
                                 style = MaterialTheme.typography.labelLarge,
                                 color = NeonCyan,
                             )

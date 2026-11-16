@@ -1,5 +1,6 @@
-package com.example.ui.screens
+package com.example.ui.components
 
+import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -11,6 +12,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -18,7 +20,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -32,20 +33,20 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -60,27 +61,33 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.data.local.DownloadedVideoEntity
-import com.example.ui.components.LiquidGlassCard
 import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
@@ -90,7 +97,6 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
-import com.example.ui.viewmodel.BlackholeViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -99,64 +105,152 @@ import java.util.Date
 import java.util.Locale
 
 @Composable
-fun VideosScreen(
-    viewModel: BlackholeViewModel,
-    onNavigateBack: () -> Unit,
+fun DownloadedVideosSwipeUpSheet(
+    videos: List<DownloadedVideoEntity>,
+    drawerProgress: Float,
+    maxHeightPx: Float,
+    onDragByPx: (Float) -> Unit,
+    onDragFinish: (Float) -> Unit,
+    onCollapse: () -> Unit,
+    onDeleteVideo: (DownloadedVideoEntity) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val videos by viewModel.videos.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val gridState = rememberLazyGridState()
     var previewingVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
     var pendingDeleteVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
 
-    BackHandler(enabled = previewingVideo != null) {
-        previewingVideo = null
+    BackHandler(enabled = previewingVideo != null || drawerProgress > 0.05f) {
+        if (previewingVideo != null) {
+            previewingVideo = null
+        } else {
+            onCollapse()
+        }
     }
 
-    Scaffold(
-        modifier = modifier.fillMaxSize(),
-        containerColor = ObsidianVoid,
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-    ) { _ ->
+    val sheetNestedScroll = remember(maxHeightPx) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
+                val atTop = gridState.firstVisibleItemIndex == 0 &&
+                    gridState.firstVisibleItemScrollOffset == 0
+                val isPullingDownFromTop = atTop && available.y > 0f
+                val isMidTransition = drawerProgress < 0.999f
+
+                if (isMidTransition || isPullingDownFromTop) {
+                    onDragByPx(available.y)
+                    return Offset(0f, available.y)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (drawerProgress < 0.999f) {
+                    onDragFinish(available.y)
+                    return available
+                }
+                return Velocity.Zero
+            }
+        }
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                translationY = ((1f - drawerProgress) * maxHeightPx).coerceAtLeast(0f)
+            }
+            .testTag("downloaded_videos_swipe_sheet"),
+        shape = RoundedCornerShape(
+            topStart = if (drawerProgress > 0.98f) 0.dp else 28.dp,
+            topEnd = if (drawerProgress > 0.98f) 0.dp else 28.dp,
+        ),
+        color = ObsidianVoid.copy(alpha = 0.97f),
+        border = BorderStroke(
+            width = 1.dp,
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    NeonCyan.copy(alpha = 0.35f),
+                    GlassStrokeBright.copy(alpha = 0.16f),
+                    Color.Transparent,
+                ),
+            ),
+        ),
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(ObsidianVoid)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xFF0A1019),
+                            ObsidianVoid,
+                        ),
+                    ),
+                )
                 .statusBarsPadding()
                 .navigationBarsPadding(),
         ) {
-            // Top Gallery Drawer Header
-            Row(
+            // Draggable Sheet Header & Pull-Down Handle
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(
-                        onClick = onNavigateBack,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("videos_back_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                            contentDescription = "Back to Blackhole Core",
-                            tint = ChromeSilver,
+                    .pointerInput(Unit) {
+                        val velocityTracker = VelocityTracker()
+                        detectVerticalDragGestures(
+                            onDragStart = { velocityTracker.resetTracking() },
+                            onVerticalDrag = { change, dragAmount ->
+                                change.consume()
+                                velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                onDragByPx(dragAmount)
+                            },
+                            onDragEnd = {
+                                val velocityY = velocityTracker.calculateVelocity().y
+                                onDragFinish(velocityY)
+                            },
+                            onDragCancel = {
+                                onDragFinish(0f)
+                            },
                         )
                     }
-                    Spacer(modifier = Modifier.width(6.dp))
+                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(44.dp)
+                        .height(4.dp)
+                        .clip(CircleShape)
+                        .background(GlassStrokeBright.copy(alpha = 0.45f)),
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
                     Column {
                         Text(
-                            text = "VIDEOS",
-                            style = MaterialTheme.typography.headlineMedium,
+                            text = "DOWNLOADED VIDEOS",
+                            style = MaterialTheme.typography.titleLarge,
                             color = ChromeSilver,
                         )
                         Text(
                             text = "${videos.size} LOCAL VAULT ${if (videos.size == 1) "CAPTURE" else "CAPTURES"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MutedSlate,
+                        )
+                    }
+                    IconButton(
+                        onClick = onCollapse,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("collapse_videos_sheet_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.KeyboardArrowDown,
+                            contentDescription = "Swipe down to close videos",
+                            tint = ChromeSilver,
                         )
                     }
                 }
@@ -167,6 +261,21 @@ fun VideosScreen(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
+                        .pointerInput(Unit) {
+                            val velocityTracker = VelocityTracker()
+                            detectVerticalDragGestures(
+                                onDragStart = { velocityTracker.resetTracking() },
+                                onVerticalDrag = { change, dragAmount ->
+                                    change.consume()
+                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                    onDragByPx(dragAmount)
+                                },
+                                onDragEnd = {
+                                    onDragFinish(velocityTracker.calculateVelocity().y)
+                                },
+                                onDragCancel = { onDragFinish(0f) },
+                            )
+                        }
                         .padding(32.dp),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -211,7 +320,7 @@ fun VideosScreen(
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = "Copy any supported video link and tap the Blackhole core to pull the highest resolution stream locally.",
+                                text = "Swipe down to return to the Blackhole core, copy a video link, and tap to pull.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MutedSlate,
                                 textAlign = TextAlign.Center,
@@ -220,9 +329,15 @@ fun VideosScreen(
                     }
                 }
             } else {
-                BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .nestedScroll(sheetNestedScroll),
+                ) {
                     val columns = if (maxWidth >= 600.dp) 2 else 1
                     LazyVerticalGrid(
+                        state = gridState,
                         columns = GridCells.Fixed(columns),
                         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -230,11 +345,11 @@ fun VideosScreen(
                         modifier = Modifier.fillMaxSize(),
                     ) {
                         items(videos, key = { it.id }) { video ->
-                            VideoVaultCard(
+                            SwipeSheetVideoCard(
                                 video = video,
                                 onPlay = { previewingVideo = video },
                                 onShare = {
-                                    val shareUri = resolvePlayableUri(context, video)
+                                    val shareUri = resolvePlayableVideoUri(context, video)
                                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
                                         type = video.mimeType.ifBlank { "video/mp4" }
                                         putExtra(Intent.EXTRA_STREAM, shareUri)
@@ -254,7 +369,7 @@ fun VideosScreen(
     }
 
     previewingVideo?.let { activeVideo ->
-        VideoPreviewPlayerModal(
+        SwipeSheetVideoPlayerModal(
             video = activeVideo,
             onDismiss = { previewingVideo = null },
         )
@@ -271,7 +386,7 @@ fun VideosScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        viewModel.deleteVideo(toDelete)
+                        onDeleteVideo(toDelete)
                         pendingDeleteVideo = null
                     },
                 ) {
@@ -288,7 +403,7 @@ fun VideosScreen(
 }
 
 @Composable
-private fun VideoVaultCard(
+private fun SwipeSheetVideoCard(
     video: DownloadedVideoEntity,
     onPlay: () -> Unit,
     onShare: () -> Unit,
@@ -311,7 +426,6 @@ private fun VideoVaultCard(
         shape = RoundedCornerShape(22.dp),
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Video Thumbnail Preview Area
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -341,7 +455,6 @@ private fun VideoVaultCard(
                     )
                 }
 
-                // Subtle bottom scrim
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -355,7 +468,6 @@ private fun VideoVaultCard(
                         ),
                 )
 
-                // Play Core Button
                 Surface(
                     color = ObsidianVoid.copy(alpha = 0.75f),
                     shape = CircleShape,
@@ -372,7 +484,6 @@ private fun VideoVaultCard(
                     }
                 }
 
-                // Quality & Duration Badges
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopStart)
@@ -402,7 +513,7 @@ private fun VideoVaultCard(
                             .padding(12.dp),
                     ) {
                         Text(
-                            text = formatDuration(video.durationMs),
+                            text = formatSheetDuration(video.durationMs),
                             style = MaterialTheme.typography.labelSmall,
                             color = ChromeSilver,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -411,7 +522,6 @@ private fun VideoVaultCard(
                 }
             }
 
-            // Metadata & Actions Row
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -429,7 +539,7 @@ private fun VideoVaultCard(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "${video.platform} · ${formatFileSize(video.fileSizeBytes)} · ${video.resolution} · ${formatDate(video.createdAt)}",
+                        text = "${video.platform} · ${formatSheetFileSize(video.fileSizeBytes)} · ${video.resolution} · ${formatSheetDate(video.createdAt)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                         maxLines = 1,
@@ -472,12 +582,12 @@ private fun VideoVaultCard(
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun VideoPreviewPlayerModal(
+private fun SwipeSheetVideoPlayerModal(
     video: DownloadedVideoEntity,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
-    val playableUri = remember(video.id) { resolvePlayableUri(context, video) }
+    val playableUri = remember(video.id) { resolvePlayableVideoUri(context, video) }
 
     val exoPlayer = remember(playableUri) {
         ExoPlayer.Builder(context).build().apply {
@@ -504,10 +614,7 @@ private fun VideoPreviewPlayerModal(
                 .statusBarsPadding()
                 .navigationBarsPadding(),
         ) {
-            Column(
-                modifier = Modifier.fillMaxSize(),
-            ) {
-                // Top Player Bar
+            Column(modifier = Modifier.fillMaxSize()) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -524,7 +631,7 @@ private fun VideoPreviewPlayerModal(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = "${video.qualityLabel} · ${video.resolution} · ${formatFileSize(video.fileSizeBytes)}",
+                            text = "${video.qualityLabel} · ${video.resolution} · ${formatSheetFileSize(video.fileSizeBytes)}",
                             style = MaterialTheme.typography.labelSmall,
                             color = NeonCyan,
                         )
@@ -543,7 +650,6 @@ private fun VideoPreviewPlayerModal(
                     }
                 }
 
-                // Media3 Player Surface
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -572,7 +678,7 @@ private fun VideoPreviewPlayerModal(
     }
 }
 
-private fun resolvePlayableUri(context: android.content.Context, video: DownloadedVideoEntity): Uri {
+private fun resolvePlayableVideoUri(context: Context, video: DownloadedVideoEntity): Uri {
     val file = File(video.filePath)
     if (file.exists()) {
         return FileProvider.getUriForFile(
@@ -584,14 +690,14 @@ private fun resolvePlayableUri(context: android.content.Context, video: Download
     return Uri.parse(video.contentUri)
 }
 
-private fun formatDuration(durationMs: Long): String {
+private fun formatSheetDuration(durationMs: Long): String {
     val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
     val minutes = totalSeconds / 60L
     val seconds = totalSeconds % 60L
     return String.format(Locale.US, "%02d:%02d", minutes, seconds)
 }
 
-private fun formatFileSize(bytes: Long): String {
+private fun formatSheetFileSize(bytes: Long): String {
     val mb = bytes / (1024.0 * 1024.0)
     return if (mb >= 1.0) {
         String.format(Locale.US, "%.1f MB", mb)
@@ -600,7 +706,7 @@ private fun formatFileSize(bytes: Long): String {
     }
 }
 
-private fun formatDate(timestamp: Long): String {
+private fun formatSheetDate(timestamp: Long): String {
     val formatter = SimpleDateFormat("MMM d", Locale.US)
     return formatter.format(Date(timestamp))
 }

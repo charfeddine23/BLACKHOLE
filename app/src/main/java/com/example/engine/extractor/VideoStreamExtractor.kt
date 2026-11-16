@@ -9,8 +9,10 @@ import com.example.engine.network.SpoofedClientProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.CookieJar
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -45,8 +47,13 @@ class VideoStreamExtractor(
                 }
             }
 
-            // Strategy 2: Platform-specific endpoints (Vimeo config, Reddit video+audio, etc.)
+            // Strategy 2: Platform-specific endpoints (YouTube InnerTube, Vimeo config, Reddit video+audio)
             val platformStreams = when (platform) {
+                PlatformBadge.YOUTUBE -> {
+                    val ytResult = extractYoutubeStreams(cleanUrl)
+                    if (ytResult.authChallenge) sawAuthChallenge = true
+                    ytResult.streams
+                }
                 PlatformBadge.VIMEO -> extractVimeoStreams(cleanUrl)
                 PlatformBadge.REDDIT -> extractRedditStreams(cleanUrl)
                 else -> emptyList()
@@ -320,6 +327,184 @@ class VideoStreamExtractor(
             headers = headers,
             isHls = true,
         )
+    }
+
+    private fun extractYoutubeStreams(url: String): HtmlProbeOutcome {
+        val videoId = extractYoutubeVideoId(url) ?: return HtmlProbeOutcome(emptyList(), false)
+        var loginRequired = false
+
+        val clientConfigs = listOf(
+            Triple(
+                "ANDROID",
+                "19.44.38",
+                "com.google.android.youtube/19.44.38 (Linux; U; Android 15; Pixel 9 Pro) gzip",
+            ),
+            Triple(
+                "IOS",
+                "19.45.4",
+                "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X)",
+            ),
+        )
+
+        for ((clientName, clientVersion, userAgent) in clientConfigs) {
+            val payload = JSONObject().apply {
+                put("videoId", videoId)
+                put(
+                    "context",
+                    JSONObject().apply {
+                        put(
+                            "client",
+                            JSONObject().apply {
+                                put("clientName", clientName)
+                                put("clientVersion", clientVersion)
+                                put("hl", "en")
+                                put("gl", "US")
+                                if (clientName == "ANDROID") {
+                                    put("androidSdkVersion", 35)
+                                }
+                            },
+                        )
+                    },
+                )
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+            }
+
+            val req = Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .header("User-Agent", userAgent)
+                .header("Content-Type", "application/json")
+                .header("X-YouTube-Client-Name", if (clientName == "ANDROID") "3" else "5")
+                .header("X-YouTube-Client-Version", clientVersion)
+                .header("Origin", "https://www.youtube.com")
+                .build()
+
+            val outcome = runCatching {
+                client.newCall(req).execute().use { response ->
+                    if (response.code == 401 || response.code == 403) {
+                        loginRequired = true
+                        return@use emptyList<ExtractedStream>()
+                    }
+                    if (!response.isSuccessful) return@use emptyList<ExtractedStream>()
+                    val json = JSONObject(response.body?.string().orEmpty())
+                    val playability = json.optJSONObject("playabilityStatus")
+                    val status = playability?.optString("status").orEmpty()
+                    if (status.equals("LOGIN_REQUIRED", ignoreCase = true)) {
+                        loginRequired = true
+                        return@use emptyList<ExtractedStream>()
+                    }
+
+                    val title = json.optJSONObject("videoDetails")
+                        ?.optString("title")
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let(::sanitizeTitle)
+                        ?: "YouTube_$videoId"
+
+                    val streamingData = json.optJSONObject("streamingData")
+                        ?: return@use emptyList<ExtractedStream>()
+
+                    val streamHeaders = mapOf(
+                        "User-Agent" to userAgent,
+                        "Referer" to "https://www.youtube.com/",
+                    )
+                    val found = mutableListOf<ExtractedStream>()
+
+                    // Best MP4A audio track for splitting/muxing with high-res adaptive video
+                    val adaptive = streamingData.optJSONArray("adaptiveFormats") ?: JSONArray()
+                    var bestAudioUrl: String? = null
+                    var bestAudioBitrate = -1L
+                    val videoAdaptive = mutableListOf<JSONObject>()
+
+                    for (i in 0 until adaptive.length()) {
+                        val fmt = adaptive.optJSONObject(i) ?: continue
+                        val fmtUrl = fmt.optString("url")
+                        if (fmtUrl.isBlank()) continue
+                        val mime = fmt.optString("mimeType").lowercase()
+                        if (mime.startsWith("audio/mp4")) {
+                            val bitrate = fmt.optLong("bitrate", 0L)
+                            if (bitrate > bestAudioBitrate) {
+                                bestAudioBitrate = bitrate
+                                bestAudioUrl = fmtUrl
+                            }
+                        } else if (mime.startsWith("video/mp4")) {
+                            videoAdaptive.add(fmt)
+                        }
+                    }
+
+                    videoAdaptive.forEach { vFmt ->
+                        val vUrl = vFmt.optString("url")
+                        val height = vFmt.optInt("height", 1080)
+                        val bytes = vFmt.optString("contentLength").toLongOrNull() ?: -1L
+                        if (vUrl.isNotBlank() && bestAudioUrl != null) {
+                            found.add(
+                                ExtractedStream(
+                                    streamUrl = vUrl,
+                                    title = title,
+                                    platform = PlatformBadge.YOUTUBE,
+                                    qualityLabel = formatQualityLabel(height),
+                                    resolutionHeight = height,
+                                    mimeType = "video/mp4",
+                                    estimatedBytes = bytes,
+                                    headers = streamHeaders,
+                                    audioStreamUrl = bestAudioUrl,
+                                ),
+                            )
+                        }
+                    }
+
+                    // Progressive muxed formats
+                    val formats = streamingData.optJSONArray("formats") ?: JSONArray()
+                    for (i in 0 until formats.length()) {
+                        val fmt = formats.optJSONObject(i) ?: continue
+                        val fUrl = fmt.optString("url")
+                        if (fUrl.isBlank()) continue
+                        val height = fmt.optInt("height", 720)
+                        val bytes = fmt.optString("contentLength").toLongOrNull() ?: -1L
+                        found.add(
+                            ExtractedStream(
+                                streamUrl = fUrl,
+                                title = title,
+                                platform = PlatformBadge.YOUTUBE,
+                                qualityLabel = formatQualityLabel(height),
+                                resolutionHeight = height,
+                                mimeType = "video/mp4",
+                                estimatedBytes = bytes,
+                                headers = streamHeaders,
+                            ),
+                        )
+                    }
+
+                    // HLS manifest fallback
+                    val hlsUrl = streamingData.optString("hlsManifestUrl")
+                    if (hlsUrl.isNotBlank()) {
+                        parseBestHlsVariant(hlsUrl, PlatformBadge.YOUTUBE, title, streamHeaders)
+                            ?.let { found.add(it) }
+                    }
+
+                    found
+                }
+            }.getOrDefault(emptyList())
+
+            if (outcome.isNotEmpty()) {
+                return HtmlProbeOutcome(outcome, loginRequired)
+            }
+        }
+
+        return HtmlProbeOutcome(emptyList(), loginRequired)
+    }
+
+    private fun extractYoutubeVideoId(url: String): String? {
+        val patterns = listOf(
+            Regex("""[?&]v=([A-Za-z0-9_-]{11})"""),
+            Regex("""youtu\.be/([A-Za-z0-9_-]{11})"""),
+            Regex("""youtube\.com/(?:shorts|live|embed)/([A-Za-z0-9_-]{11})"""),
+        )
+        for (pattern in patterns) {
+            val id = pattern.find(url)?.groupValues?.getOrNull(1)
+            if (!id.isNullOrBlank()) return id
+        }
+        return null
     }
 
     private fun extractVimeoStreams(url: String): List<ExtractedStream> {

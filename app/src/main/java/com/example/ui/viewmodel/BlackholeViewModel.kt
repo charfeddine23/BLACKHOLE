@@ -1,7 +1,9 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.BlackholeDatabase
@@ -17,9 +19,12 @@ import com.example.engine.updater.AppUpdateManager
 import com.example.engine.updater.UpdateCheckState
 import com.example.service.BlackholeDownloadService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -37,11 +42,13 @@ data class BlackholeUiState(
     val showCookieVault: Boolean = false,
     val authWebViewUrl: String? = null,
     val cookieStatusMessage: String? = null,
+    val autoDownloadTriggered: Boolean = false,
 )
 
 class BlackholeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
+    private val prefs = context.getSharedPreferences("blackhole_updater_prefs", Context.MODE_PRIVATE)
     private val clipboardDetector = ClipboardDetector(context)
     private val cookieVault = CookieVaultManager.getInstance(context)
     private val appUpdateManager = AppUpdateManager()
@@ -57,6 +64,11 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _showCookieVault = MutableStateFlow(false)
     private val _authWebViewUrl = MutableStateFlow<String?>(null)
     private val _cookieStatusMessage = MutableStateFlow<String?>(null)
+    private val _autoDownloadTriggered = MutableStateFlow(false)
+    private val _autoLaunchUpdateUrl = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val autoLaunchUpdateUrl: SharedFlow<String> = _autoLaunchUpdateUrl.asSharedFlow()
+
+    private var lastUpdateCheckElapsedMs: Long = 0L
 
     val videos: StateFlow<List<DownloadedVideoEntity>> = repository.allVideos
         .stateIn(
@@ -94,7 +106,8 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         baseStateFlow,
         metaStateFlow,
         _cookieStatusMessage,
-    ) { base, meta, cookieMsg ->
+        _autoDownloadTriggered,
+    ) { base, meta, cookieMsg, autoTriggered ->
         base.copy(
             updateState = meta.first.first,
             showUpdateDialog = meta.first.second,
@@ -102,6 +115,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             showCookieVault = meta.third.first,
             authWebViewUrl = meta.third.second,
             cookieStatusMessage = cookieMsg,
+            autoDownloadTriggered = autoTriggered,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -111,18 +125,40 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         refreshClipboardOnLaunch()
-        checkForUpdates(silent = true)
+        checkForUpdates(silent = true, autoDownloadIfFound = true)
     }
 
-    fun checkForUpdates(silent: Boolean = false) {
+    fun checkForUpdatesOnEntry() {
+        val now = SystemClock.elapsedRealtime()
+        if (lastUpdateCheckElapsedMs != 0L && now - lastUpdateCheckElapsedMs < ENTRY_CHECK_COOLDOWN_MS) {
+            return
+        }
+        checkForUpdates(silent = true, autoDownloadIfFound = true)
+    }
+
+    fun checkForUpdates(
+        silent: Boolean = false,
+        autoDownloadIfFound: Boolean = true,
+    ) {
         if (_updateState.value is UpdateCheckState.Checking) return
+        lastUpdateCheckElapsedMs = SystemClock.elapsedRealtime()
         viewModelScope.launch {
             _updateState.value = UpdateCheckState.Checking
             val result = appUpdateManager.checkLatestRelease()
             _updateState.value = result
             when (result) {
-                is UpdateCheckState.UpdateAvailable -> _showUpdateDialog.value = true
+                is UpdateCheckState.UpdateAvailable -> {
+                    val release = result.release
+                    val lastAutoTag = prefs.getString(KEY_LAST_AUTO_UPDATE_TAG, null)
+                    if (autoDownloadIfFound && lastAutoTag != release.tagName) {
+                        prefs.edit().putString(KEY_LAST_AUTO_UPDATE_TAG, release.tagName).apply()
+                        _autoDownloadTriggered.value = true
+                        _autoLaunchUpdateUrl.tryEmit(release.preferredLaunchUrl)
+                    }
+                    _showUpdateDialog.value = true
+                }
                 is UpdateCheckState.UpToDate, is UpdateCheckState.Error -> {
+                    _autoDownloadTriggered.value = false
                     if (!silent) _showUpdateDialog.value = true
                 }
                 else -> Unit
@@ -250,5 +286,10 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             repository.deleteVideo(video)
         }
+    }
+
+    companion object {
+        private const val ENTRY_CHECK_COOLDOWN_MS = 15_000L
+        private const val KEY_LAST_AUTO_UPDATE_TAG = "last_auto_update_tag"
     }
 }

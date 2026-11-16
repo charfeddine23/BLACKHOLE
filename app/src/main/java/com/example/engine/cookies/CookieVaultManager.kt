@@ -2,6 +2,7 @@ package com.example.engine.cookies
 
 import android.content.Context
 import android.webkit.CookieManager
+import com.pulse.blackhole.data.vault.SessionVaultManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -13,7 +14,6 @@ import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
 import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
@@ -70,7 +70,8 @@ data class StoredCookieEntry(
 class CookieVaultManager private constructor(private val appContext: Context) {
 
     private val mutex = Mutex()
-    private val storeFile = File(appContext.filesDir, "blackhole_cookies_vault.json")
+    val sessionVault = SessionVaultManager(appContext)
+    private val legacyPlaintextFile = File(appContext.filesDir, "blackhole_cookies_vault.json")
     private val cookieCache = ConcurrentHashMap<String, MutableList<StoredCookieEntry>>()
 
     private val _syncedDomains = MutableStateFlow<List<String>>(emptyList())
@@ -78,6 +79,10 @@ class CookieVaultManager private constructor(private val appContext: Context) {
 
     init {
         loadFromDiskSync()
+    }
+
+    fun hasActiveSession(): Boolean {
+        return sessionVault.hasActiveSession() || cookieCache.values.any { it.isNotEmpty() }
     }
 
     val okHttpCookieJar: CookieJar = object : CookieJar {
@@ -189,7 +194,8 @@ class CookieVaultManager private constructor(private val appContext: Context) {
     suspend fun clearAllCookies() = withContext(Dispatchers.IO) {
         mutex.withLock {
             cookieCache.clear()
-            if (storeFile.exists()) storeFile.delete()
+            sessionVault.clearVault()
+            if (legacyPlaintextFile.exists()) legacyPlaintextFile.delete()
             _syncedDomains.value = emptyList()
         }
         withContext(Dispatchers.Main) {
@@ -198,6 +204,29 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                 CookieManager.getInstance().flush()
             }
         }
+    }
+
+    fun buildExtractionCommand(
+        targetUrl: String,
+        vault: SessionVaultManager = sessionVault,
+    ): List<String> {
+        val command = mutableListOf("yt-dlp")
+        if (vault.hasActiveSession()) {
+            val cookieFilePath = writeCookiesToTempFile(vault.getCookies().orEmpty())
+            command.add("--cookies")
+            command.add(cookieFilePath)
+        } else {
+            command.add("--extractor-args")
+            command.add("youtube:player_client=android,web")
+        }
+        command.add(targetUrl)
+        return command
+    }
+
+    private fun writeCookiesToTempFile(cookiesContent: String): String {
+        val tempFile = File.createTempFile("session_cookies", ".txt", appContext.cacheDir)
+        tempFile.writeText(cookiesContent)
+        return tempFile.absolutePath
     }
 
     fun getCookieHeaderForUrl(url: String): String {
@@ -297,50 +326,76 @@ class CookieVaultManager private constructor(private val appContext: Context) {
     }
 
     private fun loadFromDiskSync() {
-        if (!storeFile.exists()) return
         runCatching {
-            val raw = storeFile.readText()
-            val arr = JSONArray(raw)
-            val loaded = mutableListOf<StoredCookieEntry>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                loaded.add(
-                    StoredCookieEntry(
-                        domain = obj.optString("domain"),
-                        includeSubdomains = obj.optBoolean("includeSubdomains", true),
-                        path = obj.optString("path", "/"),
-                        secure = obj.optBoolean("secure", false),
-                        expiresAtMs = obj.optLong("expiresAtMs", 0L),
-                        name = obj.optString("name"),
-                        value = obj.optString("value"),
-                        httpOnly = obj.optBoolean("httpOnly", false),
-                    ),
-                )
+            val encryptedRaw = sessionVault.getCookies()
+            if (!encryptedRaw.isNullOrBlank()) {
+                val parsed = parseCookiesText(encryptedRaw)
+                if (parsed.isNotEmpty()) {
+                    mergeEntriesSync(parsed)
+                    return
+                }
             }
-            mergeEntriesSync(loaded)
+
+            // Migrate legacy unencrypted JSON file into EncryptedSharedPreferences if present
+            if (legacyPlaintextFile.exists()) {
+                val raw = legacyPlaintextFile.readText()
+                val arr = JSONArray(raw)
+                val loaded = mutableListOf<StoredCookieEntry>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    loaded.add(
+                        StoredCookieEntry(
+                            domain = obj.optString("domain"),
+                            includeSubdomains = obj.optBoolean("includeSubdomains", true),
+                            path = obj.optString("path", "/"),
+                            secure = obj.optBoolean("secure", false),
+                            expiresAtMs = obj.optLong("expiresAtMs", 0L),
+                            name = obj.optString("name"),
+                            value = obj.optString("value"),
+                            httpOnly = obj.optBoolean("httpOnly", false),
+                        ),
+                    )
+                }
+                if (loaded.isNotEmpty()) {
+                    mergeEntriesSync(loaded)
+                    persistToDisk()
+                }
+                legacyPlaintextFile.delete()
+            }
         }
     }
 
     private fun persistToDisk() {
         runCatching {
-            val arr = JSONArray()
+            val sb = StringBuilder("# Netscape HTTP Cookie File\n")
+            var written = 0
             cookieCache.values.flatten().forEach { entry ->
                 if (!entry.isExpired()) {
-                    arr.put(
-                        JSONObject().apply {
-                            put("domain", entry.domain)
-                            put("includeSubdomains", entry.includeSubdomains)
-                            put("path", entry.path)
-                            put("secure", entry.secure)
-                            put("expiresAtMs", entry.expiresAtMs)
-                            put("name", entry.name)
-                            put("value", entry.value)
-                            put("httpOnly", entry.httpOnly)
-                        },
-                    )
+                    val domainField = if (entry.includeSubdomains && !entry.domain.startsWith(".")) {
+                        ".${entry.domain}"
+                    } else {
+                        entry.domain
+                    }
+                    val prefix = if (entry.httpOnly) "#HttpOnly_" else ""
+                    val includeSubField = if (entry.includeSubdomains) "TRUE" else "FALSE"
+                    val secureField = if (entry.secure) "TRUE" else "FALSE"
+                    val expSeconds = if (entry.expiresAtMs > 0L) entry.expiresAtMs / 1000L else 0L
+                    sb.append(prefix)
+                        .append(domainField).append('\t')
+                        .append(includeSubField).append('\t')
+                        .append(entry.path.ifBlank { "/" }).append('\t')
+                        .append(secureField).append('\t')
+                        .append(expSeconds).append('\t')
+                        .append(entry.name).append('\t')
+                        .append(entry.value).append('\n')
+                    written++
                 }
             }
-            storeFile.writeText(arr.toString())
+            if (written > 0) {
+                sessionVault.saveCookies(sb.toString())
+            } else {
+                sessionVault.clearVault()
+            }
         }
     }
 
