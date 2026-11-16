@@ -2,6 +2,8 @@ name: Android Release CI/CD
 
 on:
   push:
+    branches-ignore:
+      - 'keystore-state'
   workflow_dispatch:
 
 permissions:
@@ -35,8 +37,8 @@ jobs:
         run: |
           RUN_NUM=${{ github.run_number }}
           VERSION_CODE=$((RUN_NUM + 1))
-          MINOR=$(( (RUN_NUM) / 100 ))
-          PATCH=$(( (RUN_NUM) % 100 ))
+          MINOR=$(( RUN_NUM / 100 ))
+          PATCH=$(( RUN_NUM % 100 ))
           VERSION_NAME="1.${MINOR}.${PATCH}"
           TAG_NAME="v${VERSION_NAME}"
 
@@ -58,6 +60,7 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           SECRET_STORE_PASS: ${{ secrets.STORE_PASSWORD }}
           SECRET_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           KEYSTORE_FILE="${{ github.workspace }}/my-upload-key.jks"
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$SECRET_STORE_PASS" ] && [ -n "$SECRET_KEY_PASS" ]; then
@@ -66,7 +69,7 @@ jobs:
             echo "use_custom_secrets=true" >> "$GITHUB_OUTPUT"
             echo "Using custom release keystore from GitHub Secrets."
           elif [ -f "debug.keystore.base64" ]; then
-            echo "::notice::KEYSTORE_BASE64 secret not set; using fixed repository fallback keystore (debug.keystore.base64) for consistent update signatures."
+            echo "::notice::Using project debug.keystore.base64 converted to upload alias."
             tr -d '\n\r ' < debug.keystore.base64 | base64 --decode > "$KEYSTORE_FILE"
             keytool -changealias \
               -keystore "$KEYSTORE_FILE" \
@@ -77,8 +80,41 @@ jobs:
             echo "keystore_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
             echo "use_custom_secrets=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Neither KEYSTORE_BASE64 secret nor debug.keystore.base64 was found."
-            exit 1
+            echo "::notice::KEYSTORE_BASE64 secret not set; checking persistent keystore-state branch."
+            if git fetch origin keystore-state --depth=1 >/dev/null 2>&1 && git show FETCH_HEAD:upload-key.b64 >/tmp/upload-key.b64 2>/dev/null; then
+              tr -d '\n\r ' < /tmp/upload-key.b64 | base64 --decode > "$KEYSTORE_FILE"
+              rm -f /tmp/upload-key.b64
+              echo "Restored persistent signing keystore from keystore-state branch."
+            else
+              echo "Generating new persistent signing keystore for upload alias..."
+              keytool -genkeypair -v \
+                -keystore "$KEYSTORE_FILE" \
+                -storetype PKCS12 \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -alias upload \
+                -storepass android \
+                -keypass android \
+                -dname "CN=Blackhole, OU=Pulse, O=CharfeddineKa, L=Unknown, ST=Unknown, C=US"
+
+              rm -rf /tmp/ks-repo
+              mkdir -p /tmp/ks-repo
+              base64 -w 0 "$KEYSTORE_FILE" > /tmp/ks-repo/upload-key.b64
+              (
+                cd /tmp/ks-repo
+                git init -b keystore-state
+                git config user.name "github-actions[bot]"
+                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git add upload-key.b64
+                git commit -m "Initialize persistent release signing keystore"
+                git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+                git push -u origin keystore-state --force
+              ) || echo "::warning::Could not persist keystore-state branch; current APK will still be signed."
+              rm -rf /tmp/ks-repo
+            fi
+            echo "keystore_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "use_custom_secrets=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Ensure Gradle Wrapper Executable
@@ -119,6 +155,7 @@ jobs:
             - Version Code: `${{ steps.versioning.outputs.version_code }}`
             - Commit: `${{ github.sha }}`
           files: ${{ steps.versioning.outputs.apk_path }}
+          make_latest: true
           draft: false
           prerelease: false
 
@@ -134,7 +171,7 @@ jobs:
             fi
           done
 
-          git fetch --tags --force
+          git fetch --tags --force || true
           git tag -l 'v*' | while read -r tag; do
             if [ -n "$tag" ] && [ "$tag" != "$LATEST_TAG" ]; then
               echo "Removing leftover tag: $tag"
@@ -157,4 +194,4 @@ jobs:
 
       - name: Cleanup Decoded Keystore
         if: always()
-        run: rm -f "${{ github.workspace }}/my-upload-key.jks"
+        run: rm -f "${{ github.workspace }}/my-upload-key.jks" /tmp/upload-key.b64
