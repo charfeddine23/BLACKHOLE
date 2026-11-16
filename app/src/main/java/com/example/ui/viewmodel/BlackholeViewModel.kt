@@ -1,7 +1,6 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
-import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
@@ -10,7 +9,6 @@ import com.example.data.local.BlackholeDatabase
 import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
 import com.example.engine.clipboard.ClipboardDetector
-import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.DownloadPhase
 import com.example.engine.model.DownloadTelemetry
 import com.example.engine.model.PlatformBadge
@@ -32,7 +30,6 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 
 data class BlackholeUiState(
@@ -40,19 +37,13 @@ data class BlackholeUiState(
     val detectedPlatform: PlatformBadge = PlatformBadge.WEB_MEDIA,
     val telemetry: DownloadTelemetry = DownloadTelemetry(),
     val videoCount: Int = 0,
-    val clipboardFeedback: String? = null,
     val updateState: UpdateCheckState = UpdateCheckState.Idle,
-    val syncedDomains: List<String> = emptyList(),
-    val showCookieVault: Boolean = false,
-    val authWebViewUrl: String? = null,
-    val cookieStatusMessage: String? = null,
 )
 
 class BlackholeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
     private val clipboardDetector = ClipboardDetector(context)
-    private val cookieVault = CookieVaultManager.getInstance(context)
     private val appUpdateManager = AppUpdateManager()
     private val repository = VideoVaultRepository(
         context = context,
@@ -60,11 +51,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     )
 
     private val _inputUrl = MutableStateFlow("")
-    private val _clipboardFeedback = MutableStateFlow<String?>(null)
     private val _updateState = MutableStateFlow<UpdateCheckState>(UpdateCheckState.Idle)
-    private val _showCookieVault = MutableStateFlow(false)
-    private val _authWebViewUrl = MutableStateFlow<String?>(null)
-    private val _cookieStatusMessage = MutableStateFlow<String?>(null)
     private val _requestInstallPermission = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val requestInstallPermission: SharedFlow<Unit> = _requestInstallPermission.asSharedFlow()
 
@@ -80,41 +67,18 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             initialValue = emptyList(),
         )
 
-    private val baseStateFlow = combine(
+    val uiState: StateFlow<BlackholeUiState> = combine(
         _inputUrl,
         DownloadStateCoordinator.telemetry,
         videos,
-        _clipboardFeedback,
-    ) { url, telemetry, videoList, feedback ->
+        _updateState,
+    ) { url, telemetry, videoList, update ->
         BlackholeUiState(
             inputUrl = url,
             detectedPlatform = PlatformBadge.fromUrl(url),
             telemetry = telemetry,
             videoCount = videoList.size,
-            clipboardFeedback = feedback,
-        )
-    }
-
-    private val metaStateFlow = combine(
-        _updateState,
-        cookieVault.syncedDomains,
-        _showCookieVault,
-        _authWebViewUrl,
-    ) { update, domains, showCookies, authUrl ->
-        Triple(update, domains, showCookies to authUrl)
-    }
-
-    val uiState: StateFlow<BlackholeUiState> = combine(
-        baseStateFlow,
-        metaStateFlow,
-        _cookieStatusMessage,
-    ) { base, meta, cookieMsg ->
-        base.copy(
-            updateState = meta.first,
-            syncedDomains = meta.second,
-            showCookieVault = meta.third.first,
-            authWebViewUrl = meta.third.second,
-            cookieStatusMessage = cookieMsg,
+            updateState = update,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -144,7 +108,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun checkForUpdatesOnEntry() {
-        // Resume pending in-app install immediately once user grants "Allow from this source"
         val waitingApk = pendingInstallApk
         if (waitingApk != null && waitingApk.exists() &&
             (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls())
@@ -159,17 +122,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
         checkForUpdates(force = false)
-    }
-
-    fun onUpdatePillTap() {
-        val current = _updateState.value
-        when (current) {
-            is UpdateCheckState.ReadyToInstall -> {
-                viewModelScope.launch { triggerApkInstall(current.apkFile) }
-            }
-            is UpdateCheckState.Checking, is UpdateCheckState.Downloading -> Unit
-            else -> checkForUpdates(force = true)
-        }
     }
 
     fun checkForUpdates(force: Boolean = false) {
@@ -194,7 +146,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
                         return@launch
                     }
 
-                    // No dialog/popup window: show Blackhole perimeter progress ring at 0% -> 100% (360°)
+                    // Silent perimeter-ring download (0% -> 100%, full 360° turn) with zero popup windows
                     _updateState.value = UpdateCheckState.Downloading(release, 0.02f)
                     val apkFile = appUpdateManager.downloadApkInApp(
                         context = context,
@@ -205,7 +157,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
 
                     if (apkFile != null) {
                         _updateState.value = UpdateCheckState.ReadyToInstall(release, apkFile)
-                        // Pause briefly at 100% so the 360° perimeter ring visibly finishes a full turn
                         delay(450L)
                         if (hasPromptedAutoInstallForTag != release.tagName || force) {
                             hasPromptedAutoInstallForTag = release.tagName
@@ -236,60 +187,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun openCookieVault(authUrl: String? = null) {
-        _cookieStatusMessage.value = null
-        _authWebViewUrl.value = authUrl
-        _showCookieVault.value = true
-    }
-
-    fun dismissCookieVault() {
-        _showCookieVault.value = false
-        _authWebViewUrl.value = null
-    }
-
-    fun importCookiesFromUri(uri: Uri) {
-        viewModelScope.launch {
-            val importedCount = withContext(Dispatchers.IO) {
-                val content = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use {
-                    it.readText()
-                }.orEmpty()
-                cookieVault.importNetscapeCookiesTxt(content)
-            }
-            _cookieStatusMessage.value = if (importedCount > 0) {
-                "Imported $importedCount session cookies cleanly."
-            } else {
-                "No valid Netscape/JSON cookies found in selected file."
-            }
-        }
-    }
-
-    fun syncWebViewSession(url: String, retriggerPull: Boolean) {
-        viewModelScope.launch {
-            val count = cookieVault.syncFromWebView(url)
-            _cookieStatusMessage.value = if (count > 0) {
-                "Synced $count cookies from active WebView session."
-            } else {
-                "Session synced."
-            }
-            _showCookieVault.value = false
-            val targetToPull = _inputUrl.value.ifBlank { _authWebViewUrl.value.orEmpty() }
-            _authWebViewUrl.value = null
-            if (retriggerPull && targetToPull.isNotBlank()) {
-                _inputUrl.value = targetToPull
-                val platform = PlatformBadge.fromUrl(targetToPull)
-                DownloadStateCoordinator.setAbsorbing(targetToPull, platform)
-                BlackholeDownloadService.startGravityPull(context, targetToPull)
-            }
-        }
-    }
-
-    fun clearAllCookies() {
-        viewModelScope.launch {
-            cookieVault.clearAllCookies()
-            _cookieStatusMessage.value = "All stored session cookies cleared."
-        }
-    }
-
     fun refreshClipboardOnLaunch() {
         val currentPhase = DownloadStateCoordinator.telemetry.value.phase
         if (currentPhase == DownloadPhase.ABSORBING ||
@@ -302,7 +199,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         if (detected != null) {
             _inputUrl.value = detected.url
             DownloadStateCoordinator.armClipboardUrl(detected.url, detected.platform)
-            _clipboardFeedback.value = null
         }
     }
 
@@ -319,7 +215,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             ?: _inputUrl.value.trim()
         val validUrl = clipboardDetector.extractFirstValidUrl(candidateRaw)
         if (validUrl == null) {
-            _clipboardFeedback.value = "Copy a video URL to clipboard first, then tap the Blackhole"
             DownloadStateCoordinator.setError(
                 sourceUrl = candidateRaw,
                 platform = PlatformBadge.WEB_MEDIA,
@@ -329,14 +224,9 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         _inputUrl.value = validUrl
-        _clipboardFeedback.value = null
         val platform = PlatformBadge.fromUrl(validUrl)
         DownloadStateCoordinator.setAbsorbing(validUrl, platform)
         BlackholeDownloadService.startGravityPull(context, validUrl)
-    }
-
-    fun abortGravityPull() {
-        BlackholeDownloadService.cancelGravityPull(context)
     }
 
     fun deleteVideo(video: DownloadedVideoEntity) {

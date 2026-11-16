@@ -43,13 +43,11 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -80,15 +78,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.data.local.DownloadedVideoEntity
-import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.CyanGlowSoft
@@ -118,7 +113,6 @@ fun DownloadedVideosSwipeUpSheet(
     val context = LocalContext.current
     val gridState = rememberLazyGridState()
     var previewingVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
-    var pendingDeleteVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
 
     BackHandler(enabled = previewingVideo != null || drawerProgress > 0.05f) {
         if (previewingVideo != null) {
@@ -359,46 +353,20 @@ fun DownloadedVideosSwipeUpSheet(
                                         Intent.createChooser(shareIntent, "Share ${video.title}"),
                                     )
                                 },
-                                onDelete = { pendingDeleteVideo = video },
+                                onDelete = { onDeleteVideo(video) },
                             )
                         }
                     }
                 }
             }
         }
-    }
 
-    previewingVideo?.let { activeVideo ->
-        SwipeSheetVideoPlayerModal(
-            video = activeVideo,
-            onDismiss = { previewingVideo = null },
-        )
-    }
-
-    pendingDeleteVideo?.let { toDelete ->
-        AlertDialog(
-            onDismissRequest = { pendingDeleteVideo = null },
-            containerColor = AbyssalSurface,
-            titleContentColor = ChromeSilver,
-            textContentColor = MutedSlate,
-            title = { Text("Delete Capture?") },
-            text = { Text("Remove \"${toDelete.title}\" from your local Blackhole vault?") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        onDeleteVideo(toDelete)
-                        pendingDeleteVideo = null
-                    },
-                ) {
-                    Text("DELETE", color = CrimsonAlert)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingDeleteVideo = null }) {
-                    Text("CANCEL", color = ChromeSilver)
-                }
-            },
-        )
+        previewingVideo?.let { activeVideo ->
+            InlineVideoPlayerView(
+                video = activeVideo,
+                onDismiss = { previewingVideo = null },
+            )
+        }
     }
 }
 
@@ -582,7 +550,7 @@ private fun SwipeSheetVideoCard(
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun SwipeSheetVideoPlayerModal(
+private fun InlineVideoPlayerView(
     video: DownloadedVideoEntity,
     onDismiss: () -> Unit,
 ) {
@@ -603,76 +571,71 @@ private fun SwipeSheetVideoPlayerModal(
         }
     }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ObsidianVoid)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(ObsidianVoid.copy(alpha = 0.96f))
-                .statusBarsPadding()
-                .navigationBarsPadding(),
-        ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = video.title,
-                            style = MaterialTheme.typography.titleMedium,
-                            color = ChromeSilver,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = "${video.qualityLabel} · ${video.resolution} · ${formatSheetFileSize(video.fileSizeBytes)}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = NeonCyan,
-                        )
-                    }
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("close_player_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Close,
-                            contentDescription = "Close media player",
-                            tint = ChromeSilver,
-                        )
-                    }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(Color.Black),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    AndroidView(
-                        factory = { ctx ->
-                            PlayerView(ctx).apply {
-                                player = exoPlayer
-                                useController = true
-                                layoutParams = FrameLayout.LayoutParams(
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                )
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize(),
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = video.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = ChromeSilver,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = "${video.qualityLabel} · ${video.resolution} · ${formatSheetFileSize(video.fileSizeBytes)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NeonCyan,
                     )
                 }
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("close_player_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "Close media player",
+                        tint = ChromeSilver,
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            player = exoPlayer
+                            useController = true
+                            layoutParams = FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
             }
         }
     }

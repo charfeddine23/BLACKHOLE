@@ -8,14 +8,9 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -41,22 +36,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Cookie
-import androidx.compose.material.icons.outlined.SystemUpdate
-import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -79,7 +64,6 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -87,18 +71,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.BuildConfig
 import com.example.data.local.DownloadedVideoEntity
 import com.example.engine.model.DownloadPhase
 import com.example.engine.updater.UpdateCheckState
 import com.example.ui.animation.rememberBlackholeAnimationController
 import com.example.ui.components.BlackholeCoreButton
-import com.example.ui.components.CookieVaultDialog
 import com.example.ui.components.DownloadedVideosSwipeUpSheet
-import com.example.ui.components.LiquidGlassCard
 import com.example.ui.theme.ChromeSilver
-import com.example.ui.theme.CrimsonAlert
-import com.example.ui.theme.CyanGlowSoft
 import com.example.ui.theme.EmeraldPulse
 import com.example.ui.theme.GlassStrokeBright
 import com.example.ui.theme.MutedSlate
@@ -131,7 +110,7 @@ fun BlackholeScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Handle one-time OS "Allow install from this source" toggle only if system requires it for PackageInstaller
+    // Handle one-time OS install permission handoff if required by PackageInstaller
     LaunchedEffect(viewModel) {
         viewModel.requestInstallPermission.collect {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -149,7 +128,6 @@ fun BlackholeScreen(
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
     ) { _ ->
-        // Foreground service still runs cleanly regardless of notification prompt choice
         viewModel.triggerGravityPull()
     }
 
@@ -173,25 +151,9 @@ fun BlackholeScreen(
         uiState = uiState,
         videos = videos,
         onTapBlackhole = initiatePullWithPermissionCheck,
-        onAbortPull = viewModel::abortGravityPull,
         onDeleteVideo = viewModel::deleteVideo,
-        onTapUpdatePill = viewModel::onUpdatePillTap,
-        onOpenCookieVault = { viewModel.openCookieVault(null) },
-        onSignInToUnlock = { authUrl -> viewModel.openCookieVault(authUrl) },
         modifier = modifier,
     )
-
-    if (uiState.showCookieVault) {
-        CookieVaultDialog(
-            initialAuthUrl = uiState.authWebViewUrl,
-            syncedDomains = uiState.syncedDomains,
-            statusMessage = uiState.cookieStatusMessage,
-            onImportCookiesUri = viewModel::importCookiesFromUri,
-            onSyncWebViewSession = viewModel::syncWebViewSession,
-            onClearCookies = viewModel::clearAllCookies,
-            onDismiss = viewModel::dismissCookieVault,
-        )
-    }
 }
 
 @Composable
@@ -199,11 +161,7 @@ private fun BlackholeScreenContent(
     uiState: BlackholeUiState,
     videos: List<DownloadedVideoEntity>,
     onTapBlackhole: () -> Unit,
-    onAbortPull: () -> Unit,
     onDeleteVideo: (DownloadedVideoEntity) -> Unit,
-    onTapUpdatePill: () -> Unit,
-    onOpenCookieVault: () -> Unit,
-    onSignInToUnlock: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val telemetry = uiState.telemetry
@@ -347,21 +305,17 @@ private fun BlackholeScreenContent(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.SpaceBetween,
                 ) {
-                // Minimalist Header
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        text = "BLACKHOLE",
-                        style = MaterialTheme.typography.displaySmall,
-                        color = ChromeSilver,
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    // Minimalist Header
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
+                        Text(
+                            text = "BLACKHOLE",
+                            style = MaterialTheme.typography.displaySmall,
+                            color = ChromeSilver,
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
                         Surface(
                             color = Color.White.copy(alpha = 0.04f),
                             shape = RoundedCornerShape(50),
@@ -385,146 +339,41 @@ private fun BlackholeScreenContent(
                                 )
                             }
                         }
-
-                        val updateState = uiState.updateState
-                        val isCheckingUpdate = updateState is UpdateCheckState.Checking
-                        val isDownloadingUpdate = updateState is UpdateCheckState.Downloading
-                        val isUpdateReady = updateState is UpdateCheckState.ReadyToInstall
-                        val highlightUpdate = isDownloadingUpdate || isUpdateReady
-                        Surface(
-                            color = if (highlightUpdate) CyanGlowSoft.copy(alpha = 0.3f) else Color.White.copy(alpha = 0.04f),
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.75.dp,
-                                if (highlightUpdate) NeonCyan.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.24f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable(onClick = onTapUpdatePill)
-                                .testTag("update_check_pill"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                if (isCheckingUpdate) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(10.dp),
-                                        strokeWidth = 1.5.dp,
-                                        color = NeonCyan,
-                                    )
-                                } else {
-                                    Icon(
-                                        imageVector = Icons.Outlined.SystemUpdate,
-                                        contentDescription = "Check for app updates",
-                                        tint = if (highlightUpdate) NeonCyan else MutedSlate,
-                                        modifier = Modifier.size(12.dp),
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(5.dp))
-                                val pillText = when (updateState) {
-                                    is UpdateCheckState.Downloading -> "${(updateState.progress * 100).toInt()}%"
-                                    is UpdateCheckState.ReadyToInstall -> "INSTALL"
-                                    else -> "v${BuildConfig.VERSION_NAME}"
-                                }
-                                Text(
-                                    text = pillText,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (highlightUpdate) NeonCyan else MutedSlate,
-                                )
-                            }
-                        }
-
-                        val hasCookies = uiState.syncedDomains.isNotEmpty()
-                        Surface(
-                            color = if (hasCookies) CyanGlowSoft.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.04f),
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.75.dp,
-                                if (hasCookies) NeonCyan.copy(alpha = 0.5f) else GlassStrokeBright.copy(alpha = 0.24f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable(onClick = onOpenCookieVault)
-                                .testTag("session_vault_pill"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Cookie,
-                                    contentDescription = "Session and Cookie Vault",
-                                    tint = if (hasCookies) NeonCyan else MutedSlate,
-                                    modifier = Modifier.size(12.dp),
-                                )
-                                if (hasCookies) {
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "${uiState.syncedDomains.size}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = NeonCyan,
-                                    )
-                                }
-                            }
-                        }
                     }
-                }
 
-                // Centerpiece Blackhole Core + Live Telemetry
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .nestedScroll(homeNestedScroll)
-                        .verticalScroll(scrollState),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    val isUpdateActive = uiState.updateState is UpdateCheckState.Downloading ||
-                        uiState.updateState is UpdateCheckState.ReadyToInstall
-                    val updateRingProgress = when (val st = uiState.updateState) {
-                        is UpdateCheckState.Downloading -> st.progress
-                        is UpdateCheckState.ReadyToInstall -> 1f
-                        else -> 0f
-                    }
-                    BlackholeCoreButton(
-                        phase = telemetry.phase,
-                        qualityLabel = telemetry.qualityLabel,
-                        controller = animationController,
-                        onTapBlackhole = onTapBlackhole,
-                        isUpdateActive = isUpdateActive,
-                        updateProgress = updateRingProgress,
-                    )
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    AnimatedVisibility(
-                        visible = telemetry.phase == DownloadPhase.ABSORBING ||
-                            telemetry.phase == DownloadPhase.DOWNLOADING ||
-                            telemetry.phase == DownloadPhase.MERGING ||
-                            telemetry.phase == DownloadPhase.COMPLETED ||
-                            telemetry.phase == DownloadPhase.NEEDS_AUTH ||
-                            telemetry.phase == DownloadPhase.ERROR ||
-                            !uiState.clipboardFeedback.isNullOrBlank(),
-                        enter = fadeIn() + slideInVertically { it / 3 },
-                        exit = fadeOut() + slideOutVertically { it / 3 },
+                    // Centerpiece Blackhole Core (with silent perimeter update ring)
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .nestedScroll(homeNestedScroll)
+                            .verticalScroll(scrollState),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
                     ) {
-                        TelemetryStatusPanel(
-                            uiState = uiState,
-                            onAbortPull = onAbortPull,
-                            onOpenVideosSheet = { snapDrawer(true) },
-                            onSignInToUnlock = onSignInToUnlock,
+                        val isUpdateActive = uiState.updateState is UpdateCheckState.Downloading ||
+                            uiState.updateState is UpdateCheckState.ReadyToInstall
+                        val updateRingProgress = when (val st = uiState.updateState) {
+                            is UpdateCheckState.Downloading -> st.progress
+                            is UpdateCheckState.ReadyToInstall -> 1f
+                            else -> 0f
+                        }
+                        BlackholeCoreButton(
+                            phase = telemetry.phase,
+                            qualityLabel = telemetry.qualityLabel,
+                            controller = animationController,
+                            onTapBlackhole = onTapBlackhole,
+                            isUpdateActive = isUpdateActive,
+                            updateProgress = updateRingProgress,
                         )
                     }
-                }
 
-                // Minimalist Swipe-Up Indicator
-                SwipeUpVaultIndicator(
-                    videoCount = uiState.videoCount,
-                    onSwipeTap = { snapDrawer(true) },
-                )
-            }
+                    // Swipe-Up Downloaded Videos Page Indicator (only secondary page in app)
+                    SwipeUpVaultIndicator(
+                        videoCount = uiState.videoCount,
+                        onSwipeTap = { snapDrawer(true) },
+                    )
+                }
             }
 
             if (drawerProgress.value > 0.001f) {
@@ -542,250 +391,6 @@ private fun BlackholeScreenContent(
                     onCollapse = { snapDrawer(false) },
                     onDeleteVideo = onDeleteVideo,
                 )
-            }
-        }
-    }
-}
-
-@Composable
-private fun TelemetryStatusPanel(
-    uiState: BlackholeUiState,
-    onAbortPull: () -> Unit,
-    onOpenVideosSheet: () -> Unit,
-    onSignInToUnlock: (String) -> Unit,
-) {
-    val telemetry = uiState.telemetry
-
-    LiquidGlassCard(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        highlighted = telemetry.phase == DownloadPhase.DOWNLOADING ||
-            telemetry.phase == DownloadPhase.MERGING ||
-            telemetry.phase == DownloadPhase.COMPLETED,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 14.dp),
-        ) {
-            when {
-                telemetry.phase == DownloadPhase.ABSORBING -> {
-                    Text(
-                        text = "RUNNING MULTI-STRATEGY STREAM EXTRACTION...",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = NeonCyan,
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(50)),
-                        color = NeonCyan,
-                        trackColor = Color.White.copy(alpha = 0.08f),
-                    )
-                }
-
-                telemetry.phase == DownloadPhase.MERGING -> {
-                    Text(
-                        text = "MUXING HIGHEST VIDEO & AUDIO TRACKS...",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = PlasmaViolet,
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(50)),
-                        color = PlasmaViolet,
-                        trackColor = Color.White.copy(alpha = 0.08f),
-                    )
-                }
-
-                telemetry.phase == DownloadPhase.DOWNLOADING -> {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = telemetry.title.ifBlank { "Gravity Pull Active" },
-                            style = MaterialTheme.typography.titleMedium,
-                            color = ChromeSilver,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = formatTransferSpeed(telemetry.speedBytesPerSec),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = NeonCyan,
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    if (telemetry.totalBytes > 0L) {
-                        LinearProgressIndicator(
-                            progress = { telemetry.progressFraction.coerceIn(0f, 1f) },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(5.dp)
-                                .clip(RoundedCornerShape(50)),
-                            color = NeonCyan,
-                            trackColor = Color.White.copy(alpha = 0.08f),
-                        )
-                    } else {
-                        LinearProgressIndicator(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(5.dp)
-                                .clip(RoundedCornerShape(50)),
-                            color = NeonCyan,
-                            trackColor = Color.White.copy(alpha = 0.08f),
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val sizeText = if (telemetry.totalBytes > 0L) {
-                            "${formatMb(telemetry.bytesDownloaded)} / ${formatMb(telemetry.totalBytes)}"
-                        } else {
-                            "${formatMb(telemetry.bytesDownloaded)} pulled"
-                        }
-                        val etaText = if (telemetry.etaSeconds > 0L) {
-                            " · ETA ${formatEtaText(telemetry.etaSeconds)}"
-                        } else {
-                            ""
-                        }
-                        Text(
-                            text = "$sizeText · ${telemetry.qualityLabel}$etaText",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MutedSlate,
-                        )
-                        TextButton(
-                            onClick = onAbortPull,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("abort_download_button"),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Close,
-                                contentDescription = "Abort download",
-                                tint = CrimsonAlert,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "ABORT",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = CrimsonAlert,
-                            )
-                        }
-                    }
-                }
-
-                telemetry.phase == DownloadPhase.COMPLETED -> {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "CAPTURED IN LOCAL VAULT",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldPulse,
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "${telemetry.title} (${telemetry.qualityLabel})",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = ChromeSilver,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        TextButton(
-                            onClick = onOpenVideosSheet,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("open_vault_cta"),
-                        ) {
-                            Text(
-                                text = "OPEN",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = NeonCyan,
-                            )
-                        }
-                    }
-                }
-
-                telemetry.phase == DownloadPhase.NEEDS_AUTH -> {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = "SESSION AUTHENTICATION REQUIRED",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = PlasmaViolet,
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = telemetry.errorMessage ?: "Sign in via WebView or import cookies.txt to bypass login gate.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = ChromeSilver,
-                        )
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
-                        ) {
-                            Button(
-                                onClick = {
-                                    onSignInToUnlock(telemetry.needsAuthUrl ?: telemetry.sourceUrl)
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = NeonCyan,
-                                    contentColor = ObsidianVoid,
-                                ),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("sign_in_unlock_button"),
-                            ) {
-                                Text(
-                                    text = "SIGN IN & SYNC",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ObsidianVoid,
-                                )
-                            }
-                        }
-                    }
-                }
-
-                telemetry.phase == DownloadPhase.ERROR || !uiState.clipboardFeedback.isNullOrBlank() -> {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.ErrorOutline,
-                            contentDescription = "Extraction error",
-                            tint = CrimsonAlert,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = telemetry.errorMessage
-                                ?: uiState.clipboardFeedback
-                                ?: "Unable to extract stream.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = ChromeSilver,
-                        )
-                    }
-                }
             }
         }
     }
@@ -831,24 +436,4 @@ private fun SwipeUpVaultIndicator(
             color = MutedSlate.copy(alpha = 0.72f),
         )
     }
-}
-
-private fun formatMb(bytes: Long): String {
-    val mb = bytes / (1024.0 * 1024.0)
-    return String.format("%.1f MB", mb)
-}
-
-private fun formatTransferSpeed(bytesPerSec: Long): String {
-    val mb = bytesPerSec / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        String.format("%.1f MB/s", mb)
-    } else {
-        "${(bytesPerSec / 1024L).coerceAtLeast(1L)} KB/s"
-    }
-}
-
-private fun formatEtaText(seconds: Long): String {
-    val mins = seconds / 60L
-    val secs = seconds % 60L
-    return String.format("%02d:%02d", mins, secs)
 }

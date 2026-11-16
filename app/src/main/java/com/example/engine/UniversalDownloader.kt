@@ -114,6 +114,61 @@ class UniversalDownloader(
     }
 
     /**
+     * Strict Bulletproof Extraction Command builder requiring a valid Netscape cookies file path
+     * from SessionVaultManager to bypass login-gated Instagram and YouTube restrictions.
+     */
+    fun getBulletproofExtractionCommand(
+        targetUrl: String,
+        cookieFilePath: String? = sessionVault.writeTempNetscapeCookiesFile(context.cacheDir)?.absolutePath,
+    ): List<String> {
+        val command = mutableListOf("yt-dlp")
+
+        // 1. Mandatory Netscape cookies injection when session is present
+        if (!cookieFilePath.isNullOrBlank()) {
+            command.add("--cookies")
+            command.add(cookieFilePath)
+        } else {
+            throw IllegalStateException("Session Vault is empty! Please import cookies.txt to bypass authentication.")
+        }
+
+        // 2. Anti-bot spoofing headers & bypass flags
+        command.add("--user-agent")
+        command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
+        command.add("--no-check-certificate")
+        command.add("--geo-bypass")
+
+        // 3. Smart platform-specific routing
+        val lower = targetUrl.lowercase()
+        when {
+            lower.contains("youtube.com") || lower.contains("youtu.be") -> {
+                command.add("--extractor-args")
+                command.add("youtube:player_client=ios,web")
+                command.add("-f")
+                command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
+            }
+            lower.contains("instagram.com") || lower.contains("instagr.am") -> {
+                command.add("--referer")
+                command.add("https://www.instagram.com/")
+                command.add("-f")
+                command.add("best")
+            }
+            lower.contains("tiktok.com") -> {
+                command.add("--referer")
+                command.add("https://www.tiktok.com/")
+                command.add("-f")
+                command.add("best")
+            }
+            else -> {
+                command.add("-f")
+                command.add("best")
+            }
+        }
+
+        command.add(targetUrl)
+        return command
+    }
+
+    /**
      * Resolves shortened URLs (vt.tiktok.com, vm.tiktok.com, fb.watch, instagr.am, t.co, etc.)
      * and executes multi-strategy extraction with CookieVault session injection.
      */
@@ -121,7 +176,11 @@ class UniversalDownloader(
         val trimmed = rawUrl.trim()
         val canonicalUrl = resolveShortUrlIfNeeded(trimmed)
         val platform = PlatformBadge.fromUrl(canonicalUrl)
-        val commandPlan = getUniversalExtractionCommand(canonicalUrl, sessionVault)
+        val commandPlan = runCatching {
+            getBulletproofExtractionCommand(canonicalUrl)
+        }.getOrElse {
+            getUniversalExtractionCommand(canonicalUrl, sessionVault)
+        }
 
         val result = streamExtractor.extractHighestQuality(canonicalUrl)
         UniversalExtractionOutcome(
