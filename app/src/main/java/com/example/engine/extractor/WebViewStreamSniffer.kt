@@ -92,11 +92,11 @@ class WebViewStreamSniffer(
                         val reqUrl = request?.url?.toString().orEmpty()
                         if (isCandidateMediaNetworkUrl(reqUrl)) {
                             captured.add(reqUrl)
-                            // Prefer completing quickly if we captured an explicit mp4 or m3u8
+                            // Allow brief window for ABR quality upgrade before finishing
                             if (reqUrl.contains(".mp4", ignoreCase = true) ||
                                 reqUrl.contains(".m3u8", ignoreCase = true)
                             ) {
-                                view?.postDelayed({ finish(loginGate = false) }, 900L)
+                                view?.postDelayed({ finish(loginGate = false) }, 1800L)
                             }
                         }
                         return super.shouldInterceptRequest(view, request)

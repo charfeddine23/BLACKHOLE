@@ -39,6 +39,7 @@ data class ExtractedStream(
     val headers: Map<String, String> = emptyMap(),
     val audioStreamUrl: String? = null,
     val isHls: Boolean = false,
+    val bitrateBps: Long = 0L,
 )
 
 sealed class ExtractionResult {
