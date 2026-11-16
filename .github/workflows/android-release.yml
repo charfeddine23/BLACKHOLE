@@ -52,15 +52,34 @@ jobs:
           echo "apk_path=${OUTPUT_APK}" >> "$GITHUB_OUTPUT"
           echo "Auto-versioning build -> versionCode=${VERSION_CODE}, versionName=${VERSION_NAME}, asset=${OUTPUT_APK}"
 
-      - name: Decode Release Keystore
+      - name: Prepare Release Keystore
+        id: signing
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_STORE_PASS: ${{ secrets.STORE_PASSWORD }}
+          SECRET_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::error::KEYSTORE_BASE64 secret is missing."
+          KEYSTORE_FILE="${{ github.workspace }}/my-upload-key.jks"
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$SECRET_STORE_PASS" ] && [ -n "$SECRET_KEY_PASS" ]; then
+            echo "$KEYSTORE_BASE64" | tr -d '\n\r ' | base64 --decode > "$KEYSTORE_FILE"
+            echo "keystore_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "use_custom_secrets=true" >> "$GITHUB_OUTPUT"
+            echo "Using custom release keystore from GitHub Secrets."
+          elif [ -f "debug.keystore.base64" ]; then
+            echo "::notice::KEYSTORE_BASE64 secret not set; using fixed repository fallback keystore (debug.keystore.base64) for consistent update signatures."
+            tr -d '\n\r ' < debug.keystore.base64 | base64 --decode > "$KEYSTORE_FILE"
+            keytool -changealias \
+              -keystore "$KEYSTORE_FILE" \
+              -storepass android \
+              -alias androiddebugkey \
+              -destalias upload \
+              -keypass android
+            echo "keystore_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "use_custom_secrets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Neither KEYSTORE_BASE64 secret nor debug.keystore.base64 was found."
             exit 1
           fi
-          echo "$KEYSTORE_BASE64" | tr -d '\n\r ' | base64 --decode > "${{ github.workspace }}/my-upload-key.jks"
 
       - name: Ensure Gradle Wrapper Executable
         run: |
@@ -71,9 +90,9 @@ jobs:
 
       - name: Build & Sign Release APK
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PATH: ${{ steps.signing.outputs.keystore_path }}
+          STORE_PASSWORD: ${{ steps.signing.outputs.use_custom_secrets == 'true' && secrets.STORE_PASSWORD || 'android' }}
+          KEY_PASSWORD: ${{ steps.signing.outputs.use_custom_secrets == 'true' && secrets.KEY_PASSWORD || 'android' }}
           BUILD_VERSION_CODE: ${{ steps.versioning.outputs.version_code }}
           BUILD_VERSION_NAME: ${{ steps.versioning.outputs.version_name }}
         run: ./gradlew assembleRelease --no-daemon
