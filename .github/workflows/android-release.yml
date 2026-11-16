@@ -2,16 +2,15 @@ name: Android Release CI/CD
 
 on:
   push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build-and-release:
-    name: Build, Sign & Publish Release APK
+    name: Build, Sign & Publish Latest Release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -30,6 +29,28 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
+
+      - name: Compute Auto-Incremented Version (1.x.x)
+        id: versioning
+        run: |
+          RUN_NUM=${{ github.run_number }}
+          VERSION_CODE=$((RUN_NUM + 1))
+          MINOR=$(( (RUN_NUM) / 100 ))
+          PATCH=$(( (RUN_NUM) % 100 ))
+          VERSION_NAME="1.${MINOR}.${PATCH}"
+          TAG_NAME="v${VERSION_NAME}"
+
+          APP_NAME=$(grep -E 'rootProject\.name\s*=' settings.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' | tr -d ' ')
+          if [ -z "$APP_NAME" ]; then
+            APP_NAME="Blackhole"
+          fi
+
+          OUTPUT_APK="${APP_NAME}.v${VERSION_NAME}.apk"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_path=${OUTPUT_APK}" >> "$GITHUB_OUTPUT"
+          echo "Auto-versioning build -> versionCode=${VERSION_CODE}, versionName=${VERSION_NAME}, asset=${OUTPUT_APK}"
 
       - name: Decode Release Keystore
         env:
@@ -53,58 +74,67 @@ jobs:
           KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          BUILD_VERSION_CODE: ${{ steps.versioning.outputs.version_code }}
+          BUILD_VERSION_NAME: ${{ steps.versioning.outputs.version_name }}
         run: ./gradlew assembleRelease --no-daemon
 
-      - name: Extract Version & Rename Output APK
-        id: metadata
+      - name: Rename Output APK
         run: |
-          VERSION_NAME=$(grep -E 'versionName\s*=' app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$VERSION_NAME" ]; then
-            echo "::error::Unable to extract versionName from app/build.gradle.kts"
-            exit 1
-          fi
-          APP_NAME=$(grep -E 'rootProject\.name\s*=' settings.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' | tr -d ' ')
-          if [ -z "$APP_NAME" ]; then
-            APP_NAME="Blackhole"
-          fi
           RELEASE_APK=$(find app/build/outputs/apk/release -maxdepth 1 -name "*.apk" | head -n 1)
           if [ -z "$RELEASE_APK" ]; then
             echo "::error::No release APK found in app/build/outputs/apk/release"
             exit 1
           fi
-          OUTPUT_APK="${APP_NAME}-v${VERSION_NAME}.apk"
-          cp "$RELEASE_APK" "$OUTPUT_APK"
-          TAG_NAME="v${VERSION_NAME}"
-          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
-          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "apk_path=${OUTPUT_APK}" >> "$GITHUB_OUTPUT"
+          cp "$RELEASE_APK" "${{ steps.versioning.outputs.apk_path }}"
 
-      - name: Check Existing Release Tag
-        id: check_tag
-        run: |
-          git fetch --tags --force
-          if git rev-parse "refs/tags/${{ steps.metadata.outputs.tag_name }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${{ steps.metadata.outputs.tag_name }} already exists. Skipping duplicate release creation."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish GitHub Release
-        if: steps.check_tag.outputs.exists != 'true'
+      - name: Publish Latest GitHub Release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.metadata.outputs.tag_name }}
-          name: "${{ steps.metadata.outputs.tag_name }}"
+          tag_name: ${{ steps.versioning.outputs.tag_name }}
+          name: "${{ steps.versioning.outputs.tag_name }}"
           body: |
-            Automated signed release build for **${{ steps.metadata.outputs.apk_path }}**.
-            - Version: `${{ steps.metadata.outputs.version_name }}`
+            Automated signed release build for **${{ steps.versioning.outputs.apk_path }}**.
+            - Version Name: `${{ steps.versioning.outputs.version_name }}`
+            - Version Code: `${{ steps.versioning.outputs.version_code }}`
             - Commit: `${{ github.sha }}`
-          files: ${{ steps.metadata.outputs.apk_path }}
+          files: ${{ steps.versioning.outputs.apk_path }}
           draft: false
           prerelease: false
+
+      - name: Delete Old Releases & Tags (Keep Latest Only)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_TAG: ${{ steps.versioning.outputs.tag_name }}
+        run: |
+          gh release list --limit 100 --json tagName --jq '.[].tagName' | while read -r old_tag; do
+            if [ -n "$old_tag" ] && [ "$old_tag" != "$LATEST_TAG" ]; then
+              echo "Deleting old release and tag: $old_tag"
+              gh release delete "$old_tag" --yes --cleanup-tag || true
+            fi
+          done
+
+          git fetch --tags --force
+          git tag -l 'v*' | while read -r tag; do
+            if [ -n "$tag" ] && [ "$tag" != "$LATEST_TAG" ]; then
+              echo "Removing leftover tag: $tag"
+              git push origin ":refs/tags/$tag" || true
+            fi
+          done
+
+      - name: Clean Up Old GitHub Actions History
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/runs?per_page=100" \
+            --jq ".workflow_runs[] | select(.id != ${{ github.run_id }} and .status == \"completed\") | .id" | \
+            while read -r run_id; do
+              if [ -n "$run_id" ]; then
+                echo "Deleting old workflow run: $run_id"
+                gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run_id" || true
+              fi
+            done
 
       - name: Cleanup Decoded Keystore
         if: always()
