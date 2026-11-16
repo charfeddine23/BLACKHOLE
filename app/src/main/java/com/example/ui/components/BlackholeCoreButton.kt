@@ -1,6 +1,13 @@
 package com.example.ui.components
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
@@ -24,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -66,10 +74,28 @@ fun BlackholeCoreButton(
     onTapBlackhole: () -> Unit,
     modifier: Modifier = Modifier,
     coreDiameter: Dp = 264.dp,
+    isUpdateActive: Boolean = false,
+    updateProgress: Float = 0f,
 ) {
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val interactionSource = remember { MutableInteractionSource() }
+
+    val smoothUpdateProgress by animateFloatAsState(
+        targetValue = updateProgress.coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 280, easing = LinearEasing),
+        label = "update_perimeter_progress",
+    )
+    val updateInfinite = rememberInfiniteTransition(label = "update_perimeter_orbit")
+    val updateOrbitAngle by updateInfinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1250, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "update_orbit_angle",
+    )
 
     val primaryGlow = when (phase) {
         DownloadPhase.COMPLETED -> EmeraldPulse
@@ -151,6 +177,64 @@ fun BlackholeCoreButton(
                 radius = coreDiameter.toPx() * 0.62f,
                 center = center,
             )
+
+            // Silent In-App Update Ring spinning & sweeping around Blackhole perimeter (0° -> 360° full circle)
+            if (isUpdateActive) {
+                val perimeterRadius = (coreDiameter.toPx() / 2f) + 6.dp.toPx()
+                val arcSize = Size(perimeterRadius * 2f, perimeterRadius * 2f)
+                val arcTopLeft = Offset(
+                    center.x - perimeterRadius,
+                    center.y - perimeterRadius,
+                )
+
+                // Subtle guide ring around Blackhole perimeter
+                drawCircle(
+                    color = NeonCyan.copy(alpha = 0.14f),
+                    radius = perimeterRadius,
+                    center = center,
+                    style = Stroke(width = 3.dp.toPx()),
+                )
+
+                // Cumulative sweep arc reaching full 360° circle upon completion
+                drawArc(
+                    brush = Brush.sweepGradient(
+                        colors = listOf(
+                            NeonCyan,
+                            ElectricBlue,
+                            EmeraldPulse,
+                            NeonCyan,
+                        ),
+                        center = center,
+                    ),
+                    startAngle = -90f,
+                    sweepAngle = (360f * smoothUpdateProgress).coerceIn(0f, 360f),
+                    useCenter = false,
+                    topLeft = arcTopLeft,
+                    size = arcSize,
+                    style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round),
+                )
+
+                // Spinning orbital flare along the perimeter while downloading
+                if (smoothUpdateProgress < 0.995f) {
+                    drawArc(
+                        brush = Brush.sweepGradient(
+                            colors = listOf(
+                                Color.Transparent,
+                                NeonCyan.copy(alpha = 0.9f),
+                                Color.White.copy(alpha = 0.95f),
+                                Color.Transparent,
+                            ),
+                            center = center,
+                        ),
+                        startAngle = updateOrbitAngle - 90f,
+                        sweepAngle = 72f,
+                        useCenter = false,
+                        topLeft = arcTopLeft,
+                        size = arcSize,
+                        style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round),
+                    )
+                }
+            }
         }
 
         // Interactive Blackhole Sphere

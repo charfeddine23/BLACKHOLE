@@ -47,12 +47,17 @@ class VideoStreamExtractor(
                 }
             }
 
-            // Strategy 2: Platform-specific endpoints (YouTube InnerTube, Vimeo config, Reddit video+audio)
+            // Strategy 2: Platform-specific endpoints (YouTube InnerTube, TikTok iOS Safari, Vimeo, Reddit)
             val platformStreams = when (platform) {
                 PlatformBadge.YOUTUBE -> {
                     val ytResult = extractYoutubeStreams(cleanUrl)
                     if (ytResult.authChallenge) sawAuthChallenge = true
                     ytResult.streams
+                }
+                PlatformBadge.TIKTOK -> {
+                    val ttResult = extractTikTokStreams(cleanUrl)
+                    if (ttResult.authChallenge) sawAuthChallenge = true
+                    ttResult.streams
                 }
                 PlatformBadge.VIMEO -> extractVimeoStreams(cleanUrl)
                 PlatformBadge.REDDIT -> extractRedditStreams(cleanUrl)
@@ -507,6 +512,185 @@ class VideoStreamExtractor(
         return null
     }
 
+    private fun extractTikTokStreams(url: String): HtmlProbeOutcome {
+        val tiktokHeaders = mapOf(
+            "User-Agent" to ClientSpoofer.TIKTOK_IOS_USER_AGENT,
+            "Referer" to "https://www.tiktok.com/",
+            "Origin" to "https://www.tiktok.com",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+        )
+        val reqBuilder = Request.Builder().url(url)
+        tiktokHeaders.forEach { (k, v) -> reqBuilder.header(k, v) }
+
+        return runCatching {
+            client.newCall(reqBuilder.build()).execute().use { response ->
+                if (response.code == 401 || response.code == 403) {
+                    return HtmlProbeOutcome(emptyList(), authChallenge = true)
+                }
+                if (!response.isSuccessful) {
+                    return HtmlProbeOutcome(emptyList(), authChallenge = false)
+                }
+
+                val finalUrl = response.request.url.toString()
+                val html = response.body?.string().orEmpty()
+                if (html.isBlank()) return HtmlProbeOutcome(emptyList(), authChallenge = false)
+
+                val pageTitle = extractPageTitle(html) ?: "TikTok_Video"
+                val found = mutableListOf<ExtractedStream>()
+
+                // 1. Parse __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON script payload
+                val universalMatch = Regex(
+                    """<script[^>]+id=["']__UNIVERSAL_DATA_FOR_REHYDRATION__["'][^>]*>([\s\S]*?)</script>""",
+                    RegexOption.IGNORE_CASE,
+                ).find(html)?.groupValues?.getOrNull(1)
+
+                if (!universalMatch.isNullOrBlank()) {
+                    val root = runCatching { JSONObject(universalMatch) }.getOrNull()
+                    val defaultScope = root?.optJSONObject("__DEFAULT_SCOPE__")
+                    val videoDetail = defaultScope?.optJSONObject("webapp.video-detail")
+                        ?.optJSONObject("itemInfo")
+                        ?.optJSONObject("itemStruct")
+                    if (videoDetail != null) {
+                        val desc = videoDetail.optString("desc").takeIf { it.isNotBlank() }?.let(::sanitizeTitle)
+                            ?: pageTitle
+                        val videoObj = videoDetail.optJSONObject("video")
+                        if (videoObj != null) {
+                            extractTikTokVideoObjectStreams(videoObj, desc, tiktokHeaders, found)
+                        }
+                    }
+                }
+
+                // 2. Fallback: parse legacy SIGI_STATE JSON payload
+                if (found.isEmpty()) {
+                    val sigiMatch = Regex(
+                        """<script[^>]+id=["']SIGI_STATE["'][^>]*>([\s\S]*?)</script>""",
+                        RegexOption.IGNORE_CASE,
+                    ).find(html)?.groupValues?.getOrNull(1)
+
+                    if (!sigiMatch.isNullOrBlank()) {
+                        val sigiRoot = runCatching { JSONObject(sigiMatch) }.getOrNull()
+                        val itemModule = sigiRoot?.optJSONObject("ItemModule")
+                        val keys = itemModule?.keys()
+                        if (keys != null) {
+                            while (keys.hasNext()) {
+                                val itemObj = itemModule.optJSONObject(keys.next()) ?: continue
+                                val desc = itemObj.optString("desc").takeIf { it.isNotBlank() }?.let(::sanitizeTitle)
+                                    ?: pageTitle
+                                val videoObj = itemObj.optJSONObject("video") ?: continue
+                                extractTikTokVideoObjectStreams(videoObj, desc, tiktokHeaders, found)
+                            }
+                        }
+                    }
+                }
+
+                // 3. Fallback: regex scan for unescaped playAddr / downloadAddr URLs
+                if (found.isEmpty()) {
+                    val unescaped = unescapeMarkup(html)
+                    val addrRegex = Regex(
+                        """"(?:playAddr|downloadAddr)"\s*:\s*"(https?://[^"]+)"""",
+                        RegexOption.IGNORE_CASE,
+                    )
+                    addrRegex.findAll(unescaped).forEach { match ->
+                        val rawStreamUrl = match.groupValues[1]
+                        if (rawStreamUrl.startsWith("http")) {
+                            found.add(
+                                ExtractedStream(
+                                    streamUrl = rawStreamUrl,
+                                    title = pageTitle,
+                                    platform = PlatformBadge.TIKTOK,
+                                    qualityLabel = "1080P FHD",
+                                    resolutionHeight = 1080,
+                                    mimeType = "video/mp4",
+                                    estimatedBytes = -1L,
+                                    headers = tiktokHeaders,
+                                ),
+                            )
+                        }
+                    }
+                }
+
+                val isCaptchaOrLogin = finalUrl.contains("/login", ignoreCase = true) ||
+                    html.contains("verify-bar-close", ignoreCase = true)
+
+                HtmlProbeOutcome(
+                    streams = found.distinctBy { it.streamUrl },
+                    authChallenge = isCaptchaOrLogin && found.isEmpty(),
+                )
+            }
+        }.getOrDefault(HtmlProbeOutcome(emptyList(), false))
+    }
+
+    private fun extractTikTokVideoObjectStreams(
+        videoObj: JSONObject,
+        title: String,
+        headers: Map<String, String>,
+        out: MutableList<ExtractedStream>,
+    ) {
+        val defaultHeight = videoObj.optInt("height", 1080).coerceAtLeast(360)
+        val bitrateInfo = videoObj.optJSONArray("bitrateInfo")
+        if (bitrateInfo != null) {
+            for (i in 0 until bitrateInfo.length()) {
+                val entry = bitrateInfo.optJSONObject(i) ?: continue
+                val playAddr = entry.optJSONObject("PlayAddr") ?: continue
+                val urlList = playAddr.optJSONArray("UrlList") ?: continue
+                val height = playAddr.optInt("Height", defaultHeight).coerceAtLeast(360)
+                val sizeBytes = playAddr.optLong("DataSize", -1L)
+                for (j in 0 until urlList.length()) {
+                    val candidateUrl = urlList.optString(j)
+                    if (candidateUrl.startsWith("http")) {
+                        out.add(
+                            ExtractedStream(
+                                streamUrl = candidateUrl,
+                                title = title,
+                                platform = PlatformBadge.TIKTOK,
+                                qualityLabel = formatQualityLabel(height),
+                                resolutionHeight = height,
+                                mimeType = "video/mp4",
+                                estimatedBytes = sizeBytes,
+                                headers = headers,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+
+        val playAddr = videoObj.optString("playAddr")
+        if (playAddr.startsWith("http")) {
+            out.add(
+                ExtractedStream(
+                    streamUrl = playAddr,
+                    title = title,
+                    platform = PlatformBadge.TIKTOK,
+                    qualityLabel = formatQualityLabel(defaultHeight),
+                    resolutionHeight = defaultHeight,
+                    mimeType = "video/mp4",
+                    estimatedBytes = -1L,
+                    headers = headers,
+                ),
+            )
+        }
+
+        if (out.isEmpty()) {
+            val downloadAddr = videoObj.optString("downloadAddr")
+            if (downloadAddr.startsWith("http")) {
+                out.add(
+                    ExtractedStream(
+                        streamUrl = downloadAddr,
+                        title = title,
+                        platform = PlatformBadge.TIKTOK,
+                        qualityLabel = formatQualityLabel(defaultHeight),
+                        resolutionHeight = defaultHeight,
+                        mimeType = "video/mp4",
+                        estimatedBytes = -1L,
+                        headers = headers,
+                    ),
+                )
+            }
+        }
+    }
+
     private fun extractVimeoStreams(url: String): List<ExtractedStream> {
         val idMatch = Regex("""vimeo\.com/(?:video/)?(\d+)""").find(url) ?: return emptyList()
         val videoId = idMatch.groupValues[1]
@@ -807,7 +991,8 @@ class VideoStreamExtractor(
         val pathOnly = lower.substringBefore("?")
         return pathOnly.endsWith(".mp4") || pathOnly.endsWith(".webm") ||
             pathOnly.endsWith(".mov") || pathOnly.endsWith(".m4v") ||
-            lower.contains("mime=video") || lower.contains(".mp4?")
+            lower.contains("mime=video") || lower.contains("mime_type=video") ||
+            lower.contains("video_mp4") || lower.contains(".mp4?")
     }
 
     private fun resolveMimeType(contentType: String, url: String): String {

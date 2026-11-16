@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -43,7 +44,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Cookie
 import androidx.compose.material.icons.outlined.SystemUpdate
-import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material3.Button
@@ -82,7 +82,6 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -91,7 +90,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.data.local.DownloadedVideoEntity
 import com.example.engine.model.DownloadPhase
-import com.example.engine.updater.AppUpdateManager
 import com.example.engine.updater.UpdateCheckState
 import com.example.ui.animation.rememberBlackholeAnimationController
 import com.example.ui.components.BlackholeCoreButton
@@ -133,14 +131,17 @@ fun BlackholeScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Automatically open the APK / release download link when a new update is found
+    // Handle one-time OS "Allow install from this source" toggle only if system requires it for PackageInstaller
     LaunchedEffect(viewModel) {
-        viewModel.autoLaunchUpdateUrl.collect { updateUrl ->
-            runCatching {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateUrl)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        viewModel.requestInstallPermission.collect {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                runCatching {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:${context.packageName}"),
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
                 }
-                context.startActivity(intent)
             }
         }
     }
@@ -174,27 +175,11 @@ fun BlackholeScreen(
         onTapBlackhole = initiatePullWithPermissionCheck,
         onAbortPull = viewModel::abortGravityPull,
         onDeleteVideo = viewModel::deleteVideo,
-        onOpenUpdateDialog = viewModel::openUpdateDialog,
+        onTapUpdatePill = viewModel::onUpdatePillTap,
         onOpenCookieVault = { viewModel.openCookieVault(null) },
         onSignInToUnlock = { authUrl -> viewModel.openCookieVault(authUrl) },
         modifier = modifier,
     )
-
-    if (uiState.showUpdateDialog) {
-        LiquidGlassUpdateDialog(
-            updateState = uiState.updateState,
-            autoDownloadTriggered = uiState.autoDownloadTriggered,
-            onDownloadUpdate = { url ->
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-                viewModel.dismissUpdateDialog()
-            },
-            onRetryCheck = { viewModel.checkForUpdates(silent = false, autoDownloadIfFound = true) },
-            onDismiss = viewModel::dismissUpdateDialog,
-        )
-    }
 
     if (uiState.showCookieVault) {
         CookieVaultDialog(
@@ -216,7 +201,7 @@ private fun BlackholeScreenContent(
     onTapBlackhole: () -> Unit,
     onAbortPull: () -> Unit,
     onDeleteVideo: (DownloadedVideoEntity) -> Unit,
-    onOpenUpdateDialog: () -> Unit,
+    onTapUpdatePill: () -> Unit,
     onOpenCookieVault: () -> Unit,
     onSignInToUnlock: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -401,18 +386,21 @@ private fun BlackholeScreenContent(
                             }
                         }
 
-                        val hasUpdate = uiState.updateState is UpdateCheckState.UpdateAvailable
-                        val isCheckingUpdate = uiState.updateState is UpdateCheckState.Checking
+                        val updateState = uiState.updateState
+                        val isCheckingUpdate = updateState is UpdateCheckState.Checking
+                        val isDownloadingUpdate = updateState is UpdateCheckState.Downloading
+                        val isUpdateReady = updateState is UpdateCheckState.ReadyToInstall
+                        val highlightUpdate = isDownloadingUpdate || isUpdateReady
                         Surface(
-                            color = if (hasUpdate) CyanGlowSoft.copy(alpha = 0.3f) else Color.White.copy(alpha = 0.04f),
+                            color = if (highlightUpdate) CyanGlowSoft.copy(alpha = 0.3f) else Color.White.copy(alpha = 0.04f),
                             shape = RoundedCornerShape(50),
                             border = BorderStroke(
                                 0.75.dp,
-                                if (hasUpdate) NeonCyan.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.24f),
+                                if (highlightUpdate) NeonCyan.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.24f),
                             ),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
-                                .clickable(onClick = onOpenUpdateDialog)
+                                .clickable(onClick = onTapUpdatePill)
                                 .testTag("update_check_pill"),
                         ) {
                             Row(
@@ -429,19 +417,20 @@ private fun BlackholeScreenContent(
                                     Icon(
                                         imageVector = Icons.Outlined.SystemUpdate,
                                         contentDescription = "Check for app updates",
-                                        tint = if (hasUpdate) NeonCyan else MutedSlate,
+                                        tint = if (highlightUpdate) NeonCyan else MutedSlate,
                                         modifier = Modifier.size(12.dp),
                                     )
                                 }
                                 Spacer(modifier = Modifier.width(5.dp))
+                                val pillText = when (updateState) {
+                                    is UpdateCheckState.Downloading -> "${(updateState.progress * 100).toInt()}%"
+                                    is UpdateCheckState.ReadyToInstall -> "INSTALL"
+                                    else -> "v${BuildConfig.VERSION_NAME}"
+                                }
                                 Text(
-                                    text = if (hasUpdate) {
-                                        "UPDATE"
-                                    } else {
-                                        "v${BuildConfig.VERSION_NAME}"
-                                    },
+                                    text = pillText,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = if (hasUpdate) NeonCyan else MutedSlate,
+                                    color = if (highlightUpdate) NeonCyan else MutedSlate,
                                 )
                             }
                         }
@@ -492,11 +481,20 @@ private fun BlackholeScreenContent(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
+                    val isUpdateActive = uiState.updateState is UpdateCheckState.Downloading ||
+                        uiState.updateState is UpdateCheckState.ReadyToInstall
+                    val updateRingProgress = when (val st = uiState.updateState) {
+                        is UpdateCheckState.Downloading -> st.progress
+                        is UpdateCheckState.ReadyToInstall -> 1f
+                        else -> 0f
+                    }
                     BlackholeCoreButton(
                         phase = telemetry.phase,
                         qualityLabel = telemetry.qualityLabel,
                         controller = animationController,
                         onTapBlackhole = onTapBlackhole,
+                        isUpdateActive = isUpdateActive,
+                        updateProgress = updateRingProgress,
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -853,229 +851,4 @@ private fun formatEtaText(seconds: Long): String {
     val mins = seconds / 60L
     val secs = seconds % 60L
     return String.format("%02d:%02d", mins, secs)
-}
-
-@Composable
-private fun LiquidGlassUpdateDialog(
-    updateState: UpdateCheckState,
-    autoDownloadTriggered: Boolean,
-    onDownloadUpdate: (String) -> Unit,
-    onRetryCheck: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    Dialog(onDismissRequest = onDismiss) {
-        LiquidGlassCard(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(26.dp),
-            highlighted = updateState is UpdateCheckState.UpdateAvailable,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(22.dp),
-            ) {
-                when (updateState) {
-                    is UpdateCheckState.UpdateAvailable -> {
-                        val release = updateState.release
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Outlined.SystemUpdate,
-                                contentDescription = null,
-                                tint = NeonCyan,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = if (autoDownloadTriggered) {
-                                    "AUTO-DOWNLOADING UPDATE"
-                                } else {
-                                    "UPDATE AVAILABLE"
-                                },
-                                style = MaterialTheme.typography.labelLarge,
-                                color = NeonCyan,
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text(
-                            text = "v${BuildConfig.VERSION_NAME}  ->  ${release.tagName}",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = ChromeSilver,
-                        )
-                        if (!release.apkFileName.isNullOrBlank()) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            val sizeLabel = if (release.apkSizeBytes > 0L) {
-                                " · ${formatMb(release.apkSizeBytes)}"
-                            } else {
-                                ""
-                            }
-                            Text(
-                                text = "${release.apkFileName}$sizeLabel",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MutedSlate,
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = release.releaseNotes,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = ChromeSilver.copy(alpha = 0.88f),
-                            maxLines = 6,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Spacer(modifier = Modifier.height(18.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            TextButton(
-                                onClick = onDismiss,
-                                modifier = Modifier.minimumInteractiveComponentSize(),
-                            ) {
-                                Text(
-                                    text = "LATER",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MutedSlate,
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Button(
-                                onClick = { onDownloadUpdate(release.preferredLaunchUrl) },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = NeonCyan,
-                                    contentColor = ObsidianVoid,
-                                ),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("download_update_button"),
-                            ) {
-                                Text(
-                                    text = "DOWNLOAD APK",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ObsidianVoid,
-                                )
-                            }
-                        }
-                    }
-
-                    is UpdateCheckState.UpToDate -> {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Rounded.CheckCircleOutline,
-                                contentDescription = null,
-                                tint = EmeraldPulse,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "BLACKHOLE IS UP TO DATE",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = EmeraldPulse,
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text(
-                            text = "Running latest version v${updateState.currentVersion} from github.com/charfeddine23/BLACKHOLE.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = ChromeSilver,
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
-                        ) {
-                            TextButton(
-                                onClick = { onDownloadUpdate(AppUpdateManager.REPO_URL) },
-                                modifier = Modifier.minimumInteractiveComponentSize(),
-                            ) {
-                                Text(
-                                    text = "OPEN GITHUB",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = NeonCyan,
-                                )
-                            }
-                            TextButton(
-                                onClick = onDismiss,
-                                modifier = Modifier.minimumInteractiveComponentSize(),
-                            ) {
-                                Text(
-                                    text = "CLOSE",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-                    }
-
-                    is UpdateCheckState.Checking -> {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp),
-                                strokeWidth = 2.dp,
-                                color = NeonCyan,
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(
-                                text = "CHECKING RELEASES...",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = ChromeSilver,
-                            )
-                        }
-                    }
-
-                    else -> {
-                        val err = (updateState as? UpdateCheckState.Error)?.message
-                            ?: "Unable to verify latest release."
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Rounded.ErrorOutline,
-                                contentDescription = null,
-                                tint = CrimsonAlert,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "UPDATE CHECK FAILED",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = CrimsonAlert,
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = err,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = ChromeSilver,
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
-                        ) {
-                            TextButton(
-                                onClick = { onDownloadUpdate(AppUpdateManager.REPO_RELEASES_FALLBACK_URL) },
-                                modifier = Modifier.minimumInteractiveComponentSize(),
-                            ) {
-                                Text(
-                                    text = "RELEASES PAGE",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = NeonCyan,
-                                )
-                            }
-                            TextButton(
-                                onClick = onRetryCheck,
-                                modifier = Modifier.minimumInteractiveComponentSize(),
-                            ) {
-                                Text(
-                                    text = "RETRY",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }

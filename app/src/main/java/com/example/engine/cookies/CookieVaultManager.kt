@@ -2,6 +2,8 @@ package com.example.engine.cookies
 
 import android.content.Context
 import android.webkit.CookieManager
+import com.example.engine.model.PlatformBadge
+import com.example.engine.network.ClientSpoofer
 import com.pulse.blackhole.data.vault.SessionVaultManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -211,14 +213,52 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         vault: SessionVaultManager = sessionVault,
     ): List<String> {
         val command = mutableListOf("yt-dlp")
+        val platform = PlatformBadge.fromUrl(targetUrl)
+
+        if (platform == PlatformBadge.TIKTOK) {
+            command.add("--user-agent")
+            command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
+            command.add("--referer")
+            command.add("https://www.tiktok.com/")
+            command.add("--format")
+            command.add("best")
+        } else if (!vault.hasActiveSession()) {
+            command.add("--extractor-args")
+            command.add("youtube:player_client=android,web")
+        }
+
         if (vault.hasActiveSession()) {
             val cookieFilePath = writeCookiesToTempFile(vault.getCookies().orEmpty())
             command.add("--cookies")
             command.add(cookieFilePath)
-        } else {
-            command.add("--extractor-args")
-            command.add("youtube:player_client=android,web")
         }
+
+        command.add(targetUrl)
+        return command
+    }
+
+    fun getTikTokExtractionCommand(targetUrl: String): List<String> {
+        val command = mutableListOf("yt-dlp")
+
+        // تيك توك يتطلب User-Agent موبايل لكي لا يرفض الطلب
+        command.add("--user-agent")
+        command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
+
+        command.add("--referer")
+        command.add("https://www.tiktok.com/")
+
+        command.add("--no-check-certificate")
+
+        // جلب أفضل جودة متوفرة مباشرة بدون علامة مائية إن أمكن
+        command.add("-f")
+        command.add("best")
+
+        if (sessionVault.hasActiveSession()) {
+            val cookieFilePath = writeCookiesToTempFile(sessionVault.getCookies().orEmpty())
+            command.add("--cookies")
+            command.add(cookieFilePath)
+        }
+
         command.add(targetUrl)
         return command
     }

@@ -71,12 +71,17 @@ class WebViewStreamSniffer(
                     }
                 }
 
+                val isTikTok = targetUrl.contains("tiktok.com", ignoreCase = true)
                 webView.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     mediaPlaybackRequiresUserGesture = false
                     mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                    userAgentString = ClientSpoofer.profiles.first().userAgent
+                    userAgentString = if (isTikTok) {
+                        ClientSpoofer.TIKTOK_IOS_USER_AGENT
+                    } else {
+                        ClientSpoofer.profiles.first().userAgent
+                    }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
@@ -144,7 +149,11 @@ class WebViewStreamSniffer(
                     }
                 }
 
-                webView.loadUrl(targetUrl)
+                if (isTikTok) {
+                    webView.loadUrl(targetUrl, mapOf("Referer" to "https://www.tiktok.com/"))
+                } else {
+                    webView.loadUrl(targetUrl)
+                }
             }
         }
 
@@ -172,6 +181,8 @@ class WebViewStreamSniffer(
             pathOnly.endsWith(".webm") ||
             pathOnly.endsWith(".mov") ||
             lower.contains("mime=video") ||
+            lower.contains("mime_type=video") ||
+            lower.contains("video_mp4") ||
             lower.contains("videoplayback") ||
             lower.contains("/master.m3u8") ||
             lower.contains("/playlist.m3u8")

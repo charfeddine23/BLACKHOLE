@@ -10,6 +10,9 @@ data class SpoofedClientProfile(
 
 object ClientSpoofer {
 
+    const val TIKTOK_IOS_USER_AGENT =
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"
+
     val profiles: List<SpoofedClientProfile> = listOf(
         SpoofedClientProfile(
             id = "CHROME_DESKTOP",
@@ -39,8 +42,8 @@ object ClientSpoofer {
             ),
         ),
         SpoofedClientProfile(
-            id = "SAFARI_IOS_HLS",
-            userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1",
+            id = "SAFARI_IOS_MOBILE",
+            userAgent = TIKTOK_IOS_USER_AGENT,
             extraHeaders = mapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.9",
@@ -61,16 +64,24 @@ object ClientSpoofer {
         profile: SpoofedClientProfile,
         refererOverride: String? = null,
     ): Map<String, String> {
-        val origin = runCatching {
-            val uri = URI(targetUrl)
-            "${uri.scheme}://${uri.authority}"
-        }.getOrNull()
+        val isTikTok = targetUrl.contains("tiktok.com", ignoreCase = true) ||
+            targetUrl.contains("tiktokcdn", ignoreCase = true)
+        val origin = if (isTikTok) {
+            "https://www.tiktok.com"
+        } else {
+            runCatching {
+                val uri = URI(targetUrl)
+                "${uri.scheme}://${uri.authority}"
+            }.getOrNull()
+        }
 
         val headers = LinkedHashMap<String, String>()
-        headers["User-Agent"] = profile.userAgent
+        headers["User-Agent"] = if (isTikTok) TIKTOK_IOS_USER_AGENT else profile.userAgent
         headers.putAll(profile.extraHeaders)
         if (!refererOverride.isNullOrBlank()) {
             headers["Referer"] = refererOverride
+        } else if (isTikTok) {
+            headers["Referer"] = "https://www.tiktok.com/"
         } else if (!origin.isNullOrBlank()) {
             headers["Referer"] = "$origin/"
         }

@@ -1,8 +1,8 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
-import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -16,9 +16,13 @@ import com.example.engine.model.DownloadTelemetry
 import com.example.engine.model.PlatformBadge
 import com.example.engine.service.DownloadStateCoordinator
 import com.example.engine.updater.AppUpdateManager
+import com.example.engine.updater.InAppInstallOutcome
 import com.example.engine.updater.UpdateCheckState
+import com.example.engine.updater.UpdateInstallStatusBus
 import com.example.service.BlackholeDownloadService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -29,6 +33,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 data class BlackholeUiState(
     val inputUrl: String = "",
@@ -37,18 +42,15 @@ data class BlackholeUiState(
     val videoCount: Int = 0,
     val clipboardFeedback: String? = null,
     val updateState: UpdateCheckState = UpdateCheckState.Idle,
-    val showUpdateDialog: Boolean = false,
     val syncedDomains: List<String> = emptyList(),
     val showCookieVault: Boolean = false,
     val authWebViewUrl: String? = null,
     val cookieStatusMessage: String? = null,
-    val autoDownloadTriggered: Boolean = false,
 )
 
 class BlackholeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
-    private val prefs = context.getSharedPreferences("blackhole_updater_prefs", Context.MODE_PRIVATE)
     private val clipboardDetector = ClipboardDetector(context)
     private val cookieVault = CookieVaultManager.getInstance(context)
     private val appUpdateManager = AppUpdateManager()
@@ -60,15 +62,16 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _inputUrl = MutableStateFlow("")
     private val _clipboardFeedback = MutableStateFlow<String?>(null)
     private val _updateState = MutableStateFlow<UpdateCheckState>(UpdateCheckState.Idle)
-    private val _showUpdateDialog = MutableStateFlow(false)
     private val _showCookieVault = MutableStateFlow(false)
     private val _authWebViewUrl = MutableStateFlow<String?>(null)
     private val _cookieStatusMessage = MutableStateFlow<String?>(null)
-    private val _autoDownloadTriggered = MutableStateFlow(false)
-    private val _autoLaunchUpdateUrl = MutableSharedFlow<String>(extraBufferCapacity = 1)
-    val autoLaunchUpdateUrl: SharedFlow<String> = _autoLaunchUpdateUrl.asSharedFlow()
+    private val _requestInstallPermission = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val requestInstallPermission: SharedFlow<Unit> = _requestInstallPermission.asSharedFlow()
 
     private var lastUpdateCheckElapsedMs: Long = 0L
+    private var activeUpdateJob: Job? = null
+    private var pendingInstallApk: File? = null
+    private var hasPromptedAutoInstallForTag: String? = null
 
     val videos: StateFlow<List<DownloadedVideoEntity>> = repository.allVideos
         .stateIn(
@@ -94,28 +97,24 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val metaStateFlow = combine(
         _updateState,
-        _showUpdateDialog,
         cookieVault.syncedDomains,
         _showCookieVault,
         _authWebViewUrl,
-    ) { update, showUpdate, domains, showCookies, authUrl ->
-        Triple(update to showUpdate, domains, showCookies to authUrl)
+    ) { update, domains, showCookies, authUrl ->
+        Triple(update, domains, showCookies to authUrl)
     }
 
     val uiState: StateFlow<BlackholeUiState> = combine(
         baseStateFlow,
         metaStateFlow,
         _cookieStatusMessage,
-        _autoDownloadTriggered,
-    ) { base, meta, cookieMsg, autoTriggered ->
+    ) { base, meta, cookieMsg ->
         base.copy(
-            updateState = meta.first.first,
-            showUpdateDialog = meta.first.second,
+            updateState = meta.first,
             syncedDomains = meta.second,
             showCookieVault = meta.third.first,
             authWebViewUrl = meta.third.second,
             cookieStatusMessage = cookieMsg,
-            autoDownloadTriggered = autoTriggered,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -124,59 +123,117 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     )
 
     init {
+        UpdateInstallStatusBus.onStatusCallback = { installed, error ->
+            if (installed) {
+                pendingInstallApk = null
+                _updateState.value = UpdateCheckState.Idle
+            } else if (!error.isNullOrBlank()) {
+                _updateState.value = UpdateCheckState.Error(error)
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            appUpdateManager.cleanupInstalledUpdates(context)
+        }
         refreshClipboardOnLaunch()
-        checkForUpdates(silent = true, autoDownloadIfFound = true)
+        checkForUpdates(force = true)
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        UpdateInstallStatusBus.onStatusCallback = null
     }
 
     fun checkForUpdatesOnEntry() {
+        // Resume pending in-app install immediately once user grants "Allow from this source"
+        val waitingApk = pendingInstallApk
+        if (waitingApk != null && waitingApk.exists() &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls())
+        ) {
+            pendingInstallApk = null
+            viewModelScope.launch { triggerApkInstall(waitingApk) }
+            return
+        }
+
         val now = SystemClock.elapsedRealtime()
         if (lastUpdateCheckElapsedMs != 0L && now - lastUpdateCheckElapsedMs < ENTRY_CHECK_COOLDOWN_MS) {
             return
         }
-        checkForUpdates(silent = true, autoDownloadIfFound = true)
+        checkForUpdates(force = false)
     }
 
-    fun checkForUpdates(
-        silent: Boolean = false,
-        autoDownloadIfFound: Boolean = true,
-    ) {
-        if (_updateState.value is UpdateCheckState.Checking) return
+    fun onUpdatePillTap() {
+        val current = _updateState.value
+        when (current) {
+            is UpdateCheckState.ReadyToInstall -> {
+                viewModelScope.launch { triggerApkInstall(current.apkFile) }
+            }
+            is UpdateCheckState.Checking, is UpdateCheckState.Downloading -> Unit
+            else -> checkForUpdates(force = true)
+        }
+    }
+
+    fun checkForUpdates(force: Boolean = false) {
+        val current = _updateState.value
+        if (current is UpdateCheckState.Checking ||
+            current is UpdateCheckState.Downloading ||
+            (!force && current is UpdateCheckState.ReadyToInstall)
+        ) {
+            return
+        }
+        if (activeUpdateJob?.isActive == true) return
+
         lastUpdateCheckElapsedMs = SystemClock.elapsedRealtime()
-        viewModelScope.launch {
+        activeUpdateJob = viewModelScope.launch {
             _updateState.value = UpdateCheckState.Checking
             val result = appUpdateManager.checkLatestRelease()
-            _updateState.value = result
             when (result) {
                 is UpdateCheckState.UpdateAvailable -> {
                     val release = result.release
-                    val lastAutoTag = prefs.getString(KEY_LAST_AUTO_UPDATE_TAG, null)
-                    if (autoDownloadIfFound && lastAutoTag != release.tagName) {
-                        prefs.edit().putString(KEY_LAST_AUTO_UPDATE_TAG, release.tagName).apply()
-                        _autoDownloadTriggered.value = true
-                        _autoLaunchUpdateUrl.tryEmit(release.preferredLaunchUrl)
+                    if (release.apkDownloadUrl.isNullOrBlank()) {
+                        _updateState.value = UpdateCheckState.Error("Release APK asset missing.")
+                        return@launch
                     }
-                    _showUpdateDialog.value = true
+
+                    // No dialog/popup window: show Blackhole perimeter progress ring at 0% -> 100% (360°)
+                    _updateState.value = UpdateCheckState.Downloading(release, 0.02f)
+                    val apkFile = appUpdateManager.downloadApkInApp(
+                        context = context,
+                        release = release,
+                    ) { progress ->
+                        _updateState.value = UpdateCheckState.Downloading(release, progress)
+                    }
+
+                    if (apkFile != null) {
+                        _updateState.value = UpdateCheckState.ReadyToInstall(release, apkFile)
+                        // Pause briefly at 100% so the 360° perimeter ring visibly finishes a full turn
+                        delay(450L)
+                        if (hasPromptedAutoInstallForTag != release.tagName || force) {
+                            hasPromptedAutoInstallForTag = release.tagName
+                            triggerApkInstall(apkFile)
+                        }
+                    } else {
+                        _updateState.value = UpdateCheckState.Error("Failed to download update APK.")
+                    }
                 }
                 is UpdateCheckState.UpToDate, is UpdateCheckState.Error -> {
-                    _autoDownloadTriggered.value = false
-                    if (!silent) _showUpdateDialog.value = true
+                    _updateState.value = result
                 }
-                else -> Unit
+                else -> _updateState.value = result
             }
         }
     }
 
-    fun openUpdateDialog() {
-        val current = _updateState.value
-        if (current is UpdateCheckState.UpdateAvailable) {
-            _showUpdateDialog.value = true
-        } else {
-            checkForUpdates(silent = false)
+    private suspend fun triggerApkInstall(apkFile: File) {
+        when (val outcome = appUpdateManager.installApkInApp(context, apkFile)) {
+            InAppInstallOutcome.SessionCommitted -> Unit
+            InAppInstallOutcome.NeedsInstallPermission -> {
+                pendingInstallApk = apkFile
+                _requestInstallPermission.tryEmit(Unit)
+            }
+            is InAppInstallOutcome.Failed -> {
+                _updateState.value = UpdateCheckState.Error(outcome.message)
+            }
         }
-    }
-
-    fun dismissUpdateDialog() {
-        _showUpdateDialog.value = false
     }
 
     fun openCookieVault(authUrl: String? = null) {
@@ -290,6 +347,5 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
 
     companion object {
         private const val ENTRY_CHECK_COOLDOWN_MS = 15_000L
-        private const val KEY_LAST_AUTO_UPDATE_TAG = "last_auto_update_tag"
     }
 }
