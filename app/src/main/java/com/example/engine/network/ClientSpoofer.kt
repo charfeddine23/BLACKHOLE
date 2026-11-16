@@ -1,6 +1,7 @@
 package com.example.engine.network
 
 import java.net.URI
+import java.util.concurrent.atomic.AtomicInteger
 
 data class SpoofedClientProfile(
     val id: String,
@@ -13,10 +14,18 @@ object ClientSpoofer {
     const val TIKTOK_IOS_USER_AGENT =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"
 
+    const val CHROME_DESKTOP_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
+    const val ANDROID_CHROME_USER_AGENT =
+        "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.49 Mobile Safari/537.36"
+
+    private val rotationIndex = AtomicInteger(0)
+
     val profiles: List<SpoofedClientProfile> = listOf(
         SpoofedClientProfile(
             id = "CHROME_DESKTOP",
-            userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            userAgent = CHROME_DESKTOP_USER_AGENT,
             extraHeaders = mapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.9",
@@ -31,14 +40,13 @@ object ClientSpoofer {
         ),
         SpoofedClientProfile(
             id = "ANDROID_CHROME",
-            userAgent = "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.49 Mobile Safari/537.36",
+            userAgent = ANDROID_CHROME_USER_AGENT,
             extraHeaders = mapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.9",
                 "Sec-CH-UA" to "\"Chromium\";v=\"133\", \"Google Chrome\";v=\"133\"",
                 "Sec-CH-UA-Mobile" to "?1",
                 "Sec-CH-UA-Platform" to "\"Android\"",
-                "X-Requested-With" to "com.android.chrome",
             ),
         ),
         SpoofedClientProfile(
@@ -59,17 +67,58 @@ object ClientSpoofer {
         ),
     )
 
+    private val rotatingUserAgents = listOf(
+        TIKTOK_IOS_USER_AGENT,
+        CHROME_DESKTOP_USER_AGENT,
+        ANDROID_CHROME_USER_AGENT,
+    )
+
+    fun nextRotatedUserAgent(targetUrl: String): String {
+        val lower = targetUrl.lowercase()
+        if (lower.contains("tiktok.com") || lower.contains("tiktokcdn")) {
+            return TIKTOK_IOS_USER_AGENT
+        }
+        val idx = (rotationIndex.getAndIncrement() and Int.MAX_VALUE) % rotatingUserAgents.size
+        return rotatingUserAgents[idx]
+    }
+
+    fun refererForUrl(targetUrl: String): String {
+        val lower = targetUrl.lowercase()
+        return when {
+            lower.contains("tiktok.com") || lower.contains("tiktokcdn") -> "https://www.tiktok.com/"
+            lower.contains("instagram.com") || lower.contains("instagr.am") || lower.contains("cdninstagram") ->
+                "https://www.instagram.com/"
+            lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com") || lower.contains("fbcdn") ->
+                "https://www.facebook.com/"
+            lower.contains("youtube.com") || lower.contains("youtu.be") || lower.contains("googlevideo") ->
+                "https://www.youtube.com/"
+            lower.contains("twitter.com") || lower.contains("x.com") || lower.contains("twimg") ->
+                "https://x.com/"
+            lower.contains("vimeo.com") -> "https://vimeo.com/"
+            lower.contains("reddit.com") || lower.contains("redd.it") -> "https://www.reddit.com/"
+            else -> runCatching {
+                val uri = URI(targetUrl)
+                "${uri.scheme}://${uri.authority}/"
+            }.getOrDefault("https://www.google.com/")
+        }
+    }
+
     fun buildHeadersForUrl(
         targetUrl: String,
-        profile: SpoofedClientProfile,
+        profile: SpoofedClientProfile = profiles.first(),
         refererOverride: String? = null,
     ): Map<String, String> {
-        val isTikTok = targetUrl.contains("tiktok.com", ignoreCase = true) ||
-            targetUrl.contains("tiktokcdn", ignoreCase = true)
-        val origin = if (isTikTok) {
-            "https://www.tiktok.com"
-        } else {
-            runCatching {
+        val lower = targetUrl.lowercase()
+        val isTikTok = lower.contains("tiktok.com") || lower.contains("tiktokcdn")
+        val isInstagram = lower.contains("instagram.com") || lower.contains("instagr.am") || lower.contains("cdninstagram")
+        val isFacebook = lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com") || lower.contains("fbcdn")
+
+        val resolvedReferer = refererOverride?.takeIf { it.isNotBlank() } ?: refererForUrl(targetUrl)
+        val origin = when {
+            isTikTok -> "https://www.tiktok.com"
+            isInstagram -> "https://www.instagram.com"
+            isFacebook -> "https://www.facebook.com"
+            else -> runCatching {
                 val uri = URI(targetUrl)
                 "${uri.scheme}://${uri.authority}"
             }.getOrNull()
@@ -78,15 +127,12 @@ object ClientSpoofer {
         val headers = LinkedHashMap<String, String>()
         headers["User-Agent"] = if (isTikTok) TIKTOK_IOS_USER_AGENT else profile.userAgent
         headers.putAll(profile.extraHeaders)
-        if (!refererOverride.isNullOrBlank()) {
-            headers["Referer"] = refererOverride
-        } else if (isTikTok) {
-            headers["Referer"] = "https://www.tiktok.com/"
-        } else if (!origin.isNullOrBlank()) {
-            headers["Referer"] = "$origin/"
-        }
+        headers["Referer"] = resolvedReferer
         if (!origin.isNullOrBlank()) {
             headers["Origin"] = origin
+        }
+        if (isInstagram) {
+            headers["X-IG-App-ID"] = "936619743392459"
         }
         return headers
     }

@@ -272,7 +272,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
                 "Session synced."
             }
             _showCookieVault.value = false
-            val targetToPull = _authWebViewUrl.value ?: _inputUrl.value
+            val targetToPull = _inputUrl.value.ifBlank { _authWebViewUrl.value.orEmpty() }
             _authWebViewUrl.value = null
             if (retriggerPull && targetToPull.isNotBlank()) {
                 _inputUrl.value = targetToPull

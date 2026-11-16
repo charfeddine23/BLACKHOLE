@@ -159,38 +159,90 @@ class CookieVaultManager private constructor(private val appContext: Context) {
     suspend fun syncFromWebView(url: String): Int = withContext(Dispatchers.Main) {
         val cookieManager = CookieManager.getInstance()
         cookieManager.flush()
-        val rawHeader = cookieManager.getCookie(url).orEmpty()
-        if (rawHeader.isBlank()) return@withContext 0
 
-        val host = runCatching { java.net.URI(url).host.orEmpty() }.getOrDefault("")
-        if (host.isBlank()) return@withContext 0
-
-        val entries = rawHeader.split(";").mapNotNull { segment ->
-            val idx = segment.indexOf('=')
-            if (idx <= 0) return@mapNotNull null
-            val name = segment.substring(0, idx).trim()
-            val value = segment.substring(idx + 1).trim()
-            if (name.isBlank()) return@mapNotNull null
-            StoredCookieEntry(
-                domain = host.removePrefix("www."),
-                includeSubdomains = true,
-                path = "/",
-                secure = url.startsWith("https://", ignoreCase = true),
-                expiresAtMs = 0L,
-                name = name,
-                value = value,
-            )
+        val candidateUrls = linkedSetOf(url)
+        val lower = url.lowercase()
+        when {
+            lower.contains("instagram") || lower.contains("instagr.am") -> {
+                candidateUrls.add("https://www.instagram.com/")
+                candidateUrls.add("https://i.instagram.com/")
+                candidateUrls.add("https://instagram.com/")
+            }
+            lower.contains("facebook") || lower.contains("fb.") -> {
+                candidateUrls.add("https://www.facebook.com/")
+                candidateUrls.add("https://m.facebook.com/")
+                candidateUrls.add("https://facebook.com/")
+            }
+            lower.contains("youtube") || lower.contains("google") || lower.contains("youtu.be") -> {
+                candidateUrls.add("https://www.youtube.com/")
+                candidateUrls.add("https://youtube.com/")
+                candidateUrls.add("https://accounts.google.com/")
+            }
+            lower.contains("tiktok") -> {
+                candidateUrls.add("https://www.tiktok.com/")
+                candidateUrls.add("https://m.tiktok.com/")
+            }
+            lower.contains("twitter") || lower.contains("x.com") -> {
+                candidateUrls.add("https://x.com/")
+                candidateUrls.add("https://twitter.com/")
+            }
         }
 
-        if (entries.isNotEmpty()) {
+        val collected = mutableListOf<StoredCookieEntry>()
+        val seenKeys = mutableSetOf<String>()
+
+        candidateUrls.forEach { target ->
+            val rawHeader = cookieManager.getCookie(target).orEmpty()
+            if (rawHeader.isBlank()) return@forEach
+            val host = runCatching { java.net.URI(target).host.orEmpty() }.getOrDefault("")
+            if (host.isBlank()) return@forEach
+            val normalizedDomain = normalizeRootDomain(host)
+
+            rawHeader.split(";").forEach { segment ->
+                val idx = segment.indexOf('=')
+                if (idx <= 0) return@forEach
+                val name = segment.substring(0, idx).trim()
+                val value = segment.substring(idx + 1).trim()
+                if (name.isBlank()) return@forEach
+                val dedupKey = "$normalizedDomain:$name"
+                if (seenKeys.add(dedupKey)) {
+                    collected.add(
+                        StoredCookieEntry(
+                            domain = normalizedDomain,
+                            includeSubdomains = true,
+                            path = "/",
+                            secure = target.startsWith("https://", ignoreCase = true),
+                            expiresAtMs = 0L,
+                            name = name,
+                            value = value,
+                        ),
+                    )
+                }
+            }
+        }
+
+        if (collected.isNotEmpty()) {
             withContext(Dispatchers.IO) {
                 mutex.withLock {
-                    mergeEntriesSync(entries)
+                    mergeEntriesSync(collected)
                     persistToDisk()
                 }
             }
         }
-        entries.size
+        collected.size
+    }
+
+    private fun normalizeRootDomain(host: String): String {
+        val clean = host.lowercase().trimStart('.')
+        return when {
+            clean == "instagram.com" || clean.endsWith(".instagram.com") -> "instagram.com"
+            clean == "facebook.com" || clean.endsWith(".facebook.com") -> "facebook.com"
+            clean == "youtube.com" || clean.endsWith(".youtube.com") -> "youtube.com"
+            clean == "tiktok.com" || clean.endsWith(".tiktok.com") -> "tiktok.com"
+            clean == "x.com" || clean.endsWith(".x.com") -> "x.com"
+            clean == "twitter.com" || clean.endsWith(".twitter.com") -> "twitter.com"
+            else -> clean.removePrefix("www.").removePrefix("m.")
+        }
     }
 
     suspend fun clearAllCookies() = withContext(Dispatchers.IO) {
@@ -212,25 +264,42 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         targetUrl: String,
         vault: SessionVaultManager = sessionVault,
     ): List<String> {
-        val command = mutableListOf("yt-dlp")
         val platform = PlatformBadge.fromUrl(targetUrl)
-
-        if (platform == PlatformBadge.TIKTOK) {
-            command.add("--user-agent")
-            command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
-            command.add("--referer")
-            command.add("https://www.tiktok.com/")
-            command.add("--format")
-            command.add("best")
-        } else if (!vault.hasActiveSession()) {
-            command.add("--extractor-args")
-            command.add("youtube:player_client=android,web")
-        }
+        val command = mutableListOf(
+            "yt-dlp",
+            "--user-agent",
+            ClientSpoofer.nextRotatedUserAgent(targetUrl),
+            "--no-check-certificate",
+            "--geo-bypass",
+        )
 
         if (vault.hasActiveSession()) {
-            val cookieFilePath = writeCookiesToTempFile(vault.getCookies().orEmpty())
-            command.add("--cookies")
-            command.add(cookieFilePath)
+            val cookieFile = vault.writeTempNetscapeCookiesFile(appContext.cacheDir)
+            if (cookieFile != null && cookieFile.exists()) {
+                command.add("--cookies")
+                command.add(cookieFile.absolutePath)
+            }
+        }
+
+        when (platform) {
+            PlatformBadge.YOUTUBE -> {
+                command.add("--extractor-args")
+                command.add("youtube:player_client=ios,web")
+                command.add("-f")
+                command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
+            }
+            PlatformBadge.TIKTOK -> {
+                command.add("--referer")
+                command.add("https://www.tiktok.com/")
+                command.add("-f")
+                command.add("best")
+            }
+            else -> {
+                command.add("--referer")
+                command.add(ClientSpoofer.refererForUrl(targetUrl))
+                command.add("-f")
+                command.add("best")
+            }
         }
 
         command.add(targetUrl)
@@ -238,29 +307,7 @@ class CookieVaultManager private constructor(private val appContext: Context) {
     }
 
     fun getTikTokExtractionCommand(targetUrl: String): List<String> {
-        val command = mutableListOf("yt-dlp")
-
-        // تيك توك يتطلب User-Agent موبايل لكي لا يرفض الطلب
-        command.add("--user-agent")
-        command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
-
-        command.add("--referer")
-        command.add("https://www.tiktok.com/")
-
-        command.add("--no-check-certificate")
-
-        // جلب أفضل جودة متوفرة مباشرة بدون علامة مائية إن أمكن
-        command.add("-f")
-        command.add("best")
-
-        if (sessionVault.hasActiveSession()) {
-            val cookieFilePath = writeCookiesToTempFile(sessionVault.getCookies().orEmpty())
-            command.add("--cookies")
-            command.add(cookieFilePath)
-        }
-
-        command.add(targetUrl)
-        return command
+        return buildExtractionCommand(targetUrl, sessionVault)
     }
 
     private fun writeCookiesToTempFile(cookiesContent: String): String {

@@ -110,13 +110,18 @@ object DownloadStateCoordinator {
         )
     }
 
-    fun setNeedsAuth(sourceUrl: String, platform: PlatformBadge, reason: String) {
+    fun setNeedsAuth(
+        sourceUrl: String,
+        platform: PlatformBadge,
+        reason: String,
+        authUrl: String = sourceUrl,
+    ) {
         _telemetry.value = DownloadTelemetry(
             phase = DownloadPhase.NEEDS_AUTH,
             sourceUrl = sourceUrl,
             platform = platform,
             errorMessage = reason,
-            needsAuthUrl = sourceUrl,
+            needsAuthUrl = authUrl,
         )
     }
 

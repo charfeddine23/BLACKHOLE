@@ -23,6 +23,7 @@ import com.example.R
 import com.example.data.local.BlackholeDatabase
 import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
+import com.example.engine.UniversalDownloader
 import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.extractor.VideoStreamExtractor
 import com.example.engine.extractor.WebViewStreamSniffer
@@ -57,6 +58,15 @@ class BlackholeDownloadService : Service() {
     private val okHttpClient: OkHttpClient by lazy { VideoStreamExtractor.createWithVault(cookieVault) }
     private val sniffer: WebViewStreamSniffer by lazy { WebViewStreamSniffer(applicationContext, cookieVault) }
     private val extractor: VideoStreamExtractor by lazy { VideoStreamExtractor(okHttpClient, sniffer) }
+    private val universalDownloader: UniversalDownloader by lazy {
+        UniversalDownloader(
+            context = applicationContext,
+            cookieVault = cookieVault,
+            httpClient = okHttpClient,
+            webViewSniffer = sniffer,
+            streamExtractor = extractor,
+        )
+    }
     private val hlsDownloader: HlsSegmentDownloader by lazy { HlsSegmentDownloader(okHttpClient) }
     private val repository: VideoVaultRepository by lazy {
         val db = BlackholeDatabase.getInstance(applicationContext)
@@ -94,7 +104,7 @@ class BlackholeDownloadService : Service() {
                 startForegroundWithNotification(
                     buildNotification(
                         title = "Blackhole Core Active",
-                        text = "Running multi-strategy extraction...",
+                        text = "Routing ${platform.label} through Universal Smart Router...",
                         progress = 0,
                         indeterminate = true,
                     ),
@@ -111,19 +121,26 @@ class BlackholeDownloadService : Service() {
     private suspend fun executeGravityPull(sourceUrl: String, platform: PlatformBadge) {
         DownloadStateCoordinator.setAbsorbing(sourceUrl, platform)
         try {
-            when (val extraction = extractor.extractHighestQuality(sourceUrl)) {
+            val routed = universalDownloader.routeAndExtract(sourceUrl)
+            val resolvedPlatform = routed.platform
+            when (val extraction = routed.result) {
                 is ExtractionResult.NeedsAuth -> {
-                    DownloadStateCoordinator.setNeedsAuth(sourceUrl, platform, extraction.reason)
+                    DownloadStateCoordinator.setNeedsAuth(
+                        sourceUrl = routed.canonicalUrl,
+                        platform = resolvedPlatform,
+                        reason = extraction.reason,
+                        authUrl = extraction.url,
+                    )
                     postTerminalNotification("Session Required", extraction.reason)
                 }
 
                 is ExtractionResult.Error -> {
-                    DownloadStateCoordinator.setError(sourceUrl, platform, extraction.message)
+                    DownloadStateCoordinator.setError(routed.canonicalUrl, resolvedPlatform, extraction.message)
                     postTerminalNotification("Blackhole Extraction Failed", extraction.message)
                 }
 
                 is ExtractionResult.Success -> {
-                    streamAndSaveVideo(sourceUrl, extraction.bestStream)
+                    streamAndSaveVideo(routed.canonicalUrl, extraction.bestStream)
                 }
             }
         } catch (_: CancellationException) {

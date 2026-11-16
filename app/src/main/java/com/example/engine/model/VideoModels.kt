@@ -5,6 +5,7 @@ enum class PlatformBadge(val label: String) {
     YOUTUBE("YOUTUBE"),
     TIKTOK("TIKTOK"),
     INSTAGRAM("INSTAGRAM"),
+    FACEBOOK("FACEBOOK"),
     X_TWITTER("X / TWITTER"),
     VIMEO("VIMEO"),
     REDDIT("REDDIT"),
@@ -18,8 +19,9 @@ enum class PlatformBadge(val label: String) {
                     lower.contains(".mkv") || lower.contains(".m4v") || lower.contains(".m3u8") -> DIRECT
                 lower.contains("youtube.com") || lower.contains("youtu.be") -> YOUTUBE
                 lower.contains("tiktok.com") -> TIKTOK
-                lower.contains("instagram.com") -> INSTAGRAM
-                lower.contains("twitter.com") || lower.contains("x.com") -> X_TWITTER
+                lower.contains("instagram.com") || lower.contains("instagr.am") -> INSTAGRAM
+                lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com") -> FACEBOOK
+                lower.contains("twitter.com") || lower.contains("x.com") || lower.contains("t.co/") -> X_TWITTER
                 lower.contains("vimeo.com") -> VIMEO
                 lower.contains("reddit.com") || lower.contains("v.redd.it") -> REDDIT
                 else -> WEB_MEDIA

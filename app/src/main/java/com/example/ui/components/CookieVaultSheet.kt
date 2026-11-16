@@ -87,7 +87,10 @@ fun CookieVaultDialog(
 ) {
     var browserMode by remember(initialAuthUrl) { mutableStateOf(!initialAuthUrl.isNullOrBlank()) }
     var currentUrl by remember(initialAuthUrl) {
-        mutableStateOf(initialAuthUrl?.takeIf { it.isNotBlank() } ?: "https://vimeo.com")
+        mutableStateOf(
+            initialAuthUrl?.takeIf { it.isNotBlank() }
+                ?: "https://www.instagram.com/accounts/login/",
+        )
     }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
 
@@ -391,6 +394,57 @@ private fun WebViewSessionSyncScreen(
                     style = MaterialTheme.typography.labelSmall,
                     color = ObsidianVoid,
                 )
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            val quickPlatforms = listOf(
+                "IG" to "https://www.instagram.com/accounts/login/",
+                "FB" to "https://m.facebook.com/login/",
+                "YT" to "https://www.youtube.com/",
+                "TT" to "https://www.tiktok.com/login",
+                "X" to "https://x.com/i/flow/login",
+            )
+            quickPlatforms.forEach { (label, targetUrl) ->
+                val isSelected = addressInput.contains(
+                    when (label) {
+                        "IG" -> "instagram"
+                        "FB" -> "facebook"
+                        "YT" -> "youtube"
+                        "TT" -> "tiktok"
+                        else -> "x.com"
+                    },
+                    ignoreCase = true,
+                )
+                Surface(
+                    color = if (isSelected) CyanGlowSoft.copy(alpha = 0.35f) else Color.White.copy(alpha = 0.05f),
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(
+                        0.75.dp,
+                        if (isSelected) NeonCyan else GlassStrokeBright.copy(alpha = 0.25f),
+                    ),
+                    onClick = {
+                        addressInput = targetUrl
+                        activeWebView?.loadUrl(targetUrl)
+                    },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Box(
+                        modifier = Modifier.padding(vertical = 6.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isSelected) NeonCyan else ChromeSilver,
+                        )
+                    }
+                }
             }
         }
 
