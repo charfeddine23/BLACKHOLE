@@ -1,0 +1,6 @@
+{
+  "name": "Blackhole",
+  "description": "Blackhole Video Downloader — Dark Liquid Glass media extractor and local vault for the Pulse suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
