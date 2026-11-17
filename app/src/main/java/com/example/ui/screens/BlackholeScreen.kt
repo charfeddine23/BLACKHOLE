@@ -8,9 +8,12 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -64,6 +67,8 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -73,11 +78,13 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.local.DownloadedVideoEntity
 import com.example.engine.model.DownloadPhase
+import com.example.engine.model.DownloadTelemetry
 import com.example.engine.updater.UpdateCheckState
 import com.example.ui.animation.rememberBlackholeAnimationController
 import com.example.ui.components.BlackholeCoreButton
 import com.example.ui.components.DownloadedVideosSwipeUpSheet
 import com.example.ui.theme.ChromeSilver
+import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.EmeraldPulse
 import com.example.ui.theme.GlassStrokeBright
 import com.example.ui.theme.MutedSlate
@@ -87,6 +94,7 @@ import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeUiState
 import com.example.ui.viewmodel.BlackholeViewModel
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 @Composable
 fun BlackholeScreen(
@@ -366,6 +374,10 @@ private fun BlackholeScreenContent(
                             isUpdateActive = isUpdateActive,
                             updateProgress = updateRingProgress,
                         )
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        BlackholeBareStatusCaption(telemetry = telemetry)
                     }
 
                     // Swipe-Up Downloaded Videos Page Indicator (only secondary page in app)
@@ -435,5 +447,79 @@ private fun SwipeUpVaultIndicator(
             style = MaterialTheme.typography.labelSmall,
             color = MutedSlate.copy(alpha = 0.72f),
         )
+    }
+}
+
+@Composable
+private fun BlackholeBareStatusCaption(
+    telemetry: DownloadTelemetry,
+) {
+    val captionData: Pair<String, Color>? = when (telemetry.phase) {
+        DownloadPhase.ERROR -> {
+            (telemetry.errorMessage?.takeIf { it.isNotBlank() }
+                ?: "Unable to download stream from this link.") to CrimsonAlert
+        }
+        DownloadPhase.NEEDS_AUTH -> {
+            (telemetry.errorMessage?.takeIf { it.isNotBlank() }
+                ?: "This video requires account session authentication.") to PlasmaViolet
+        }
+        DownloadPhase.ABSORBING -> {
+            "Extracting highest quality ${telemetry.platform.label} stream..." to NeonCyan
+        }
+        DownloadPhase.DOWNLOADING -> {
+            val sizePart = if (telemetry.totalBytes > 0L) {
+                "${formatCaptionMb(telemetry.bytesDownloaded)} / ${formatCaptionMb(telemetry.totalBytes)}"
+            } else {
+                formatCaptionMb(telemetry.bytesDownloaded)
+            }
+            val speedPart = formatCaptionSpeed(telemetry.speedBytesPerSec)
+            val titlePart = telemetry.title.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
+            "$titlePart${telemetry.qualityLabel} · $sizePart · $speedPart" to ChromeSilver
+        }
+        DownloadPhase.MERGING -> {
+            "Merging ${telemetry.qualityLabel} video and audio tracks..." to PlasmaViolet
+        }
+        DownloadPhase.COMPLETED -> {
+            "Captured: ${telemetry.title} (${telemetry.qualityLabel})" to EmeraldPulse
+        }
+        DownloadPhase.CLIPBOARD_ARMED -> {
+            "${telemetry.platform.label} link detected · tap core to download" to MutedSlate
+        }
+        DownloadPhase.IDLE -> null
+    }
+
+    AnimatedVisibility(
+        visible = captionData != null,
+        enter = fadeIn(),
+        exit = fadeOut(),
+    ) {
+        captionData?.let { (message, color) ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = color,
+                textAlign = TextAlign.Center,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp)
+                    .testTag("blackhole_status_caption"),
+            )
+        }
+    }
+}
+
+private fun formatCaptionMb(bytes: Long): String {
+    val mb = bytes / (1024.0 * 1024.0)
+    return String.format(Locale.US, "%.1f MB", mb)
+}
+
+private fun formatCaptionSpeed(bytesPerSec: Long): String {
+    val mb = bytesPerSec / (1024.0 * 1024.0)
+    return if (mb >= 1.0) {
+        String.format(Locale.US, "%.1f MB/s", mb)
+    } else {
+        "${(bytesPerSec / 1024L).coerceAtLeast(1L)} KB/s"
     }
 }
