@@ -168,6 +168,36 @@ class UniversalDownloader(
         return command
     }
 
+    fun getFinalExecutionCommand(
+        targetUrl: String,
+        sessionVault: SessionVaultManager = this.sessionVault,
+    ): List<String> {
+        val command = mutableListOf("yt-dlp")
+
+        // 1. Validate Netscape cookies file from encrypted Session Vault
+        val cookiePath = sessionVault.getCookieFilePath()
+        if (!cookiePath.isNullOrBlank() && File(cookiePath).exists()) {
+            command.add("--cookies")
+            command.add(cookiePath)
+        } else {
+            throw IllegalStateException("Session Vault is empty! Please import Netscape cookies.txt.")
+        }
+
+        // 2. Client spoofing & anti-bot flags
+        command.add("--extractor-args")
+        command.add("youtube:player_client=ios,web")
+        command.add("--user-agent")
+        command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
+        command.add("--no-check-certificate")
+
+        // 3. Best video+audio merge selector & target URL
+        command.add("-f")
+        command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
+        command.add(targetUrl)
+
+        return command
+    }
+
     /**
      * Resolves shortened URLs (vt.tiktok.com, vm.tiktok.com, fb.watch, instagr.am, t.co, etc.)
      * and executes multi-strategy extraction with CookieVault session injection.
@@ -177,7 +207,7 @@ class UniversalDownloader(
         val canonicalUrl = resolveShortUrlIfNeeded(trimmed)
         val platform = PlatformBadge.fromUrl(canonicalUrl)
         val commandPlan = runCatching {
-            getBulletproofExtractionCommand(canonicalUrl)
+            getFinalExecutionCommand(canonicalUrl, sessionVault)
         }.getOrElse {
             getUniversalExtractionCommand(canonicalUrl, sessionVault)
         }
