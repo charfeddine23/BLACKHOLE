@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.view.ViewGroup
+import android.webkit.WebView
 import android.widget.FrameLayout
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
@@ -39,6 +40,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Movie
+import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
@@ -109,16 +111,25 @@ fun DownloadedVideosSwipeUpSheet(
     onCollapse: () -> Unit,
     onDeleteVideo: (DownloadedVideoEntity) -> Unit,
     modifier: Modifier = Modifier,
+    syncedDomains: List<String> = emptyList(),
+    vaultStatusMessage: String? = null,
+    onAutoSyncCookies: (String) -> Unit = {},
+    onManualSyncCookies: (String) -> Unit = {},
+    onPullFromBrowser: (String) -> Unit = {},
+    onDismissVaultStatus: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val gridState = rememberLazyGridState()
     var previewingVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
+    var showBrowserTab by remember { mutableStateOf(false) }
+    var embeddedWebView by remember { mutableStateOf<WebView?>(null) }
 
-    BackHandler(enabled = previewingVideo != null || drawerProgress > 0.05f) {
-        if (previewingVideo != null) {
-            previewingVideo = null
-        } else {
-            onCollapse()
+    BackHandler(enabled = previewingVideo != null || showBrowserTab || drawerProgress > 0.05f) {
+        when {
+            previewingVideo != null -> previewingVideo = null
+            showBrowserTab && embeddedWebView?.canGoBack() == true -> embeddedWebView?.goBack()
+            showBrowserTab -> showBrowserTab = false
+            else -> onCollapse()
         }
     }
 
@@ -223,34 +234,95 @@ fun DownloadedVideosSwipeUpSheet(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "DOWNLOADED VIDEOS",
                             style = MaterialTheme.typography.titleLarge,
                             color = ChromeSilver,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = "${videos.size} LOCAL VAULT ${if (videos.size == 1) "CAPTURE" else "CAPTURES"}",
+                            text = if (showBrowserTab) {
+                                "IN-APP BROWSER · AUTO COOKIE CAPTURE"
+                            } else {
+                                "${videos.size} LOCAL VAULT ${if (videos.size == 1) "CAPTURE" else "CAPTURES"}"
+                            },
                             style = MaterialTheme.typography.labelSmall,
-                            color = MutedSlate,
+                            color = if (showBrowserTab) NeonCyan else MutedSlate,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    IconButton(
-                        onClick = onCollapse,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("collapse_videos_sheet_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.KeyboardArrowDown,
-                            contentDescription = "Swipe down to close videos",
-                            tint = ChromeSilver,
-                        )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(
+                            color = if (showBrowserTab) NeonCyan.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.06f),
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                width = 0.85.dp,
+                                color = if (showBrowserTab) NeonCyan.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.3f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { showBrowserTab = !showBrowserTab }
+                                .minimumInteractiveComponentSize()
+                                .testTag("downloaded_sheet_browser_toggle"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = if (showBrowserTab) Icons.Outlined.Movie else Icons.Outlined.Public,
+                                    contentDescription = if (showBrowserTab) "Show downloaded videos" else "Open in-app browser",
+                                    tint = if (showBrowserTab) NeonCyan else ChromeSilver,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = if (showBrowserTab) "VIDEOS" else "BROWSER",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (showBrowserTab) NeonCyan else ChromeSilver,
+                                )
+                            }
+                        }
+
+                        IconButton(
+                            onClick = onCollapse,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("collapse_videos_sheet_button"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.KeyboardArrowDown,
+                                contentDescription = "Swipe down to close videos",
+                                tint = ChromeSilver,
+                            )
+                        }
                     }
                 }
             }
 
-            if (videos.isEmpty()) {
+            if (showBrowserTab) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                ) {
+                    DownloadedVideosBrowserPanel(
+                        syncedDomains = syncedDomains,
+                        statusMessage = vaultStatusMessage,
+                        onAutoSyncCookies = onAutoSyncCookies,
+                        onManualSyncCookies = onManualSyncCookies,
+                        onPullCurrentPage = { pageUrl ->
+                            onPullFromBrowser(pageUrl)
+                            onCollapse()
+                        },
+                        onDismissStatus = onDismissVaultStatus,
+                        onBindWebViewRef = { embeddedWebView = it },
+                    )
+                }
+            } else if (videos.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .weight(1f)

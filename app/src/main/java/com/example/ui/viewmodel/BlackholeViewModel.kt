@@ -1,6 +1,7 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
@@ -9,6 +10,7 @@ import com.example.data.local.BlackholeDatabase
 import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
 import com.example.engine.clipboard.ClipboardDetector
+import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.DownloadPhase
 import com.example.engine.model.DownloadTelemetry
 import com.example.engine.model.PlatformBadge
@@ -30,6 +32,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 data class BlackholeUiState(
@@ -38,12 +41,15 @@ data class BlackholeUiState(
     val telemetry: DownloadTelemetry = DownloadTelemetry(),
     val videoCount: Int = 0,
     val updateState: UpdateCheckState = UpdateCheckState.Idle,
+    val syncedDomains: List<String> = emptyList(),
+    val vaultStatusMessage: String? = null,
 )
 
 class BlackholeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
     private val clipboardDetector = ClipboardDetector(context)
+    private val cookieVault = CookieVaultManager.getInstance(context)
     private val appUpdateManager = AppUpdateManager()
     private val repository = VideoVaultRepository(
         context = context,
@@ -52,6 +58,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val _inputUrl = MutableStateFlow("")
     private val _updateState = MutableStateFlow<UpdateCheckState>(UpdateCheckState.Idle)
+    private val _vaultStatusMessage = MutableStateFlow<String?>(null)
     private val _requestInstallPermission = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val requestInstallPermission: SharedFlow<Unit> = _requestInstallPermission.asSharedFlow()
 
@@ -67,7 +74,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             initialValue = emptyList(),
         )
 
-    val uiState: StateFlow<BlackholeUiState> = combine(
+    private val coreSnapshotFlow = combine(
         _inputUrl,
         DownloadStateCoordinator.telemetry,
         videos,
@@ -79,6 +86,17 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
             telemetry = telemetry,
             videoCount = videoList.size,
             updateState = update,
+        )
+    }
+
+    val uiState: StateFlow<BlackholeUiState> = combine(
+        coreSnapshotFlow,
+        cookieVault.syncedDomains,
+        _vaultStatusMessage,
+    ) { base, domains, vaultMsg ->
+        base.copy(
+            syncedDomains = domains,
+            vaultStatusMessage = vaultMsg,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -229,10 +247,84 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         BlackholeDownloadService.startGravityPull(context, validUrl)
     }
 
+    fun onSharedUrlReceived(rawText: String) {
+        val validUrl = clipboardDetector.extractFirstValidUrl(rawText.trim()) ?: return
+        _inputUrl.value = validUrl
+        val platform = PlatformBadge.fromUrl(validUrl)
+        DownloadStateCoordinator.armClipboardUrl(validUrl, platform)
+        val activePhase = DownloadStateCoordinator.telemetry.value.phase
+        if (activePhase != DownloadPhase.ABSORBING &&
+            activePhase != DownloadPhase.DOWNLOADING &&
+            activePhase != DownloadPhase.MERGING
+        ) {
+            DownloadStateCoordinator.setAbsorbing(validUrl, platform)
+            BlackholeDownloadService.startGravityPull(context, validUrl)
+        }
+    }
+
+    fun triggerGravityPullForUrl(rawUrl: String) {
+        val activePhase = DownloadStateCoordinator.telemetry.value.phase
+        if (activePhase == DownloadPhase.ABSORBING ||
+            activePhase == DownloadPhase.DOWNLOADING ||
+            activePhase == DownloadPhase.MERGING
+        ) {
+            return
+        }
+        val validUrl = clipboardDetector.extractFirstValidUrl(rawUrl.trim())
+            ?: return
+        _inputUrl.value = validUrl
+        val platform = PlatformBadge.fromUrl(validUrl)
+        DownloadStateCoordinator.setAbsorbing(validUrl, platform)
+        BlackholeDownloadService.startGravityPull(context, validUrl)
+    }
+
     fun deleteVideo(video: DownloadedVideoEntity) {
         viewModelScope.launch {
             repository.deleteVideo(video)
         }
+    }
+
+    fun importCookiesFromUri(uri: Uri) {
+        viewModelScope.launch {
+            val importedCount = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        stream.bufferedReader().use { reader ->
+                            cookieVault.importNetscapeCookiesTxt(reader.readText())
+                        }
+                    } ?: 0
+                }.getOrDefault(0)
+            }
+            _vaultStatusMessage.value = if (importedCount > 0) {
+                "Encrypted & stored $importedCount session cookies in AES-256 Vault."
+            } else {
+                "No valid Netscape/JSON cookies found in selected file."
+            }
+        }
+    }
+
+    fun syncWebViewSession(url: String, silent: Boolean = false) {
+        viewModelScope.launch {
+            val syncedCount = cookieVault.syncFromWebView(url)
+            if (!silent || syncedCount > 0) {
+                _vaultStatusMessage.value = if (syncedCount > 0) {
+                    "Synced $syncedCount live session cookies into AES-256 Vault."
+                } else {
+                    "No session cookies captured yet — complete login first, then tap Sync."
+                }
+            }
+        }
+    }
+
+    fun clearAllCookies() {
+        viewModelScope.launch {
+            cookieVault.clearAllCookies()
+            _vaultStatusMessage.value = "Session Vault cleared."
+        }
+    }
+
+    fun clearVaultStatusMessage() {
+        _vaultStatusMessage.value = null
     }
 
     companion object {

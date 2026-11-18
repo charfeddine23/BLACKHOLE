@@ -65,6 +65,21 @@ class SessionVaultManager(context: Context) {
     // مسح الجلسة
     fun clearVault() {
         sharedPreferences.edit().remove(KEY_COOKIES_CONTENT).apply()
+        runCatching {
+            val tempFile = File(appContext.cacheDir, COOKIE_TEMP_FILE_NAME)
+            if (tempFile.exists()) tempFile.delete()
+        }
+    }
+
+    /**
+     * Returns the absolute path to the Netscape-format cookies.txt file materialized
+     * from the encrypted Session Vault, or null if the vault is empty.
+     */
+    fun getCookieFilePath(): String? {
+        if (!hasActiveSession()) return null
+        return writeTempNetscapeCookiesFile(appContext.cacheDir)
+            ?.takeIf { it.exists() && it.length() > 0L }
+            ?.absolutePath
     }
 
     /**
@@ -77,7 +92,7 @@ class SessionVaultManager(context: Context) {
         if (netscapeContent.isBlank()) return null
         return runCatching {
             if (!targetDir.exists()) targetDir.mkdirs()
-            val tempFile = File(targetDir, "blackhole_session_cookies.txt")
+            val tempFile = File(targetDir, COOKIE_TEMP_FILE_NAME)
             tempFile.writeText(netscapeContent)
             tempFile
         }.getOrNull()
@@ -130,5 +145,6 @@ class SessionVaultManager(context: Context) {
     companion object {
         private const val PREFS_NAME = "blackhole_secure_vault"
         private const val KEY_COOKIES_CONTENT = "KEY_COOKIES_CONTENT"
+        private const val COOKIE_TEMP_FILE_NAME = "blackhole_session_cookies.txt"
     }
 }

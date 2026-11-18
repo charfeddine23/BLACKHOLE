@@ -9,11 +9,15 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.example.ui.screens.BlackholeScreen
+import com.example.ui.screens.VaultScreen
 import com.example.ui.viewmodel.BlackholeViewModel
 import kotlinx.serialization.Serializable
 
 @Serializable
 object BlackholeRoute
+
+@Serializable
+object VaultRoute
 
 @Composable
 fun BlackholeNavGraph(
@@ -29,7 +33,23 @@ fun BlackholeNavGraph(
             enterTransition = { fadeIn(tween(240)) },
             exitTransition = { fadeOut(tween(220)) },
         ) {
-            BlackholeScreen(viewModel = blackholeViewModel)
+            BlackholeScreen(
+                viewModel = blackholeViewModel,
+                onNavigateToVault = {
+                    navController.navigate(VaultRoute) {
+                        launchSingleTop = true
+                    }
+                },
+            )
+        }
+        composable<VaultRoute>(
+            enterTransition = { fadeIn(tween(240)) },
+            exitTransition = { fadeOut(tween(220)) },
+        ) {
+            VaultScreen(
+                viewModel = blackholeViewModel,
+                onBack = { navController.popBackStack() },
+            )
         }
     }
 }

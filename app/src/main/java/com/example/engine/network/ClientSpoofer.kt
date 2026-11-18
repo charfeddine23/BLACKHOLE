@@ -20,6 +20,9 @@ object ClientSpoofer {
     const val ANDROID_CHROME_USER_AGENT =
         "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.49 Mobile Safari/537.36"
 
+    const val INSTAGRAM_ANDROID_USER_AGENT =
+        "Instagram 317.0.0.34.109 Android (34/14; 420dpi; 1080x2400; Google/google; Pixel 8; shiba; shiba; en_US; 562413684)"
+
     private val rotationIndex = AtomicInteger(0)
 
     val profiles: List<SpoofedClientProfile> = listOf(
@@ -126,14 +129,33 @@ object ClientSpoofer {
 
         val headers = LinkedHashMap<String, String>()
         headers["User-Agent"] = if (isTikTok) TIKTOK_IOS_USER_AGENT else profile.userAgent
-        headers.putAll(profile.extraHeaders)
+        if (!isTikTok) {
+            headers.putAll(profile.extraHeaders)
+        } else {
+            headers["Accept"] = "*/*"
+            headers["Accept-Language"] = "en-US,en;q=0.9"
+        }
         headers["Referer"] = resolvedReferer
         if (!origin.isNullOrBlank()) {
             headers["Origin"] = origin
         }
-        if (isInstagram) {
+        if (isInstagram && !lower.contains("cdninstagram")) {
             headers["X-IG-App-ID"] = "936619743392459"
         }
         return headers
+    }
+
+    fun buildDownloadHeaders(
+        streamUrl: String,
+        streamHeaders: Map<String, String>,
+    ): Map<String, String> {
+        if (streamHeaders.containsKey("User-Agent")) {
+            val out = LinkedHashMap<String, String>(streamHeaders)
+            out.putIfAbsent("Accept", "*/*")
+            out.putIfAbsent("Accept-Language", "en-US,en;q=0.9")
+            out.putIfAbsent("Referer", refererForUrl(streamUrl))
+            return out
+        }
+        return buildHeadersForUrl(streamUrl, profiles.first()) + streamHeaders
     }
 }

@@ -99,6 +99,7 @@ import java.util.Locale
 @Composable
 fun BlackholeScreen(
     viewModel: BlackholeViewModel,
+    onNavigateToVault: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -159,7 +160,12 @@ fun BlackholeScreen(
         uiState = uiState,
         videos = videos,
         onTapBlackhole = initiatePullWithPermissionCheck,
+        onHoldVault = onNavigateToVault,
         onDeleteVideo = viewModel::deleteVideo,
+        onAutoSyncCookies = { url -> viewModel.syncWebViewSession(url, silent = true) },
+        onManualSyncCookies = { url -> viewModel.syncWebViewSession(url, silent = false) },
+        onPullFromBrowser = viewModel::triggerGravityPullForUrl,
+        onDismissVaultStatus = viewModel::clearVaultStatusMessage,
         modifier = modifier,
     )
 }
@@ -169,7 +175,12 @@ private fun BlackholeScreenContent(
     uiState: BlackholeUiState,
     videos: List<DownloadedVideoEntity>,
     onTapBlackhole: () -> Unit,
+    onHoldVault: () -> Unit,
     onDeleteVideo: (DownloadedVideoEntity) -> Unit,
+    onAutoSyncCookies: (String) -> Unit,
+    onManualSyncCookies: (String) -> Unit,
+    onPullFromBrowser: (String) -> Unit,
+    onDismissVaultStatus: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val telemetry = uiState.telemetry
@@ -373,6 +384,7 @@ private fun BlackholeScreenContent(
                             onTapBlackhole = onTapBlackhole,
                             isUpdateActive = isUpdateActive,
                             updateProgress = updateRingProgress,
+                            onHoldVault = onHoldVault,
                         )
 
                         Spacer(modifier = Modifier.height(14.dp))
@@ -402,6 +414,12 @@ private fun BlackholeScreenContent(
                     onDragFinish = finishDragWithVelocity,
                     onCollapse = { snapDrawer(false) },
                     onDeleteVideo = onDeleteVideo,
+                    syncedDomains = uiState.syncedDomains,
+                    vaultStatusMessage = uiState.vaultStatusMessage,
+                    onAutoSyncCookies = onAutoSyncCookies,
+                    onManualSyncCookies = onManualSyncCookies,
+                    onPullFromBrowser = onPullFromBrowser,
+                    onDismissVaultStatus = onDismissVaultStatus,
                 )
             }
         }

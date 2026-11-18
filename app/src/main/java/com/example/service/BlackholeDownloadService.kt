@@ -57,7 +57,7 @@ class BlackholeDownloadService : Service() {
     private val cookieVault: CookieVaultManager by lazy { CookieVaultManager.getInstance(applicationContext) }
     private val okHttpClient: OkHttpClient by lazy { VideoStreamExtractor.createWithVault(cookieVault) }
     private val sniffer: WebViewStreamSniffer by lazy { WebViewStreamSniffer(applicationContext, cookieVault) }
-    private val extractor: VideoStreamExtractor by lazy { VideoStreamExtractor(okHttpClient, sniffer) }
+    private val extractor: VideoStreamExtractor by lazy { VideoStreamExtractor(okHttpClient, sniffer, cookieVault) }
     private val universalDownloader: UniversalDownloader by lazy {
         UniversalDownloader(
             context = applicationContext,
@@ -140,7 +140,27 @@ class BlackholeDownloadService : Service() {
                 }
 
                 is ExtractionResult.Success -> {
-                    streamAndSaveVideo(routed.canonicalUrl, extraction.bestStream)
+                    val candidatesToTry = extraction.candidates.ifEmpty { listOf(extraction.bestStream) }.take(3)
+                    var completed = false
+                    for (candidate in candidatesToTry) {
+                        if (streamAndSaveVideo(routed.canonicalUrl, candidate)) {
+                            completed = true
+                            break
+                        }
+                    }
+                    if (!completed && DownloadStateCoordinator.telemetry.value.phase !=
+                        com.example.engine.model.DownloadPhase.ERROR
+                    ) {
+                        DownloadStateCoordinator.setError(
+                            routed.canonicalUrl,
+                            extraction.bestStream.platform,
+                            "Stream yielded 0 bytes or was rejected by upstream server.",
+                        )
+                        postTerminalNotification(
+                            "Blackhole Download Failed",
+                            "Stream rejected by upstream server. Try Browser login in DOWNLOADED VIDEOS.",
+                        )
+                    }
                 }
             }
         } catch (_: CancellationException) {
@@ -158,7 +178,7 @@ class BlackholeDownloadService : Service() {
         }
     }
 
-    private suspend fun streamAndSaveVideo(sourceUrl: String, stream: ExtractedStream) {
+    private suspend fun streamAndSaveVideo(sourceUrl: String, stream: ExtractedStream): Boolean {
         val extension = if (stream.isHls) "mp4" else extensionForMime(stream.mimeType)
         val safeFileBase = stream.title
             .replace(Regex("""[^A-Za-z0-9_\-]"""), "_")
@@ -169,10 +189,10 @@ class BlackholeDownloadService : Service() {
 
         val vaultDir = File(filesDir, "blackhole_videos").apply { mkdirs() }
         val localFile = File(vaultDir, fileName)
-        val mergedHeaders = ClientSpoofer.buildHeadersForUrl(
-            targetUrl = stream.streamUrl,
-            profile = ClientSpoofer.profiles.first(),
-        ) + stream.headers
+        val mergedHeaders = ClientSpoofer.buildDownloadHeaders(
+            streamUrl = stream.streamUrl,
+            streamHeaders = stream.headers,
+        )
 
         val succeeded = when {
             stream.isHls -> {
@@ -202,16 +222,7 @@ class BlackholeDownloadService : Service() {
 
         if (!succeeded || !localFile.exists() || localFile.length() <= 0L) {
             localFile.delete()
-            if (DownloadStateCoordinator.telemetry.value.phase !=
-                com.example.engine.model.DownloadPhase.ERROR
-            ) {
-                DownloadStateCoordinator.setError(
-                    sourceUrl,
-                    stream.platform,
-                    "Stream yielded 0 bytes or was rejected by upstream server.",
-                )
-            }
-            return
+            return false
         }
 
         val exportedUri = exportToMediaStoreIfSupported(localFile, fileName, stream.mimeType)
@@ -250,6 +261,7 @@ class BlackholeDownloadService : Service() {
             title = "Captured in Vault",
             text = "${stream.title} (${stream.qualityLabel})",
         )
+        return true
     }
 
     private suspend fun downloadHlsStream(

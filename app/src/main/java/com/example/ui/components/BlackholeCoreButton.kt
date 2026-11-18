@@ -1,6 +1,7 @@
 package com.example.ui.components
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -12,8 +13,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.indication
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -46,10 +50,14 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.onLongClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -63,8 +71,13 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+
+private const val VAULT_HOLD_TOTAL_MS = 1_000L
+private const val VAULT_HOLD_GRACE_MS = 140L
+private const val QUICK_TAP_MAX_MS = 380L
 
 @Composable
 fun BlackholeCoreButton(
@@ -76,10 +89,12 @@ fun BlackholeCoreButton(
     coreDiameter: Dp = 264.dp,
     isUpdateActive: Boolean = false,
     updateProgress: Float = 0f,
+    onHoldVault: () -> Unit = {},
 ) {
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val interactionSource = remember { MutableInteractionSource() }
+    val vaultHoldProgress = remember { Animatable(0f) }
 
     val smoothUpdateProgress by animateFloatAsState(
         targetValue = updateProgress.coerceIn(0f, 1f),
@@ -235,9 +250,42 @@ fun BlackholeCoreButton(
                     )
                 }
             }
+
+            // 1-second Vault Hold Ring around Blackhole perimeter
+            val holdFraction = vaultHoldProgress.value
+            if (holdFraction > 0.01f) {
+                val holdRadius = (coreDiameter.toPx() / 2f) + 12.dp.toPx()
+                val holdSize = Size(holdRadius * 2f, holdRadius * 2f)
+                val holdTopLeft = Offset(
+                    center.x - holdRadius,
+                    center.y - holdRadius,
+                )
+                drawCircle(
+                    color = PlasmaViolet.copy(alpha = 0.18f),
+                    radius = holdRadius,
+                    center = center,
+                    style = Stroke(width = 3.dp.toPx()),
+                )
+                drawArc(
+                    brush = Brush.sweepGradient(
+                        colors = listOf(
+                            PlasmaViolet,
+                            NeonCyan,
+                            PlasmaViolet,
+                        ),
+                        center = center,
+                    ),
+                    startAngle = -90f,
+                    sweepAngle = (360f * holdFraction).coerceIn(0f, 360f),
+                    useCenter = false,
+                    topLeft = holdTopLeft,
+                    size = holdSize,
+                    style = Stroke(width = 4.5.dp.toPx(), cap = StrokeCap.Round),
+                )
+            }
         }
 
-        // Interactive Blackhole Sphere
+        // Interactive Blackhole Sphere (Tap to pull, Hold 1s to enter Vault)
         Box(
             modifier = Modifier
                 .size(coreDiameter)
@@ -246,25 +294,114 @@ fun BlackholeCoreButton(
                     scaleY = coreButtonScale
                 }
                 .clip(CircleShape)
-                .semantics {
-                    contentDescription = when (phase) {
-                        DownloadPhase.DOWNLOADING -> "Downloading video at ${(controller.animatedDownloadProgress.value * 100).roundToInt()} percent"
-                        DownloadPhase.ABSORBING -> "Absorbing stream link"
-                        DownloadPhase.CLIPBOARD_ARMED -> "Tap Blackhole core to pull armed video link"
-                        DownloadPhase.COMPLETED -> "Download complete. Tap to pull again"
-                        else -> "Tap Blackhole core to detect clipboard and download video"
-                    }
-                }
-                .clickable(
+                .indication(
                     interactionSource = interactionSource,
                     indication = ripple(bounded = true, color = NeonCyan),
-                    role = Role.Button,
-                    onClick = {
+                )
+                .semantics(mergeDescendants = true) {
+                    role = Role.Button
+                    contentDescription = when (phase) {
+                        DownloadPhase.DOWNLOADING -> "Downloading video at ${(controller.animatedDownloadProgress.value * 100).roundToInt()} percent. Hold 1 second for Vault"
+                        DownloadPhase.ABSORBING -> "Absorbing stream link. Hold 1 second for Vault"
+                        DownloadPhase.CLIPBOARD_ARMED -> "Tap Blackhole core to pull armed video link, or hold 1 second for Vault"
+                        DownloadPhase.COMPLETED -> "Download complete. Tap to pull again, or hold 1 second for Vault"
+                        else -> "Tap Blackhole core to download video, or hold 1 second for Vault"
+                    }
+                    onClick {
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         scope.launch { controller.triggerTapImplosion() }
                         onTapBlackhole()
-                    },
-                )
+                        true
+                    }
+                    onLongClick(label = "Open Vault") {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onHoldVault()
+                        true
+                    }
+                }
+                .pointerInput(onTapBlackhole, onHoldVault) {
+                    val touchSlop = viewConfiguration.touchSlop
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val downTimeMs = down.uptimeMillis
+                        val pressInteraction = PressInteraction.Press(down.position)
+                        scope.launch { interactionSource.emit(pressInteraction) }
+
+                        var holdTriggered = false
+                        var movedBeyondSlop = false
+
+                        val holdJob = scope.launch {
+                            delay(VAULT_HOLD_GRACE_MS)
+                            vaultHoldProgress.snapTo(0f)
+                            vaultHoldProgress.animateTo(
+                                targetValue = 1f,
+                                animationSpec = tween(
+                                    durationMillis = (VAULT_HOLD_TOTAL_MS - VAULT_HOLD_GRACE_MS).toInt(),
+                                    easing = LinearEasing,
+                                ),
+                            )
+                            holdTriggered = true
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            vaultHoldProgress.snapTo(0f)
+                            onHoldVault()
+                        }
+
+                        try {
+                            var lastUpTimeMs = downTimeMs
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id }
+                                    ?: event.changes.firstOrNull()
+                                    ?: break
+
+                                val dragDistance = (change.position - down.position).getDistance()
+                                if (dragDistance > touchSlop) {
+                                    movedBeyondSlop = true
+                                    holdJob.cancel()
+                                    break
+                                }
+
+                                if (!change.pressed) {
+                                    lastUpTimeMs = change.uptimeMillis
+                                    change.consume()
+                                    break
+                                }
+                            }
+
+                            holdJob.cancel()
+                            scope.launch {
+                                vaultHoldProgress.snapTo(0f)
+                                interactionSource.emit(
+                                    if (movedBeyondSlop) {
+                                        PressInteraction.Cancel(pressInteraction)
+                                    } else {
+                                        PressInteraction.Release(pressInteraction)
+                                    },
+                                )
+                            }
+
+                            val pressDurationMs = lastUpTimeMs - downTimeMs
+                            if (!holdTriggered && !movedBeyondSlop && pressDurationMs < QUICK_TAP_MAX_MS) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                scope.launch { controller.triggerTapImplosion() }
+                                onTapBlackhole()
+                            }
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            holdJob.cancel()
+                            scope.launch {
+                                vaultHoldProgress.snapTo(0f)
+                                interactionSource.emit(PressInteraction.Cancel(pressInteraction))
+                            }
+                            throw ce
+                        } catch (_: Throwable) {
+                            holdJob.cancel()
+                            scope.launch {
+                                vaultHoldProgress.snapTo(0f)
+                                interactionSource.emit(PressInteraction.Cancel(pressInteraction))
+                            }
+                        }
+                    }
+                }
                 .testTag("blackhole_core_button"),
             contentAlignment = Alignment.Center,
         ) {

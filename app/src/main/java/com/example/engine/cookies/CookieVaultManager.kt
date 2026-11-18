@@ -328,6 +328,20 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         return cookies.joinToString("; ") { "${it.name}=${it.value}" }
     }
 
+    fun getCookieValue(url: String, cookieName: String): String? {
+        val httpUrl = runCatching {
+            HttpUrl.Builder()
+                .scheme(if (url.startsWith("https://", ignoreCase = true)) "https" else "http")
+                .host(java.net.URI(url).host ?: return null)
+                .build()
+        }.getOrNull() ?: return null
+
+        return okHttpCookieJar.loadForRequest(httpUrl)
+            .firstOrNull { it.name.equals(cookieName, ignoreCase = true) }
+            ?.value
+            ?.takeIf { it.isNotBlank() }
+    }
+
     private fun parseCookiesText(content: String): List<StoredCookieEntry> {
         val trimmed = content.trim()
         if (trimmed.isBlank()) return emptyList()
