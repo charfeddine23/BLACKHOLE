@@ -97,7 +97,7 @@ internal class MetaVideoPowerExtractor(
                         )
                     }
                 }
-                if (found.any { it.resolutionHeight >= 1080 && hasUsableAudio(it) }) break
+                if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) break
             }
         }
 
@@ -153,12 +153,12 @@ internal class MetaVideoPowerExtractor(
                         )
                     }
                 }
-                if (found.isNotEmpty()) break
+                if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) break
             }
         }
 
         // Layer 4 & 5: ?__a=1&__d=dis + Captioned Embed + Direct HTML Pages
-        if (found.isEmpty()) {
+        if (found.none { hasConfirmedAudio(it) }) {
             val htmlTargets = buildList {
                 if (!shortcode.isNullOrBlank()) {
                     add("https://www.instagram.com/reel/$shortcode/embed/captioned/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
@@ -206,11 +206,25 @@ internal class MetaVideoPowerExtractor(
                         )
                     }
                 }
-                if (found.any { it.resolutionHeight >= 1080 && hasUsableAudio(it) }) break
+                if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) break
             }
         }
 
-        val cleanVerified = verifyAndDedupe(found)
+        // Share any discovered audio track across layers if an earlier layer had video-only candidates
+        val globalAudio = found.firstNotNullOfOrNull { it.audioStreamUrl }
+        val audioEnriched = if (globalAudio != null) {
+            found.map { stream ->
+                if (stream.audioStreamUrl == null && !isMetaProgressiveUrl(stream.streamUrl)) {
+                    stream.copy(audioStreamUrl = globalAudio)
+                } else {
+                    stream
+                }
+            }
+        } else {
+            found
+        }
+
+        val cleanVerified = verifyAndDedupe(audioEnriched)
         return MetaExtractionOutcome(
             streams = cleanVerified,
             authChallenge = authChallenge && cleanVerified.isEmpty(),
@@ -251,7 +265,8 @@ internal class MetaVideoPowerExtractor(
             if (blob.contains("video_versions") ||
                 blob.contains("video_url") ||
                 blob.contains("dash_manifest") ||
-                blob.contains("playable_url")
+                blob.contains("playable_url") ||
+                blob.contains("audio_url")
             ) {
                 runCatching {
                     val obj = JSONObject(blob)
@@ -342,17 +357,16 @@ internal class MetaVideoPowerExtractor(
         // 6. og:video / <video> tags inside embed HTML
         extractOgAndVideoTags(unescaped, baseUrl, title, PlatformBadge.INSTAGRAM, streamHeaders, localCandidates)
 
-        // Pair pooled audio to any DASH video-only Instagram candidate missing audioStreamUrl
-        val pooledAudio = audioPool.firstOrNull()
+        // Pair pooled audio to any non-progressive Instagram candidate missing audioStreamUrl.
+        // LocalMediaMuxer safely preserves any native audio track already inside videoFile.
+        val pooledAudio = audioPool.firstOrNull { !it.endsWith(".mp3", ignoreCase = true) }
+            ?: audioPool.firstOrNull()
         localCandidates.forEach { candidate ->
             if (candidate.audioStreamUrl == null &&
                 pooledAudio != null &&
-                !isMetaProgressiveUrl(candidate.streamUrl) &&
-                (isMetaVideoOnlyDashUrl(candidate.streamUrl) || candidate.platform == PlatformBadge.INSTAGRAM)
+                !isMetaProgressiveUrl(candidate.streamUrl)
             ) {
-                // Only attach if candidate is known DASH video-only OR there are no confirmed progressive versions
-                val shouldPair = isMetaVideoOnlyDashUrl(candidate.streamUrl)
-                out.add(if (shouldPair) candidate.copy(audioStreamUrl = pooledAudio) else candidate)
+                out.add(candidate.copy(audioStreamUrl = pooledAudio))
             } else {
                 out.add(candidate)
             }
@@ -429,17 +443,30 @@ internal class MetaVideoPowerExtractor(
                     }
                 }
 
-                val dashXml = node.optString("video_dash_manifest")
+                val rawDashXml = node.optString("video_dash_manifest")
                     .ifBlank { node.optString("dash_manifest") }
-                if (dashXml.contains("<MPD", ignoreCase = true)) {
+                    .ifBlank { node.optString("all_video_dash_manifest") }
+                val unescapedDash = if (rawDashXml.isNotBlank()) unescapeMetaMarkup(rawDashXml) else ""
+                if (unescapedDash.contains("<MPD", ignoreCase = true)) {
                     extractScopedMpdStreams(
-                        markup = unescapeMetaMarkup(dashXml),
+                        markup = unescapedDash,
                         title = title,
                         platform = PlatformBadge.INSTAGRAM,
                         headers = headers,
                         out = out,
                         audioPoolOut = audioPool,
                     )
+                }
+
+                // Capture Instagram Reel sound progressive download URL as backup audio source
+                val soundFallback = sanitizeCdnUrl(
+                    node.optString("progressive_download_url")
+                        .ifBlank { node.optString("fast_start_progressive_download_url") },
+                )
+                if (soundFallback.startsWith("http") &&
+                    (soundFallback.contains("cdninstagram", true) || soundFallback.contains("fbcdn.net", true))
+                ) {
+                    audioPool.add(soundFallback)
                 }
 
                 val keys = node.keys()
@@ -575,17 +602,29 @@ internal class MetaVideoPowerExtractor(
                 }
             }
 
-            if (found.any { it.resolutionHeight >= 1080 && it.audioStreamUrl == null }) {
+            if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) {
                 break
             }
-            if (isPluginOrSinglePost && found.isNotEmpty()) {
-                // Single-video endpoints already found progressive/MPD streams for the exact requested video!
-                val hasHd = found.any { it.resolutionHeight >= 720 }
-                if (hasHd) break
+            if (isPluginOrSinglePost && found.any { hasConfirmedAudio(it) && it.resolutionHeight >= 720 }) {
+                // Single-video endpoints already found A+V HD streams for the exact requested video
+                break
             }
         }
 
-        val cleanVerified = verifyAndDedupe(found)
+        val globalAudio = found.firstNotNullOfOrNull { it.audioStreamUrl }
+        val audioEnriched = if (globalAudio != null) {
+            found.map { stream ->
+                if (stream.audioStreamUrl == null && !isMetaProgressiveUrl(stream.streamUrl)) {
+                    stream.copy(audioStreamUrl = globalAudio)
+                } else {
+                    stream
+                }
+            }
+        } else {
+            found
+        }
+
+        val cleanVerified = verifyAndDedupe(audioEnriched)
         return MetaExtractionOutcome(
             streams = cleanVerified,
             authChallenge = authChallenge && cleanVerified.isEmpty(),
@@ -622,7 +661,18 @@ internal class MetaVideoPowerExtractor(
         streamHeaders: Map<String, String>,
         out: MutableList<ExtractedStream>,
     ) {
-        // 1. Progressive full-file HD & SD fields (contain BOTH audio and video!)
+        val localCandidates = mutableListOf<ExtractedStream>()
+        val audioPool = mutableListOf<String>()
+
+        // Capture standalone audio_url fields if present
+        Regex(""""audio_url"\s*:\s*"(https?://[^"]+)"""", RegexOption.IGNORE_CASE)
+            .findAll(markup)
+            .forEach { m ->
+                val aUrl = sanitizeCdnUrl(m.groupValues[1])
+                if (aUrl.startsWith("http")) audioPool.add(aUrl)
+            }
+
+        // 1. Progressive full-file HD & SD fields (contain BOTH audio and video unless marked DASH video-only)
         val fbJsonKeys = listOf(
             "browser_native_hd_url" to 1080,
             "playable_url_quality_hd" to 1080,
@@ -638,28 +688,41 @@ internal class MetaVideoPowerExtractor(
             regex.findAll(markup).forEach { match ->
                 val cleanUrl = sanitizeCdnUrl(match.groupValues[1])
                 if (cleanUrl.startsWith("http")) {
-                    out.add(
-                        ExtractedStream(
-                            streamUrl = cleanUrl,
-                            title = title,
-                            platform = PlatformBadge.FACEBOOK,
-                            qualityLabel = formatQualityLabel(heightTier),
-                            resolutionHeight = heightTier,
-                            mimeType = "video/mp4",
-                            estimatedBytes = -1L,
-                            headers = streamHeaders,
-                            bitrateBps = if (heightTier >= 1080) 4_000_000L else 1_600_000L,
-                        ),
-                    )
+                    if (isMetaAudioOnlyUrl(cleanUrl)) {
+                        audioPool.add(cleanUrl)
+                    } else {
+                        localCandidates.add(
+                            ExtractedStream(
+                                streamUrl = cleanUrl,
+                                title = title,
+                                platform = PlatformBadge.FACEBOOK,
+                                qualityLabel = formatQualityLabel(heightTier),
+                                resolutionHeight = heightTier,
+                                mimeType = "video/mp4",
+                                estimatedBytes = -1L,
+                                headers = streamHeaders,
+                                bitrateBps = if (heightTier >= 1080) 4_000_000L else 1_600_000L,
+                            ),
+                        )
+                    }
                 }
             }
         }
 
         // 2. Per-MPD DASH manifest extraction (pairs video & audio strictly within the SAME <MPD> block)
-        extractScopedMpdStreams(markup, title, PlatformBadge.FACEBOOK, streamHeaders, out)
+        extractScopedMpdStreams(markup, title, PlatformBadge.FACEBOOK, streamHeaders, localCandidates, audioPool)
 
         // 3. OpenGraph / <video> tags inside isolated block
-        extractOgAndVideoTags(markup, baseUrl, title, PlatformBadge.FACEBOOK, streamHeaders, out)
+        extractOgAndVideoTags(markup, baseUrl, title, PlatformBadge.FACEBOOK, streamHeaders, localCandidates)
+
+        val pooledAudio = audioPool.firstOrNull()
+        localCandidates.forEach { cand ->
+            if (cand.audioStreamUrl == null && pooledAudio != null && !isMetaProgressiveUrl(cand.streamUrl)) {
+                out.add(cand.copy(audioStreamUrl = pooledAudio))
+            } else {
+                out.add(cand)
+            }
+        }
     }
 
     private fun extractScopedMpdStreams(
@@ -710,6 +773,8 @@ internal class MetaVideoPowerExtractor(
                         repMime.startsWith("audio", ignoreCase = true) ||
                         codecs.contains("mp4a", ignoreCase = true) ||
                         codecs.contains("opus", ignoreCase = true) ||
+                        attrs.contains("audioSamplingRate", ignoreCase = true) ||
+                        inner.contains("AudioChannelConfiguration", ignoreCase = true) ||
                         isMetaAudioOnlyUrl(cleanBase)
 
                     if (isAudioRep) {
@@ -820,6 +885,10 @@ internal class MetaVideoPowerExtractor(
                 )
             }
         }
+    }
+
+    private fun hasConfirmedAudio(stream: ExtractedStream): Boolean {
+        return !stream.audioStreamUrl.isNullOrBlank() || isMetaProgressiveUrl(stream.streamUrl)
     }
 
     private fun hasUsableAudio(stream: ExtractedStream): Boolean {
@@ -934,17 +1003,22 @@ internal class MetaVideoPowerExtractor(
         return input
             .replace("\\\\/", "/")
             .replace("\\/", "/")
-            .replace("\\\\u0026", "&")
-            .replace("\\u0026", "&")
-            .replace("\\\\u0025", "%")
-            .replace("\\u0025", "%")
-            .replace("\\\\u002F", "/")
-            .replace("\\u002F", "/")
-            .replace("\\u003C", "<")
-            .replace("\\u003E", ">")
+            .replace("\\\\u0026", "&", ignoreCase = true)
+            .replace("\\u0026", "&", ignoreCase = true)
+            .replace("\\\\u0025", "%", ignoreCase = true)
+            .replace("\\u0025", "%", ignoreCase = true)
+            .replace("\\\\u002f", "/", ignoreCase = true)
+            .replace("\\u002f", "/", ignoreCase = true)
+            .replace("\\\\u003c", "<", ignoreCase = true)
+            .replace("\\u003c", "<", ignoreCase = true)
+            .replace("\\\\u003e", ">", ignoreCase = true)
+            .replace("\\u003e", ">", ignoreCase = true)
+            .replace("\\n", "\n")
             .replace("\\\"", "\"")
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+            .replace("&amp;", "&", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
     }
 
     private fun shortcodeToInstagramMediaId(shortcode: String): String? {
@@ -1059,7 +1133,10 @@ internal class MetaVideoPowerExtractor(
 
         fun isMetaAudioOnlyUrl(url: String): Boolean {
             val lower = url.lowercase()
-            if (lower.contains("mime=audio") ||
+            val pathOnly = lower.substringBefore("?")
+            if (pathOnly.endsWith(".m4a") ||
+                pathOnly.endsWith(".aac") ||
+                lower.contains("mime=audio") ||
                 lower.contains("mime_type=audio") ||
                 lower.contains("audio_mp4")
             ) {
@@ -1091,8 +1168,18 @@ internal class MetaVideoPowerExtractor(
 
         fun isMetaVideoOnlyDashUrl(url: String): Boolean {
             if (isMetaAudioOnlyUrl(url)) return false
+            val lower = url.lowercase()
+            if (lower.contains("mime=video")) return true
             val efg = decodeMetaEfgTag(url) ?: return false
-            return efg.contains("dash") && !efg.contains("progressive")
+            if (efg.contains("progressive")) return false
+            return efg.contains("dash") ||
+                efg.contains("xpv_") ||
+                efg.contains("sve_") ||
+                efg.contains("vp9") ||
+                efg.contains("vp09") ||
+                efg.contains("av01") ||
+                efg.contains("hevc") ||
+                efg.contains("vencode")
         }
 
         fun isAvcH264MetaUrl(url: String): Boolean {

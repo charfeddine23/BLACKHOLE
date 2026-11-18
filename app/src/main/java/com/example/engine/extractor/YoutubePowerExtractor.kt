@@ -337,7 +337,7 @@ internal class YoutubePowerExtractor(
         val adaptive = streamingData.optJSONArray("adaptiveFormats") ?: JSONArray()
         var bestAudioUrl: String? = null
         var bestAudioBitrate = -1L
-        val videoAdaptive = mutableListOf<Pair<JSONObject, String>>()
+        val videoAdaptiveAll = mutableListOf<Pair<JSONObject, String>>()
 
         for (i in 0 until adaptive.length()) {
             val fmt = adaptive.optJSONObject(i) ?: continue
@@ -350,9 +350,16 @@ internal class YoutubePowerExtractor(
                     bestAudioUrl = fmtUrl
                 }
             } else if (mime.startsWith("video/mp4")) {
-                videoAdaptive.add(fmt to fmtUrl)
+                videoAdaptiveAll.add(fmt to fmtUrl)
             }
         }
+
+        // Prefer H.264 (avc1) over AV1/VP9 so Android's MPEG_4 MediaMuxer always muxes A+V reliably
+        val h264Adaptive = videoAdaptiveAll.filter { (fmt, _) ->
+            val m = fmt.optString("mimeType").lowercase()
+            m.contains("avc1") || (!m.contains("av01") && !m.contains("vp9") && !m.contains("vp09"))
+        }
+        val videoAdaptive = h264Adaptive.ifEmpty { videoAdaptiveAll }
 
         videoAdaptive.forEach { (vFmt, vUrl) ->
             val height = computeQualityTier(vFmt.optInt("width", 0), vFmt.optInt("height", 1080))
@@ -453,6 +460,7 @@ internal class YoutubePowerExtractor(
                     }
 
                     val videoStreams = root.optJSONArray("videoStreams") ?: JSONArray()
+                    val pipedMp4 = mutableListOf<JSONObject>()
                     for (i in 0 until videoStreams.length()) {
                         val v = videoStreams.optJSONObject(i) ?: continue
                         val vUrl = v.optString("url")
@@ -460,6 +468,15 @@ internal class YoutubePowerExtractor(
                         val videoOnly = v.optBoolean("videoOnly", false)
                         if (!vUrl.startsWith("http") || !mime.contains("mp4")) continue
                         if (videoOnly && bestAudioUrl == null) continue
+                        pipedMp4.add(v)
+                    }
+                    val pipedH264 = pipedMp4.filter {
+                        val c = (it.optString("codec") + " " + it.optString("mimeType")).lowercase()
+                        !c.contains("av01") && !c.contains("vp9")
+                    }
+                    (pipedH264.ifEmpty { pipedMp4 }).forEach { v ->
+                        val vUrl = v.optString("url")
+                        val videoOnly = v.optBoolean("videoOnly", false)
                         val h = computeQualityTier(v.optInt("width", 0), v.optInt("height", 720))
                         out.add(
                             ExtractedStream(
@@ -531,11 +548,20 @@ internal class YoutubePowerExtractor(
                             bestAudioUrl = aUrl
                         }
                     }
+                    val invAdaptive = mutableListOf<JSONObject>()
                     for (i in 0 until adaptive.length()) {
                         val v = adaptive.optJSONObject(i) ?: continue
                         val type = v.optString("type").lowercase()
                         val vUrl = v.optString("url")
                         if (!vUrl.startsWith("http") || !type.startsWith("video/mp4") || bestAudioUrl == null) continue
+                        invAdaptive.add(v)
+                    }
+                    val invH264 = invAdaptive.filter {
+                        val t = it.optString("type").lowercase()
+                        !t.contains("av01") && !t.contains("vp9")
+                    }
+                    (invH264.ifEmpty { invAdaptive }).forEach { v ->
+                        val vUrl = v.optString("url")
                         val h = Regex("""(\d+)p""").find(v.optString("qualityLabel"))?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 720
                         out.add(
                             ExtractedStream(

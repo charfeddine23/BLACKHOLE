@@ -100,7 +100,10 @@ class WebViewStreamSniffer(
                             val lower = reqUrl.lowercase()
                             val cleaned = stripRangeQueryParams(reqUrl)
                             if (lower.contains("mime=audio") ||
+                                lower.contains("mime_type=audio") ||
                                 lower.contains("audio_mp4") ||
+                                lower.substringBefore("?").endsWith(".m4a") ||
+                                lower.substringBefore("?").endsWith(".aac") ||
                                 MetaVideoPowerExtractor.isMetaAudioOnlyUrl(cleaned)
                             ) {
                                 capturedAudios.add(cleaned)
@@ -148,14 +151,31 @@ class WebViewStreamSniffer(
                                   });
                                 }
                                 var scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
-                                var urlRegex = /"((?:browser_native_hd_url|playable_url_quality_hd|hd_src|video_url|playable_url|contentUrl))":"(https?:\\\/\\\/[^"]+)"/g;
-                                for (var i = 0; i < Math.min(scripts.length, 40); i++) {
-                                  var txt = scripts[i].textContent || '';
-                                  if (txt.length > 0 && txt.length < 350000) {
+                                var urlRegex = /"((?:browser_native_hd_url|playable_url_quality_hd|hd_src|video_url|playable_url|contentUrl|audio_url))"\s*:\s*"(https?:[^"]+)"/g;
+                                var baseUrlRegex = /<BaseURL[^>]*>\s*(https?:\/\/[^<\s]+)\s*<\/BaseURL>/gi;
+                                for (var i = 0; i < Math.min(scripts.length, 48); i++) {
+                                  var rawTxt = scripts[i].textContent || '';
+                                  if (rawTxt.length > 0 && rawTxt.length < 450000) {
+                                    var txt = rawTxt
+                                      .replace(/\\\//g, '/')
+                                      .replace(/\\u0026/gi, '&')
+                                      .replace(/\\u002f/gi, '/')
+                                      .replace(/\\u003c/gi, '<')
+                                      .replace(/\\u003e/gi, '>')
+                                      .replace(/&amp;/gi, '&');
                                     var match;
                                     while ((match = urlRegex.exec(txt)) !== null) {
-                                      var clean = match[2].replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-                                      if (clean.indexOf('http') === 0) out.videos.push(clean);
+                                      var key = (match[1] || '').toLowerCase();
+                                      var clean = match[2];
+                                      if (clean.indexOf('http') === 0) {
+                                        if (key === 'audio_url') out.audios.push(clean);
+                                        else out.videos.push(clean);
+                                      }
+                                    }
+                                    var bMatch;
+                                    while ((bMatch = baseUrlRegex.exec(txt)) !== null) {
+                                      var bu = bMatch[1];
+                                      if (bu && bu.indexOf('http') === 0) out.videos.push(bu);
                                     }
                                   }
                                 }
@@ -174,11 +194,11 @@ class WebViewStreamSniffer(
                                     for (i in 0 until vArr.length()) {
                                         val candidate = vArr.optString(i)
                                         if (candidate.startsWith("http") && !candidate.startsWith("blob:")) {
-                                            val cleaned = stripRangeQueryParams(candidate)
-                                            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(cleaned)) {
-                                                capturedAudios.add(cleaned)
+                                            val stripped = stripRangeQueryParams(candidate)
+                                            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(stripped)) {
+                                                capturedAudios.add(stripped)
                                             } else {
-                                                capturedVideos.add(cleaned)
+                                                capturedVideos.add(stripped)
                                             }
                                         }
                                     }
@@ -191,7 +211,7 @@ class WebViewStreamSniffer(
                                     }
                                 }
                             }
-                            view.postDelayed({ finish(loginGate = looksLikeLogin) }, 1_800L)
+                            view.postDelayed({ finish(loginGate = looksLikeLogin) }, 2_200L)
                         }
                     }
                 }
@@ -249,13 +269,17 @@ class WebViewStreamSniffer(
         // Ignore tiny Meta/YouTube DASH MSE segment pings that include explicit partial byte slices unless audio/video
         val pathOnly = lower.substringBefore("?")
         return pathOnly.endsWith(".mp4") ||
+            pathOnly.endsWith(".m4a") ||
+            pathOnly.endsWith(".aac") ||
             pathOnly.endsWith(".m3u8") ||
             pathOnly.endsWith(".webm") ||
             pathOnly.endsWith(".mov") ||
             lower.contains("mime=video") ||
             lower.contains("mime=audio") ||
             lower.contains("mime_type=video") ||
+            lower.contains("mime_type=audio") ||
             lower.contains("video_mp4") ||
+            lower.contains("audio_mp4") ||
             lower.contains("/master.m3u8") ||
             lower.contains("/playlist.m3u8")
     }

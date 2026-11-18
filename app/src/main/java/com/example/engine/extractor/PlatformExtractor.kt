@@ -513,7 +513,7 @@ class MultiPlatformExtractorRouter(
     private val cookieVault = CookieVaultManager.getInstance(appContext)
     private val okHttpClient = VideoStreamExtractor.createWithVault(cookieVault)
     private val sniffer = WebViewStreamSniffer(appContext, cookieVault)
-    private val streamExtractor = VideoStreamExtractor(okHttpClient, sniffer)
+    private val streamExtractor = VideoStreamExtractor(okHttpClient, sniffer, cookieVault)
     private val universalDownloader = UniversalDownloader(
         context = appContext,
         cookieVault = cookieVault,

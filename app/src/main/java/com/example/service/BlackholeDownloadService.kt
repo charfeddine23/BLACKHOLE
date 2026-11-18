@@ -29,6 +29,7 @@ import com.example.engine.extractor.VideoStreamExtractor
 import com.example.engine.extractor.WebViewStreamSniffer
 import com.example.engine.media.HlsSegmentDownloader
 import com.example.engine.media.LocalMediaMuxer
+import com.example.engine.media.TurboHttpDownloader
 import com.example.engine.model.ExtractedStream
 import com.example.engine.model.ExtractionResult
 import com.example.engine.model.PlatformBadge
@@ -140,8 +141,8 @@ class BlackholeDownloadService : Service() {
                 }
 
                 is ExtractionResult.Success -> {
-                    val candidatesToTry = extraction.candidates.ifEmpty { listOf(extraction.bestStream) }.take(4)
-                    val fallbackAudioUrl = candidatesToTry.firstNotNullOfOrNull { it.audioStreamUrl }
+                    val candidatesToTry = extraction.candidates.ifEmpty { listOf(extraction.bestStream) }.take(6)
+                    val fallbackAudioUrl = extraction.candidates.firstNotNullOfOrNull { it.audioStreamUrl }
                     var completed = false
                     for ((index, candidate) in candidatesToTry.withIndex()) {
                         val hasLaterCandidate = index < candidatesToTry.lastIndex
@@ -238,10 +239,11 @@ class BlackholeDownloadService : Service() {
             return false
         }
 
-        // Guard: If Instagram/Facebook "progressive" stream actually lacked an audio track, mux fallback audio or try next candidate
-        if (!stream.isHls &&
-            stream.audioStreamUrl.isNullOrBlank() &&
-            (stream.platform == PlatformBadge.INSTAGRAM || stream.platform == PlatformBadge.FACEBOOK) &&
+        // Guard: If progressive/HLS stream unexpectedly lacked an audio track, mux fallback audio or try next candidate
+        if (stream.audioStreamUrl.isNullOrBlank() &&
+            (stream.platform == PlatformBadge.INSTAGRAM ||
+                stream.platform == PlatformBadge.FACEBOOK ||
+                stream.platform == PlatformBadge.YOUTUBE) &&
             !LocalMediaMuxer.hasAudioTrack(localFile)
         ) {
             var recoveredAudio = false
@@ -352,6 +354,7 @@ class BlackholeDownloadService : Service() {
                     lastNotificationTick = now
                 }
             },
+            audioPlaylistUrl = stream.audioStreamUrl,
         )
     }
 
@@ -520,40 +523,20 @@ class BlackholeDownloadService : Service() {
         }
     }
 
-    private fun streamToFile(
+    private suspend fun streamToFile(
         url: String,
         headers: Map<String, String>,
         destination: File,
         onBytes: (downloaded: Long, contentLength: Long) -> Unit,
     ): Boolean {
-        val requestBuilder = Request.Builder().url(url)
-        headers.forEach { (k, v) -> requestBuilder.header(k, v) }
-
-        return okHttpClient.newCall(requestBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful) return@use false
-            val body = response.body ?: return@use false
-            val totalBytes = body.contentLength()
-            var bytesDownloaded = 0L
-
-            body.byteStream().use { input ->
-                FileOutputStream(destination).use { output ->
-                    val buffer = ByteArray(16 * 1024)
-                    while (true) {
-                        if (DownloadStateCoordinator.cancelRequested) {
-                            destination.delete()
-                            throw CancellationException("User cancelled pull")
-                        }
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        output.write(buffer, 0, read)
-                        bytesDownloaded += read
-                        onBytes(bytesDownloaded, totalBytes)
-                    }
-                    output.flush()
-                }
-            }
-            bytesDownloaded > 0L
-        }
+        return TurboHttpDownloader.downloadToFile(
+            client = okHttpClient,
+            url = url,
+            headers = headers,
+            destination = destination,
+            isCancelled = { DownloadStateCoordinator.cancelRequested },
+            onBytes = onBytes,
+        )
     }
 
     private fun buildNotificationTelemetryLine(

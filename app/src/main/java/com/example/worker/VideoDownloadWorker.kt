@@ -35,6 +35,7 @@ import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.extractor.VideoStreamExtractor
 import com.example.engine.media.HlsSegmentDownloader
 import com.example.engine.media.LocalMediaMuxer
+import com.example.engine.media.TurboHttpDownloader
 import com.example.engine.model.DownloadStatus
 import com.example.engine.model.DownloadTaskState
 import com.example.engine.model.ExtractedMediaInfo
@@ -141,7 +142,7 @@ class VideoDownloadWorker(
 
         try {
             val ok = when {
-                isHls -> downloadHls(videoUrl, title, qualityLabel, headers, localOutputFile)
+                isHls -> downloadHls(videoUrl, audioUrl, title, qualityLabel, headers, localOutputFile)
                 !audioUrl.isNullOrBlank() -> downloadAndMuxSplit(
                     videoUrl = videoUrl,
                     audioUrl = audioUrl,
@@ -239,6 +240,7 @@ class VideoDownloadWorker(
 
     private suspend fun downloadHls(
         playlistUrl: String,
+        audioPlaylistUrl: String?,
         title: String,
         qualityLabel: String,
         headers: Map<String, String>,
@@ -268,6 +270,7 @@ class VideoDownloadWorker(
                     updateNotification(title, "$qualityLabel · $pctInt% · ${formatSpeed(speed)}", pctInt, total <= 0L)
                 }
             },
+            audioPlaylistUrl = audioPlaylistUrl,
         )
     }
 
@@ -341,8 +344,11 @@ class VideoDownloadWorker(
             if (!vOk || isStopped) return@coroutineScope false
 
             if (!aOk || !audioTemp.exists() || audioTemp.length() <= 0L) {
-                videoTemp.copyTo(outputFile, overwrite = true)
-                return@coroutineScope true
+                if (LocalMediaMuxer.hasAudioTrack(videoTemp)) {
+                    videoTemp.copyTo(outputFile, overwrite = true)
+                    return@coroutineScope true
+                }
+                return@coroutineScope false
             }
 
             DownloadProgressManager.updateTask(taskId) {
@@ -356,7 +362,11 @@ class VideoDownloadWorker(
 
             val muxed = LocalMediaMuxer.mergeVideoAndAudio(videoTemp, audioTemp, outputFile)
             if (!muxed) {
-                videoTemp.copyTo(outputFile, overwrite = true)
+                if (LocalMediaMuxer.hasAudioTrack(videoTemp)) {
+                    videoTemp.copyTo(outputFile, overwrite = true)
+                    return@coroutineScope true
+                }
+                return@coroutineScope false
             }
             outputFile.exists() && outputFile.length() > 0L
         } finally {
@@ -365,7 +375,7 @@ class VideoDownloadWorker(
         }
     }
 
-    private fun downloadProgressive(
+    private suspend fun downloadProgressive(
         videoUrl: String,
         title: String,
         qualityLabel: String,
@@ -405,40 +415,20 @@ class VideoDownloadWorker(
         }
     }
 
-    private fun streamUrlToFile(
+    private suspend fun streamUrlToFile(
         url: String,
         headers: Map<String, String>,
         destination: File,
         onBytes: (downloaded: Long, totalBytes: Long) -> Unit,
     ): Boolean {
-        val reqBuilder = Request.Builder().url(url)
-        headers.forEach { (k, v) -> reqBuilder.header(k, v) }
-
-        return okHttpClient.newCall(reqBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful) return@use false
-            val body = response.body ?: return@use false
-            val total = body.contentLength()
-            var downloaded = 0L
-
-            body.byteStream().use { input ->
-                FileOutputStream(destination).use { output ->
-                    val buffer = ByteArray(16 * 1024)
-                    while (true) {
-                        if (isStopped) {
-                            destination.delete()
-                            throw CancellationException("Worker cancelled")
-                        }
-                        val count = input.read(buffer)
-                        if (count == -1) break
-                        output.write(buffer, 0, count)
-                        downloaded += count
-                        onBytes(downloaded, total)
-                    }
-                    output.flush()
-                }
-            }
-            downloaded > 0L
-        }
+        return TurboHttpDownloader.downloadToFile(
+            client = okHttpClient,
+            url = url,
+            headers = headers,
+            destination = destination,
+            isCancelled = { isStopped },
+            onBytes = onBytes,
+        )
     }
 
     /**

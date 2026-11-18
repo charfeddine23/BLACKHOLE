@@ -7,7 +7,9 @@ import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.CookieJar
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -130,7 +132,8 @@ class VideoStreamExtractor(
                                 capturedUrl.contains("mime=video") ||
                                     platform == PlatformBadge.YOUTUBE ||
                                     MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(capturedUrl) ||
-                                    (platform == PlatformBadge.INSTAGRAM && !MetaVideoPowerExtractor.isMetaProgressiveUrl(capturedUrl))
+                                    ((platform == PlatformBadge.INSTAGRAM || platform == PlatformBadge.FACEBOOK) &&
+                                        !MetaVideoPowerExtractor.isMetaProgressiveUrl(capturedUrl))
                                 )
                             sniffedStreams.add(
                                 direct.copy(
@@ -146,7 +149,8 @@ class VideoStreamExtractor(
                                 capturedUrl.contains("mime=video") ||
                                     platform == PlatformBadge.YOUTUBE ||
                                     MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(capturedUrl) ||
-                                    (platform == PlatformBadge.INSTAGRAM && !MetaVideoPowerExtractor.isMetaProgressiveUrl(capturedUrl))
+                                    ((platform == PlatformBadge.INSTAGRAM || platform == PlatformBadge.FACEBOOK) &&
+                                        !MetaVideoPowerExtractor.isMetaProgressiveUrl(capturedUrl))
                                 )
                             sniffedStreams.add(
                                 ExtractedStream(
@@ -204,7 +208,11 @@ class VideoStreamExtractor(
             .distinctBy { it.streamUrl }
             .sortedWith(
                 compareByDescending<ExtractedStream> {
-                    !it.audioStreamUrl.isNullOrBlank() || !MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(it.streamUrl)
+                    when {
+                        !it.audioStreamUrl.isNullOrBlank() || MetaVideoPowerExtractor.isMetaProgressiveUrl(it.streamUrl) -> 2
+                        !MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(it.streamUrl) -> 1
+                        else -> 0
+                    }
                 }
                     .thenByDescending { !it.isHls }
                     .thenByDescending { it.resolutionHeight }
@@ -324,15 +332,48 @@ class VideoStreamExtractor(
         if (body.contains("#EXT-X-STREAM-INF")) {
             val baseUri = runCatching { URI(playlistUrl) }.getOrNull() ?: return null
             val lines = body.lines()
+
+            // Parse demuxed #EXT-X-MEDIA:TYPE=AUDIO tracks so split HLS streams keep audio
+            val audioGroupMap = linkedMapOf<String, String>()
+            var defaultAudioUri: String? = null
+            for (rawLine in lines) {
+                val line = rawLine.trim()
+                if (line.startsWith("#EXT-X-MEDIA:", ignoreCase = true) &&
+                    Regex("""TYPE=AUDIO""", RegexOption.IGNORE_CASE).containsMatchIn(line)
+                ) {
+                    val uriAttr = Regex("""URI=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        .find(line)?.groupValues?.getOrNull(1)
+                    if (!uriAttr.isNullOrBlank()) {
+                        val resolvedAudio = runCatching { baseUri.resolve(uriAttr).toString() }.getOrNull()
+                        if (!resolvedAudio.isNullOrBlank()) {
+                            val groupId = Regex("""GROUP-ID=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                                .find(line)?.groupValues?.getOrNull(1)
+                            if (!groupId.isNullOrBlank() && !audioGroupMap.containsKey(groupId)) {
+                                audioGroupMap[groupId] = resolvedAudio
+                            }
+                            if (defaultAudioUri == null ||
+                                line.contains("DEFAULT=YES", ignoreCase = true) ||
+                                line.contains("AUTOSELECT=YES", ignoreCase = true)
+                            ) {
+                                defaultAudioUri = resolvedAudio
+                            }
+                        }
+                    }
+                }
+            }
+
             var bestHeight = 0
             var bestBandwidth = 0L
             var bestVariantUrl: String? = null
+            var bestVariantAudioUrl: String? = null
 
             for (i in lines.indices) {
                 val line = lines[i].trim()
                 if (line.startsWith("#EXT-X-STREAM-INF:")) {
                     val resMatch = Regex("""RESOLUTION=\d+x(\d+)""").find(line)
                     val bwMatch = Regex("""BANDWIDTH=(\d+)""").find(line)
+                    val audioGroup = Regex("""AUDIO=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        .find(line)?.groupValues?.getOrNull(1)
                     val height = resMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 720
                     val bandwidth = bwMatch?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
                     val nextUrl = lines.drop(i + 1)
@@ -343,6 +384,7 @@ class VideoStreamExtractor(
                             bestHeight = height
                             bestBandwidth = bandwidth
                             bestVariantUrl = baseUri.resolve(nextUrl).toString()
+                            bestVariantAudioUrl = audioGroup?.let { audioGroupMap[it] } ?: defaultAudioUri
                         }
                     }
                 }
@@ -358,6 +400,7 @@ class VideoStreamExtractor(
                     mimeType = "video/mp4",
                     estimatedBytes = -1L,
                     headers = headers,
+                    audioStreamUrl = bestVariantAudioUrl,
                     isHls = true,
                 )
             }
@@ -1008,6 +1051,7 @@ class VideoStreamExtractor(
         val pageTitle = extractPageTitle(html) ?: deriveTitleFromUrl(finalPageUrl)
         val unescapedHtml = unescapeMarkup(html)
         val candidates = mutableListOf<ExtractedStream>()
+        val audioPool = mutableListOf<String>()
         val streamHeaders = headers + ("Referer" to finalPageUrl)
 
         val metaPatterns = listOf(
@@ -1020,7 +1064,7 @@ class VideoStreamExtractor(
         metaPatterns.forEach { regex ->
             regex.findAll(unescapedHtml).forEach { match ->
                 val found = resolveRelativeUrl(finalPageUrl, match.groupValues[1])
-                addCandidateIfMedia(found, pageTitle, platform, streamHeaders, candidates)
+                addCandidateIfMedia(found, pageTitle, platform, streamHeaders, candidates, audioPool)
             }
         }
 
@@ -1031,25 +1075,48 @@ class VideoStreamExtractor(
         videoTagPatterns.forEach { regex ->
             regex.findAll(unescapedHtml).forEach { match ->
                 val found = resolveRelativeUrl(finalPageUrl, match.groupValues[1])
-                addCandidateIfMedia(found, pageTitle, platform, streamHeaders, candidates)
+                addCandidateIfMedia(found, pageTitle, platform, streamHeaders, candidates, audioPool)
             }
         }
 
+        Regex(""""audio_url"\s*:\s*"(https?://[^"]+)"""", RegexOption.IGNORE_CASE)
+            .findAll(unescapedHtml)
+            .forEach { m -> audioPool.add(m.groupValues[1]) }
+
+        Regex("""<BaseURL[^>]*>\s*(https?://[^<\s]+)\s*</BaseURL>""", RegexOption.IGNORE_CASE)
+            .findAll(unescapedHtml)
+            .forEach { m ->
+                addCandidateIfMedia(m.groupValues[1], pageTitle, platform, streamHeaders, candidates, audioPool)
+            }
+
         val jsonStreamPatterns = listOf(
-            Regex(""""(?:contentUrl|browser_native_hd_url|playable_url_quality_hd|hd_src_no_ratelimit|hd_src|browser_native_sd_url|playable_url|sd_src|playAddr|downloadAddr|video_url|playbackUrl|hlsUrl|mp4Url|url)"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8|webm|mov|m4v)[^"]*)"""", RegexOption.IGNORE_CASE),
-            Regex("""(https?://[^\s"'<>\\]+\.(?:mp4|m3u8|webm|mov|m4v)(?:\?[^\s"'<>\\]*)?)""", RegexOption.IGNORE_CASE),
+            Regex(""""(?:contentUrl|browser_native_hd_url|playable_url_quality_hd|hd_src_no_ratelimit|hd_src|browser_native_sd_url|playable_url|sd_src|playAddr|downloadAddr|video_url|playbackUrl|hlsUrl|mp4Url|url)"\s*:\s*"(https?://[^"]+\.(?:mp4|m4a|aac|m3u8|webm|mov|m4v)[^"]*)"""", RegexOption.IGNORE_CASE),
+            Regex("""(https?://[^\s"'<>\\]+\.(?:mp4|m4a|aac|m3u8|webm|mov|m4v)(?:\?[^\s"'<>\\]*)?)""", RegexOption.IGNORE_CASE),
         )
         jsonStreamPatterns.forEach { regex ->
             regex.findAll(unescapedHtml).forEach { match ->
-                addCandidateIfMedia(match.groupValues[1], pageTitle, platform, streamHeaders, candidates)
+                addCandidateIfMedia(match.groupValues[1], pageTitle, platform, streamHeaders, candidates, audioPool)
             }
+        }
+
+        val fallbackAudio = audioPool.firstOrNull()
+        val enriched = if (fallbackAudio != null) {
+            candidates.map { cand ->
+                if (!cand.isHls && cand.audioStreamUrl == null && !MetaVideoPowerExtractor.isMetaProgressiveUrl(cand.streamUrl)) {
+                    cand.copy(audioStreamUrl = fallbackAudio)
+                } else {
+                    cand
+                }
+            }
+        } else {
+            candidates
         }
 
         val looksGated = finalPageUrl.lowercase().contains("/login") ||
             html.contains("login_required", ignoreCase = true)
         return HtmlProbeOutcome(
-            streams = candidates.distinctBy { it.streamUrl },
-            authChallenge = authChallenge || (looksGated && candidates.isEmpty()),
+            streams = enriched.distinctBy { it.streamUrl },
+            authChallenge = authChallenge || (looksGated && enriched.isEmpty()),
         )
     }
 
@@ -1059,8 +1126,17 @@ class VideoStreamExtractor(
         platform: PlatformBadge,
         headers: Map<String, String>,
         out: MutableList<ExtractedStream>,
+        audioPool: MutableList<String>? = null,
     ) {
-        if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(url)) return
+        val lower = url.lowercase()
+        val pathOnly = lower.substringBefore("?")
+        if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(url) ||
+            pathOnly.endsWith(".m4a") ||
+            pathOnly.endsWith(".aac")
+        ) {
+            audioPool?.add(url)
+            return
+        }
         val isHls = looksLikeHlsUrl(url)
         if (!isHls && !looksLikeDownloadableVideoUrl(url)) return
         val height = inferResolutionHeight(url)
@@ -1113,15 +1189,19 @@ class VideoStreamExtractor(
         return input
             .replace("\\\\/", "/")
             .replace("\\/", "/")
-            .replace("\\\\u0026", "&")
-            .replace("\\u0026", "&")
-            .replace("\\\\u002F", "/")
-            .replace("\\u002F", "/")
-            .replace("\\u003C", "<")
-            .replace("\\u003E", ">")
+            .replace("\\\\u0026", "&", ignoreCase = true)
+            .replace("\\u0026", "&", ignoreCase = true)
+            .replace("\\\\u002f", "/", ignoreCase = true)
+            .replace("\\u002f", "/", ignoreCase = true)
+            .replace("\\\\u003c", "<", ignoreCase = true)
+            .replace("\\u003c", "<", ignoreCase = true)
+            .replace("\\\\u003e", ">", ignoreCase = true)
+            .replace("\\u003e", ">", ignoreCase = true)
             .replace("\\\"", "\"")
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+            .replace("&amp;", "&", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
     }
 
     private fun resolveRelativeUrl(baseUrl: String, candidate: String): String {
@@ -1192,11 +1272,18 @@ class VideoStreamExtractor(
 
     companion object {
         fun defaultOkHttpClient(cookieJar: CookieJar = CookieJar.NO_COOKIES): OkHttpClient {
+            val dispatcher = Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 24
+            }
             return OkHttpClient.Builder()
+                .dispatcher(dispatcher)
+                .connectionPool(ConnectionPool(24, 5, TimeUnit.MINUTES))
                 .cookieJar(cookieJar)
                 .followRedirects(true)
                 .followSslRedirects(true)
-                .connectTimeout(20, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(45, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
                 .build()
