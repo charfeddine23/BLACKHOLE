@@ -98,15 +98,19 @@ class WebViewStreamSniffer(
                         val reqUrl = request?.url?.toString().orEmpty()
                         if (isCandidateMediaNetworkUrl(reqUrl)) {
                             val lower = reqUrl.lowercase()
-                            // Never capture chunked MSE bytestart segments as-is without stripping range params
                             val cleaned = stripRangeQueryParams(reqUrl)
-                            if (lower.contains("mime=audio") || lower.contains("audio_mp4")) {
+                            if (lower.contains("mime=audio") ||
+                                lower.contains("audio_mp4") ||
+                                MetaVideoPowerExtractor.isMetaAudioOnlyUrl(cleaned)
+                            ) {
                                 capturedAudios.add(cleaned)
                             } else {
                                 capturedVideos.add(cleaned)
                             }
                             if (cleaned.contains(".m3u8", ignoreCase = true) ||
-                                (!lower.contains("fbcdn.net") && cleaned.contains(".mp4", ignoreCase = true))
+                                (!lower.contains("fbcdn.net") &&
+                                    !lower.contains("cdninstagram.com") &&
+                                    cleaned.contains(".mp4", ignoreCase = true))
                             ) {
                                 view?.postDelayed({ finish(loginGate = false) }, 2_000L)
                             }
@@ -170,7 +174,12 @@ class WebViewStreamSniffer(
                                     for (i in 0 until vArr.length()) {
                                         val candidate = vArr.optString(i)
                                         if (candidate.startsWith("http") && !candidate.startsWith("blob:")) {
-                                            capturedVideos.add(stripRangeQueryParams(candidate))
+                                            val cleaned = stripRangeQueryParams(candidate)
+                                            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(cleaned)) {
+                                                capturedAudios.add(cleaned)
+                                            } else {
+                                                capturedVideos.add(cleaned)
+                                            }
                                         }
                                     }
                                     val aArr = obj.optJSONArray("audios") ?: JSONArray()

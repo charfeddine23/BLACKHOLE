@@ -125,9 +125,13 @@ class VideoStreamExtractor(
                         val direct = probeDirectMediaOrHls(capturedUrl, platform, defaultHeaders)
                         if (direct != null) {
                             if (direct.estimatedBytes in 1L..16_383L) continue
-                            val needsAudio = fallbackAudio != null &&
-                                (capturedUrl.contains("mime=video") || platform == PlatformBadge.YOUTUBE) &&
-                                !direct.isHls
+                            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(capturedUrl)) continue
+                            val needsAudio = fallbackAudio != null && !direct.isHls && (
+                                capturedUrl.contains("mime=video") ||
+                                    platform == PlatformBadge.YOUTUBE ||
+                                    MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(capturedUrl) ||
+                                    (platform == PlatformBadge.INSTAGRAM && !MetaVideoPowerExtractor.isMetaProgressiveUrl(capturedUrl))
+                                )
                             sniffedStreams.add(
                                 direct.copy(
                                     title = sniffed.pageTitle?.takeIf { it.isNotBlank() } ?: direct.title,
@@ -135,10 +139,15 @@ class VideoStreamExtractor(
                                 ),
                             )
                         } else if (looksLikeHlsUrl(capturedUrl) || looksLikeDownloadableVideoUrl(capturedUrl)) {
+                            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(capturedUrl)) continue
                             val isHls = looksLikeHlsUrl(capturedUrl)
                             val height = inferResolutionHeight(capturedUrl)
-                            val needsAudio = !isHls && fallbackAudio != null &&
-                                (capturedUrl.contains("mime=video") || platform == PlatformBadge.YOUTUBE)
+                            val needsAudio = !isHls && fallbackAudio != null && (
+                                capturedUrl.contains("mime=video") ||
+                                    platform == PlatformBadge.YOUTUBE ||
+                                    MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(capturedUrl) ||
+                                    (platform == PlatformBadge.INSTAGRAM && !MetaVideoPowerExtractor.isMetaProgressiveUrl(capturedUrl))
+                                )
                             sniffedStreams.add(
                                 ExtractedStream(
                                     streamUrl = capturedUrl,
@@ -191,9 +200,13 @@ class VideoStreamExtractor(
 
     private fun rankBestStreams(streams: List<ExtractedStream>): List<ExtractedStream> {
         return streams
+            .filterNot { MetaVideoPowerExtractor.isMetaAudioOnlyUrl(it.streamUrl) }
             .distinctBy { it.streamUrl }
             .sortedWith(
-                compareByDescending<ExtractedStream> { !it.isHls }
+                compareByDescending<ExtractedStream> {
+                    !it.audioStreamUrl.isNullOrBlank() || !MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(it.streamUrl)
+                }
+                    .thenByDescending { !it.isHls }
                     .thenByDescending { it.resolutionHeight }
                     .thenByDescending { it.bitrateBps }
                     .thenByDescending { it.estimatedBytes },
@@ -1047,6 +1060,7 @@ class VideoStreamExtractor(
         headers: Map<String, String>,
         out: MutableList<ExtractedStream>,
     ) {
+        if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(url)) return
         val isHls = looksLikeHlsUrl(url)
         if (!isHls && !looksLikeDownloadableVideoUrl(url)) return
         val height = inferResolutionHeight(url)

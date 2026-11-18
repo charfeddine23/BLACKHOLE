@@ -218,7 +218,7 @@ fun DownloadedVideosSwipeUpSheet(
                             },
                         )
                     }
-                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                    .padding(horizontal = 18.dp, vertical = if (showBrowserTab) 6.dp else 10.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Box(
@@ -228,7 +228,7 @@ fun DownloadedVideosSwipeUpSheet(
                         .clip(CircleShape)
                         .background(GlassStrokeBright.copy(alpha = 0.45f)),
                 )
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(if (showBrowserTab) 6.dp else 12.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -236,23 +236,21 @@ fun DownloadedVideosSwipeUpSheet(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "DOWNLOADED VIDEOS",
-                            style = MaterialTheme.typography.titleLarge,
+                            text = if (showBrowserTab) "IN-APP BROWSER" else "DOWNLOADED VIDEOS",
+                            style = if (showBrowserTab) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
                             color = ChromeSilver,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        Text(
-                            text = if (showBrowserTab) {
-                                "IN-APP BROWSER · AUTO COOKIE CAPTURE"
-                            } else {
-                                "${videos.size} LOCAL VAULT ${if (videos.size == 1) "CAPTURE" else "CAPTURES"}"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (showBrowserTab) NeonCyan else MutedSlate,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        if (!showBrowserTab) {
+                            Text(
+                                text = "${videos.size} LOCAL VAULT ${if (videos.size == 1) "CAPTURE" else "CAPTURES"}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MutedSlate,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Surface(

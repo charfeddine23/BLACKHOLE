@@ -1,5 +1,6 @@
 package com.example.engine.extractor
 
+import android.util.Base64
 import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.ExtractedStream
 import com.example.engine.model.PlatformBadge
@@ -14,6 +15,7 @@ import java.math.BigInteger
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 internal data class MetaExtractionOutcome(
     val streams: List<ExtractedStream>,
@@ -95,7 +97,7 @@ internal class MetaVideoPowerExtractor(
                         )
                     }
                 }
-                if (found.any { it.resolutionHeight >= 1080 }) break
+                if (found.any { it.resolutionHeight >= 1080 && hasUsableAudio(it) }) break
             }
         }
 
@@ -204,7 +206,7 @@ internal class MetaVideoPowerExtractor(
                         )
                     }
                 }
-                if (found.any { it.resolutionHeight >= 1080 }) break
+                if (found.any { it.resolutionHeight >= 1080 && hasUsableAudio(it) }) break
             }
         }
 
@@ -231,12 +233,14 @@ internal class MetaVideoPowerExtractor(
         )
         val unescaped = unescapeMetaMarkup(rawBody)
         val title = extractHtmlTitle(unescaped) ?: fallbackTitle
+        val localCandidates = mutableListOf<ExtractedStream>()
+        val audioPool = mutableListOf<String>()
 
         // 1. Parse JSON directly if payload is structured API/GraphQL response
         if (rawBody.trimStart().startsWith("{")) {
             runCatching {
                 val root = JSONObject(rawBody)
-                extractInstagramFromJsonTree(root, title, streamHeaders, out)
+                extractInstagramFromJsonTree(root, title, streamHeaders, localCandidates, audioPool)
             }
         }
 
@@ -251,7 +255,7 @@ internal class MetaVideoPowerExtractor(
             ) {
                 runCatching {
                     val obj = JSONObject(blob)
-                    extractInstagramFromJsonTree(obj, title, streamHeaders, out)
+                    extractInstagramFromJsonTree(obj, title, streamHeaders, localCandidates, audioPool)
                 }
             }
         }
@@ -271,10 +275,14 @@ internal class MetaVideoPowerExtractor(
                         val item = arr.optJSONObject(i) ?: continue
                         val vUrl = sanitizeCdnUrl(item.optString("url"))
                         if (vUrl.startsWith("http")) {
+                            if (isMetaAudioOnlyUrl(vUrl)) {
+                                audioPool.add(vUrl)
+                                continue
+                            }
                             val w = item.optInt("width", 0)
                             val h = item.optInt("height", 0)
                             val tier = computeShortSideTier(w, h, fallback = 1080)
-                            out.add(
+                            localCandidates.add(
                                 ExtractedStream(
                                     streamUrl = vUrl,
                                     title = title,
@@ -294,9 +302,9 @@ internal class MetaVideoPowerExtractor(
             searchFrom = idx + 16
         }
 
-        // 4. Direct fields (video_url, playable_url_quality_hd, playable_url, contentUrl)
+        // 4. Direct fields (video_url, playable_url_quality_hd, playable_url, contentUrl, audio_url)
         val directRegex = Regex(
-            """"(video_url|playable_url_quality_hd|playable_url|contentUrl)"\s*:\s*"(https?://[^"]+)"""",
+            """"(video_url|playable_url_quality_hd|playable_url|contentUrl|audio_url)"\s*:\s*"(https?://[^"]+)"""",
             RegexOption.IGNORE_CASE,
         )
         directRegex.findAll(unescaped).forEach { match ->
@@ -307,8 +315,12 @@ internal class MetaVideoPowerExtractor(
                     mediaUrl.contains("cdninstagram", ignoreCase = true) ||
                     mediaUrl.contains("fbcdn.net", ignoreCase = true))
             ) {
+                if (key == "audio_url" || isMetaAudioOnlyUrl(mediaUrl)) {
+                    audioPool.add(mediaUrl)
+                    return@forEach
+                }
                 val tier = if (key.contains("hd") || key == "video_url") 1080 else 720
-                out.add(
+                localCandidates.add(
                     ExtractedStream(
                         streamUrl = mediaUrl,
                         title = title,
@@ -318,17 +330,33 @@ internal class MetaVideoPowerExtractor(
                         mimeType = "video/mp4",
                         estimatedBytes = -1L,
                         headers = streamHeaders,
-                        bitrateBps = if (tier >= 1080) 3_000_000L else 1_200_000L,
+                        bitrateBps = if (key.contains("hd") || key == "video_url") 3_000_000L else 1_200_000L,
                     ),
                 )
             }
         }
 
         // 5. DASH XML MPD inside HTML/JSON
-        extractScopedMpdStreams(unescaped, title, PlatformBadge.INSTAGRAM, streamHeaders, out)
+        extractScopedMpdStreams(unescaped, title, PlatformBadge.INSTAGRAM, streamHeaders, localCandidates, audioPool)
 
         // 6. og:video / <video> tags inside embed HTML
-        extractOgAndVideoTags(unescaped, baseUrl, title, PlatformBadge.INSTAGRAM, streamHeaders, out)
+        extractOgAndVideoTags(unescaped, baseUrl, title, PlatformBadge.INSTAGRAM, streamHeaders, localCandidates)
+
+        // Pair pooled audio to any DASH video-only Instagram candidate missing audioStreamUrl
+        val pooledAudio = audioPool.firstOrNull()
+        localCandidates.forEach { candidate ->
+            if (candidate.audioStreamUrl == null &&
+                pooledAudio != null &&
+                !isMetaProgressiveUrl(candidate.streamUrl) &&
+                (isMetaVideoOnlyDashUrl(candidate.streamUrl) || candidate.platform == PlatformBadge.INSTAGRAM)
+            ) {
+                // Only attach if candidate is known DASH video-only OR there are no confirmed progressive versions
+                val shouldPair = isMetaVideoOnlyDashUrl(candidate.streamUrl)
+                out.add(if (shouldPair) candidate.copy(audioStreamUrl = pooledAudio) else candidate)
+            } else {
+                out.add(candidate)
+            }
+        }
     }
 
     private fun extractInstagramFromJsonTree(
@@ -336,30 +364,41 @@ internal class MetaVideoPowerExtractor(
         title: String,
         headers: Map<String, String>,
         out: MutableList<ExtractedStream>,
+        audioPool: MutableList<String>,
         depth: Int = 0,
     ) {
         if (node == null || depth > 14) return
         when (node) {
             is JSONObject -> {
+                val audioUrlField = sanitizeCdnUrl(node.optString("audio_url"))
+                if (audioUrlField.startsWith("http")) {
+                    audioPool.add(audioUrlField)
+                }
+
                 val videoUrl = node.optString("video_url")
                 if (videoUrl.startsWith("http")) {
-                    val dims = node.optJSONObject("dimensions")
-                    val w = dims?.optInt("width", 0) ?: node.optInt("original_width", 0)
-                    val h = dims?.optInt("height", 0) ?: node.optInt("original_height", 0)
-                    val tier = computeShortSideTier(w, h, fallback = 1080)
-                    out.add(
-                        ExtractedStream(
-                            streamUrl = sanitizeCdnUrl(videoUrl),
-                            title = title,
-                            platform = PlatformBadge.INSTAGRAM,
-                            qualityLabel = formatQualityLabel(tier),
-                            resolutionHeight = tier,
-                            mimeType = "video/mp4",
-                            estimatedBytes = -1L,
-                            headers = headers,
-                            bitrateBps = 3_200_000L,
-                        ),
-                    )
+                    val cleanV = sanitizeCdnUrl(videoUrl)
+                    if (isMetaAudioOnlyUrl(cleanV)) {
+                        audioPool.add(cleanV)
+                    } else {
+                        val dims = node.optJSONObject("dimensions")
+                        val w = dims?.optInt("width", 0) ?: node.optInt("original_width", 0)
+                        val h = dims?.optInt("height", 0) ?: node.optInt("original_height", 0)
+                        val tier = computeShortSideTier(w, h, fallback = 1080)
+                        out.add(
+                            ExtractedStream(
+                                streamUrl = cleanV,
+                                title = title,
+                                platform = PlatformBadge.INSTAGRAM,
+                                qualityLabel = formatQualityLabel(tier),
+                                resolutionHeight = tier,
+                                mimeType = "video/mp4",
+                                estimatedBytes = -1L,
+                                headers = headers,
+                                bitrateBps = 3_200_000L,
+                            ),
+                        )
+                    }
                 }
 
                 val versions = node.optJSONArray("video_versions")
@@ -368,6 +407,10 @@ internal class MetaVideoPowerExtractor(
                         val v = versions.optJSONObject(i) ?: continue
                         val u = sanitizeCdnUrl(v.optString("url"))
                         if (u.startsWith("http")) {
+                            if (isMetaAudioOnlyUrl(u)) {
+                                audioPool.add(u)
+                                continue
+                            }
                             val tier = computeShortSideTier(v.optInt("width", 0), v.optInt("height", 0), 1080)
                             out.add(
                                 ExtractedStream(
@@ -389,19 +432,26 @@ internal class MetaVideoPowerExtractor(
                 val dashXml = node.optString("video_dash_manifest")
                     .ifBlank { node.optString("dash_manifest") }
                 if (dashXml.contains("<MPD", ignoreCase = true)) {
-                    extractScopedMpdStreams(unescapeMetaMarkup(dashXml), title, PlatformBadge.INSTAGRAM, headers, out)
+                    extractScopedMpdStreams(
+                        markup = unescapeMetaMarkup(dashXml),
+                        title = title,
+                        platform = PlatformBadge.INSTAGRAM,
+                        headers = headers,
+                        out = out,
+                        audioPoolOut = audioPool,
+                    )
                 }
 
                 val keys = node.keys()
                 while (keys.hasNext()) {
                     val key = keys.next()
-                    extractInstagramFromJsonTree(node.opt(key), title, headers, out, depth + 1)
+                    extractInstagramFromJsonTree(node.opt(key), title, headers, out, audioPool, depth + 1)
                 }
             }
 
             is JSONArray -> {
                 for (i in 0 until node.length()) {
-                    extractInstagramFromJsonTree(node.opt(i), title, headers, out, depth + 1)
+                    extractInstagramFromJsonTree(node.opt(i), title, headers, out, audioPool, depth + 1)
                 }
             }
         }
@@ -618,25 +668,27 @@ internal class MetaVideoPowerExtractor(
         platform: PlatformBadge,
         headers: Map<String, String>,
         out: MutableList<ExtractedStream>,
+        audioPoolOut: MutableList<String>? = null,
     ) {
         val mpdRegex = Regex("""<MPD[\s\S]*?</MPD>""", RegexOption.IGNORE_CASE)
         mpdRegex.findAll(markup).forEach { mpdMatch ->
             val mpdXml = mpdMatch.value
             val adaptationRegex = Regex("""<AdaptationSet([\s\S]*?)</AdaptationSet>""", RegexOption.IGNORE_CASE)
             val repRegex = Regex("""<Representation([^>]*)>([\s\S]*?)</Representation>""", RegexOption.IGNORE_CASE)
-            val baseRegex = Regex("""<BaseURL[^>]*>(https?://[^<]+)</BaseURL>""", RegexOption.IGNORE_CASE)
+            val baseRegex = Regex("""<BaseURL[^>]*>\s*(https?://[^<\s]+)\s*</BaseURL>""", RegexOption.IGNORE_CASE)
 
             var bestAudioUrl: String? = null
+            var bestAudioIsAac = false
             var bestAudioBandwidth = -1L
-            val videoCandidates = mutableListOf<Triple<String, Int, Long>>()
+            // Tuple/data: (url, tier, bandwidth, isH264Compat)
+            val videoCandidates = mutableListOf<MpdVideoCandidate>()
 
             adaptationRegex.findAll(mpdXml).forEach { adaptMatch ->
                 val adaptBlock = adaptMatch.value
-                val isAudioSet = adaptBlock.contains("contentType=\"audio\"", ignoreCase = true) ||
-                    adaptBlock.contains("audio/mp4", ignoreCase = true) ||
-                    adaptBlock.contains("mp4a.", ignoreCase = true)
-                val isVideoSet = adaptBlock.contains("contentType=\"video\"", ignoreCase = true) ||
-                    adaptBlock.contains("video/mp4", ignoreCase = true)
+                val adaptHeader = adaptBlock.substringBefore(">")
+                val adaptIsAudio = Regex("""(?:contentType|mimeType)=["']audio""", RegexOption.IGNORE_CASE).containsMatchIn(adaptHeader) ||
+                    adaptHeader.contains("mp4a.", ignoreCase = true)
+                val adaptIsVideo = Regex("""(?:contentType|mimeType)=["']video""", RegexOption.IGNORE_CASE).containsMatchIn(adaptHeader)
 
                 repRegex.findAll(adaptBlock).forEach { repMatch ->
                     val attrs = repMatch.groupValues[1]
@@ -644,14 +696,31 @@ internal class MetaVideoPowerExtractor(
                     val rawBase = baseRegex.find(inner)?.groupValues?.getOrNull(1) ?: return@forEach
                     val cleanBase = sanitizeCdnUrl(rawBase)
                     if (!cleanBase.startsWith("http")) return@forEach
+
+                    val codecs = Regex("""codecs=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        .find(attrs)?.groupValues?.getOrNull(1)
+                        ?: Regex("""codecs=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                            .find(adaptHeader)?.groupValues?.getOrNull(1)
+                        ?: ""
+                    val repMime = Regex("""mimeType=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        .find(attrs)?.groupValues?.getOrNull(1).orEmpty()
                     val bandwidth = Regex("""bandwidth=["'](\d+)["']""").find(attrs)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
 
-                    if (isAudioSet || cleanBase.contains("audio", ignoreCase = true)) {
-                        if (bandwidth >= bestAudioBandwidth) {
+                    val isAudioRep = adaptIsAudio ||
+                        repMime.startsWith("audio", ignoreCase = true) ||
+                        codecs.contains("mp4a", ignoreCase = true) ||
+                        codecs.contains("opus", ignoreCase = true) ||
+                        isMetaAudioOnlyUrl(cleanBase)
+
+                    if (isAudioRep) {
+                        audioPoolOut?.add(cleanBase)
+                        val isAac = codecs.contains("mp4a", ignoreCase = true) || !codecs.contains("opus", ignoreCase = true)
+                        if (bestAudioUrl == null || (isAac && !bestAudioIsAac) || (isAac == bestAudioIsAac && bandwidth >= bestAudioBandwidth)) {
                             bestAudioBandwidth = bandwidth
+                            bestAudioIsAac = isAac
                             bestAudioUrl = cleanBase
                         }
-                    } else if (isVideoSet || attrs.contains("height=", ignoreCase = true)) {
+                    } else if (adaptIsVideo || repMime.startsWith("video", ignoreCase = true) || attrs.contains("height=", ignoreCase = true)) {
                         val width = Regex("""width=["'](\d+)["']""").find(attrs)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
                         val height = Regex("""height=["'](\d+)["']""").find(attrs)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
                         val fbQuality = Regex("""FBQualityLabel=["'](\d+)p["']""", RegexOption.IGNORE_CASE)
@@ -660,29 +729,45 @@ internal class MetaVideoPowerExtractor(
                             computeShortSideTier(width, height, fallback = 720),
                             fbQuality,
                         )
-                        videoCandidates.add(Triple(cleanBase, tier, bandwidth))
+                        val isH264 = codecs.contains("avc", ignoreCase = true) ||
+                            (codecs.isBlank() && isAvcH264MetaUrl(cleanBase)) ||
+                            (!codecs.contains("vp0", true) && !codecs.contains("vp9", true) && !codecs.contains("av01", true) && isAvcH264MetaUrl(cleanBase))
+                        videoCandidates.add(MpdVideoCandidate(cleanBase, tier, bandwidth, isH264))
                     }
                 }
             }
 
-            videoCandidates.forEach { (vUrl, tier, bandwidth) ->
-                out.add(
-                    ExtractedStream(
-                        streamUrl = vUrl,
-                        title = title,
-                        platform = platform,
-                        qualityLabel = formatQualityLabel(tier),
-                        resolutionHeight = tier,
-                        mimeType = "video/mp4",
-                        estimatedBytes = -1L,
-                        headers = headers,
-                        audioStreamUrl = bestAudioUrl,
-                        bitrateBps = bandwidth,
-                    ),
+            videoCandidates
+                .sortedWith(
+                    compareByDescending<MpdVideoCandidate> { it.isH264Compat }
+                        .thenByDescending { it.tier }
+                        .thenByDescending { it.bandwidth },
                 )
-            }
+                .forEach { cand ->
+                    out.add(
+                        ExtractedStream(
+                            streamUrl = cand.url,
+                            title = title,
+                            platform = platform,
+                            qualityLabel = formatQualityLabel(cand.tier),
+                            resolutionHeight = cand.tier,
+                            mimeType = "video/mp4",
+                            estimatedBytes = -1L,
+                            headers = headers,
+                            audioStreamUrl = bestAudioUrl,
+                            bitrateBps = cand.bandwidth,
+                        ),
+                    )
+                }
         }
     }
+
+    private data class MpdVideoCandidate(
+        val url: String,
+        val tier: Int,
+        val bandwidth: Long,
+        val isH264Compat: Boolean,
+    )
 
     private fun extractOgAndVideoTags(
         unescapedHtml: String,
@@ -737,23 +822,33 @@ internal class MetaVideoPowerExtractor(
         }
     }
 
+    private fun hasUsableAudio(stream: ExtractedStream): Boolean {
+        return !stream.audioStreamUrl.isNullOrBlank() || !isMetaVideoOnlyDashUrl(stream.streamUrl)
+    }
+
     private fun verifyAndDedupe(candidates: List<ExtractedStream>): List<ExtractedStream> {
         if (candidates.isEmpty()) return emptyList()
         val sorted = candidates
+            .filterNot { isMetaAudioOnlyUrl(it.streamUrl) }
             .distinctBy { it.streamUrl }
             .sortedWith(
-                compareByDescending<ExtractedStream> { it.audioStreamUrl == null } // Prefer complete progressive MP4 over split DASH
+                compareByDescending<ExtractedStream> { hasUsableAudio(it) } // NEVER pick silent DASH video-only over A+V!
+                    .thenByDescending { it.audioStreamUrl == null || isAvcH264MetaUrl(it.streamUrl) } // Prefer mux-safe H.264/progressive
+                    .thenByDescending { it.audioStreamUrl == null && isMetaProgressiveUrl(it.streamUrl) }
                     .thenByDescending { it.resolutionHeight }
                     .thenByDescending { it.bitrateBps }
                     .thenByDescending { it.estimatedBytes },
             )
 
         val verified = mutableListOf<ExtractedStream>()
-        for (stream in sorted.take(6)) {
+        for (stream in sorted.take(8)) {
             val fullBytes = probeVerifiedContentLength(stream.streamUrl, stream.headers)
-            // Skip unreachable (403/404) or partial initialization fragments (< 16 KB)
             if (fullBytes != null && (fullBytes == -1L || fullBytes >= 16_384L)) {
-                verified.add(stream.copy(estimatedBytes = if (fullBytes > 0L) fullBytes else stream.estimatedBytes))
+                val audioOk = stream.audioStreamUrl.isNullOrBlank() ||
+                    probeVerifiedContentLength(stream.audioStreamUrl, stream.headers) != null
+                if (audioOk) {
+                    verified.add(stream.copy(estimatedBytes = if (fullBytes > 0L) fullBytes else stream.estimatedBytes))
+                }
             }
         }
         return verified
@@ -940,5 +1035,73 @@ internal class MetaVideoPowerExtractor(
         height >= 720 -> "720P HD"
         height > 0 -> "${height}P"
         else -> "BEST HD"
+    }
+
+    companion object {
+        fun decodeMetaEfgTag(url: String): String? {
+            val httpUrl = url.toHttpUrlOrNull() ?: return null
+            val efg = httpUrl.queryParameter("efg")?.takeIf { it.isNotBlank() } ?: return null
+            val flagsList = listOf(
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+                Base64.URL_SAFE or Base64.NO_WRAP,
+                Base64.DEFAULT,
+            )
+            for (flags in flagsList) {
+                val decoded = runCatching {
+                    String(Base64.decode(efg, flags), StandardCharsets.UTF_8)
+                }.getOrNull()
+                if (!decoded.isNullOrBlank() && (decoded.contains("{") || decoded.contains("vencode"))) {
+                    return decoded.lowercase()
+                }
+            }
+            return null
+        }
+
+        fun isMetaAudioOnlyUrl(url: String): Boolean {
+            val lower = url.lowercase()
+            if (lower.contains("mime=audio") ||
+                lower.contains("mime_type=audio") ||
+                lower.contains("audio_mp4")
+            ) {
+                return true
+            }
+            val efg = decodeMetaEfgTag(url) ?: return false
+            val hasAudioMarker = efg.contains("audio") ||
+                efg.contains("heaac") ||
+                efg.contains("mp4a") ||
+                efg.contains("aac_") ||
+                efg.contains("opus")
+            val hasVideoMarker = efg.contains("h264") ||
+                efg.contains("avc") ||
+                efg.contains("vp9") ||
+                efg.contains("vp09") ||
+                efg.contains("hevc") ||
+                efg.contains("av01") ||
+                efg.contains("720p") ||
+                efg.contains("1080p") ||
+                efg.contains("480p") ||
+                efg.contains("360p")
+            return hasAudioMarker && !hasVideoMarker
+        }
+
+        fun isMetaProgressiveUrl(url: String): Boolean {
+            val efg = decodeMetaEfgTag(url) ?: return false
+            return efg.contains("progressive") && !isMetaAudioOnlyUrl(url)
+        }
+
+        fun isMetaVideoOnlyDashUrl(url: String): Boolean {
+            if (isMetaAudioOnlyUrl(url)) return false
+            val efg = decodeMetaEfgTag(url) ?: return false
+            return efg.contains("dash") && !efg.contains("progressive")
+        }
+
+        fun isAvcH264MetaUrl(url: String): Boolean {
+            val efg = decodeMetaEfgTag(url) ?: return true
+            return !efg.contains("vp9") &&
+                !efg.contains("vp09") &&
+                !efg.contains("av01") &&
+                !efg.contains("hev1") &&
+                !efg.contains("hvc1")
+        }
     }
 }

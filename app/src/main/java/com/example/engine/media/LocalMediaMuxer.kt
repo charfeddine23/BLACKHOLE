@@ -11,8 +11,21 @@ import java.nio.ByteBuffer
 
 object LocalMediaMuxer {
 
+    suspend fun hasAudioTrack(file: File): Boolean = withContext(Dispatchers.IO) {
+        if (!file.exists() || file.length() <= 0L) return@withContext false
+        val extractor = MediaExtractor()
+        return@withContext try {
+            extractor.setDataSource(file.absolutePath)
+            findFirstTrack(extractor, "audio/") >= 0
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }
+
     /**
-     * Merges a separate high-resolution video file and audio file into a single MP4 container
+     * Merges a separate high-resolution video file and audio file into a single MP4/WebM container
      * using Android's native MediaExtractor + MediaMuxer (zero external binaries).
      */
     suspend fun mergeVideoAndAudio(
@@ -32,10 +45,7 @@ object LocalMediaMuxer {
             val audioTrackIndex = findFirstTrack(audioExtractor, "audio/")
 
             if (videoTrackIndex < 0) return@withContext false
-            if (audioTrackIndex < 0) {
-                videoFile.copyTo(outputFile, overwrite = true)
-                return@withContext true
-            }
+            if (audioTrackIndex < 0) return@withContext false
 
             videoExtractor.selectTrack(videoTrackIndex)
             audioExtractor.selectTrack(audioTrackIndex)
@@ -43,10 +53,12 @@ object LocalMediaMuxer {
             val videoFormat = videoExtractor.getTrackFormat(videoTrackIndex)
             val audioFormat = audioExtractor.getTrackFormat(audioTrackIndex)
 
-            val videoMime = videoFormat.getString(MediaFormat.KEY_MIME).orEmpty()
-            val outputFormat = if (videoMime.contains("vp9", ignoreCase = true) ||
-                videoMime.contains("vp8", ignoreCase = true)
-            ) {
+            val videoMime = videoFormat.getString(MediaFormat.KEY_MIME).orEmpty().lowercase()
+            val audioMime = audioFormat.getString(MediaFormat.KEY_MIME).orEmpty().lowercase()
+            val isWebmVideo = videoMime.contains("vp9") || videoMime.contains("vp8")
+            val isWebmAudio = audioMime.contains("opus") || audioMime.contains("vorbis")
+
+            val outputFormat = if (isWebmVideo && isWebmAudio) {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
             } else {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4

@@ -140,10 +140,18 @@ class BlackholeDownloadService : Service() {
                 }
 
                 is ExtractionResult.Success -> {
-                    val candidatesToTry = extraction.candidates.ifEmpty { listOf(extraction.bestStream) }.take(3)
+                    val candidatesToTry = extraction.candidates.ifEmpty { listOf(extraction.bestStream) }.take(4)
+                    val fallbackAudioUrl = candidatesToTry.firstNotNullOfOrNull { it.audioStreamUrl }
                     var completed = false
-                    for (candidate in candidatesToTry) {
-                        if (streamAndSaveVideo(routed.canonicalUrl, candidate)) {
+                    for ((index, candidate) in candidatesToTry.withIndex()) {
+                        val hasLaterCandidate = index < candidatesToTry.lastIndex
+                        if (streamAndSaveVideo(
+                                sourceUrl = routed.canonicalUrl,
+                                stream = candidate,
+                                fallbackAudioUrl = fallbackAudioUrl,
+                                rejectSilentMetaVideo = hasLaterCandidate,
+                            )
+                        ) {
                             completed = true
                             break
                         }
@@ -178,7 +186,12 @@ class BlackholeDownloadService : Service() {
         }
     }
 
-    private suspend fun streamAndSaveVideo(sourceUrl: String, stream: ExtractedStream): Boolean {
+    private suspend fun streamAndSaveVideo(
+        sourceUrl: String,
+        stream: ExtractedStream,
+        fallbackAudioUrl: String? = null,
+        rejectSilentMetaVideo: Boolean = false,
+    ): Boolean {
         val extension = if (stream.isHls) "mp4" else extensionForMime(stream.mimeType)
         val safeFileBase = stream.title
             .replace(Regex("""[^A-Za-z0-9_\-]"""), "_")
@@ -223,6 +236,37 @@ class BlackholeDownloadService : Service() {
         if (!succeeded || !localFile.exists() || localFile.length() <= 0L) {
             localFile.delete()
             return false
+        }
+
+        // Guard: If Instagram/Facebook "progressive" stream actually lacked an audio track, mux fallback audio or try next candidate
+        if (!stream.isHls &&
+            stream.audioStreamUrl.isNullOrBlank() &&
+            (stream.platform == PlatformBadge.INSTAGRAM || stream.platform == PlatformBadge.FACEBOOK) &&
+            !LocalMediaMuxer.hasAudioTrack(localFile)
+        ) {
+            var recoveredAudio = false
+            if (!fallbackAudioUrl.isNullOrBlank()) {
+                val tempDir = File(cacheDir, "mux_staging").apply { mkdirs() }
+                val audioTemp = File(tempDir, "audio_fix_${System.currentTimeMillis()}.mp4")
+                val muxedTemp = File(tempDir, "muxed_fix_${System.currentTimeMillis()}.mp4")
+                try {
+                    val audioDownloaded = streamToFile(fallbackAudioUrl, mergedHeaders, audioTemp) { _, _ -> }
+                    if (audioDownloaded &&
+                        LocalMediaMuxer.mergeVideoAndAudio(localFile, audioTemp, muxedTemp) &&
+                        LocalMediaMuxer.hasAudioTrack(muxedTemp)
+                    ) {
+                        muxedTemp.copyTo(localFile, overwrite = true)
+                        recoveredAudio = true
+                    }
+                } finally {
+                    runCatching { audioTemp.delete() }
+                    runCatching { muxedTemp.delete() }
+                }
+            }
+            if (!recoveredAudio && rejectSilentMetaVideo) {
+                localFile.delete()
+                return false
+            }
         }
 
         val exportedUri = exportToMediaStoreIfSupported(localFile, fileName, stream.mimeType)
@@ -386,8 +430,11 @@ class BlackholeDownloadService : Service() {
             if (!videoOk) return@coroutineScope false
 
             if (!audioOk || !audioTemp.exists() || audioTemp.length() <= 0L) {
-                videoTemp.copyTo(outputFile, overwrite = true)
-                return@coroutineScope true
+                if (LocalMediaMuxer.hasAudioTrack(videoTemp)) {
+                    videoTemp.copyTo(outputFile, overwrite = true)
+                    return@coroutineScope true
+                }
+                return@coroutineScope false
             }
 
             DownloadStateCoordinator.setMerging(
@@ -406,7 +453,11 @@ class BlackholeDownloadService : Service() {
 
             val muxed = LocalMediaMuxer.mergeVideoAndAudio(videoTemp, audioTemp, outputFile)
             if (!muxed) {
-                videoTemp.copyTo(outputFile, overwrite = true)
+                if (LocalMediaMuxer.hasAudioTrack(videoTemp)) {
+                    videoTemp.copyTo(outputFile, overwrite = true)
+                    return@coroutineScope true
+                }
+                return@coroutineScope false
             }
             outputFile.exists() && outputFile.length() > 0L
         } finally {
