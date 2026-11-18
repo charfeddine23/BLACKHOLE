@@ -42,6 +42,8 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.material.icons.rounded.ZoomIn
+import androidx.compose.material.icons.rounded.ZoomOut
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -94,6 +96,22 @@ private val BrowserShortcuts = listOf(
     BrowserPlatformShortcut("X", "X", "https://x.com/i/flow/login", "x.com"),
 )
 
+private const val UNLOCK_VIEWPORT_JS = """
+(function(){
+  try {
+    var m = document.querySelector('meta[name="viewport"]');
+    if (m) {
+      var c = m.getAttribute('content') || 'width=device-width';
+      c = c.replace(/user-scalable\s*=\s*(no|0)/gi, 'user-scalable=yes')
+           .replace(/maximum-scale\s*=\s*[0-9.]+/gi, 'maximum-scale=5.0');
+      if (!/user-scalable/i.test(c)) c += ', user-scalable=yes';
+      if (!/maximum-scale/i.test(c)) c += ', maximum-scale=5.0';
+      m.setAttribute('content', c);
+    }
+  } catch (e) {}
+})();
+"""
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun DownloadedVideosBrowserPanel(
@@ -109,6 +127,9 @@ fun DownloadedVideosBrowserPanel(
     var addressText by remember { mutableStateOf(BrowserShortcuts.first().url) }
     var currentUrl by remember { mutableStateOf(BrowserShortcuts.first().url) }
     var loadProgress by remember { mutableIntStateOf(0) }
+    var zoomPercent by remember { mutableIntStateOf(100) }
+    var cssFallbackZoom by remember { mutableIntStateOf(100) }
+    var baseScale by remember { mutableStateOf<Float?>(null) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
     DisposableEffect(Unit) {
@@ -127,7 +148,40 @@ fun DownloadedVideosBrowserPanel(
         }
         addressText = normalized
         currentUrl = normalized
+        baseScale = null
+        zoomPercent = 100
+        cssFallbackZoom = 100
         webViewRef?.loadUrl(normalized)
+    }
+
+    fun zoomPageBy(stepPercent: Int) {
+        val wv = webViewRef ?: return
+        wv.evaluateJavascript(UNLOCK_VIEWPORT_JS, null)
+        val nativeChanged = if (stepPercent > 0) wv.zoomIn() else wv.zoomOut()
+        val nextPercent = (zoomPercent + stepPercent).coerceIn(50, 250)
+        zoomPercent = nextPercent
+        if (!nativeChanged) {
+            val nextCss = (cssFallbackZoom + stepPercent).coerceIn(50, 250)
+            cssFallbackZoom = nextCss
+            wv.evaluateJavascript(
+                "document.documentElement.style.zoom = '${nextCss}%';",
+                null,
+            )
+        }
+    }
+
+    fun resetZoom() {
+        val wv = webViewRef ?: return
+        cssFallbackZoom = 100
+        zoomPercent = 100
+        wv.evaluateJavascript(
+            "document.documentElement.style.zoom = '100%';",
+            null,
+        )
+        var guard = 0
+        while (wv.zoomOut() && guard < 16) {
+            guard++
+        }
     }
 
     Column(
@@ -136,69 +190,123 @@ fun DownloadedVideosBrowserPanel(
             .padding(horizontal = 14.dp, vertical = 4.dp)
             .testTag("downloaded_videos_browser_panel"),
     ) {
-        // Platform Quick-Login Strip + Cookie Sync Badge
+        // Platform Quick-Login Strip + Always-Visible Zoom In / Zoom Out Controls
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            BrowserShortcuts.forEach { shortcut ->
-                val isSelected = currentUrl.contains(shortcut.hostMatch, ignoreCase = true)
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                BrowserShortcuts.forEach { shortcut ->
+                    val isSelected = currentUrl.contains(shortcut.hostMatch, ignoreCase = true)
+                    Surface(
+                        color = if (isSelected) NeonCyan.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.06f),
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(
+                            width = 0.8.dp,
+                            color = if (isSelected) NeonCyan.copy(alpha = 0.72f) else GlassStrokeBright.copy(alpha = 0.26f),
+                        ),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable { navigateTo(shortcut.url) }
+                            .testTag("browser_shortcut_${shortcut.shortLabel.lowercase()}"),
+                    ) {
+                        Text(
+                            text = shortcut.shortLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isSelected) NeonCyan else ChromeSilver,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                        )
+                    }
+                }
+
                 Surface(
-                    color = if (isSelected) NeonCyan.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.06f),
+                    color = if (syncedDomains.isNotEmpty()) {
+                        EmeraldPulse.copy(alpha = 0.16f)
+                    } else {
+                        Color.White.copy(alpha = 0.05f)
+                    },
                     shape = RoundedCornerShape(50),
                     border = BorderStroke(
                         width = 0.8.dp,
-                        color = if (isSelected) NeonCyan.copy(alpha = 0.72f) else GlassStrokeBright.copy(alpha = 0.26f),
+                        color = if (syncedDomains.isNotEmpty()) {
+                            EmeraldPulse.copy(alpha = 0.6f)
+                        } else {
+                            GlassStrokeBright.copy(alpha = 0.22f)
+                        },
                     ),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .clickable { navigateTo(shortcut.url) }
-                        .testTag("browser_shortcut_${shortcut.shortLabel.lowercase()}"),
                 ) {
-                    Text(
-                        text = shortcut.shortLabel,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (isSelected) NeonCyan else ChromeSilver,
-                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Lock,
+                            contentDescription = null,
+                            tint = if (syncedDomains.isNotEmpty()) EmeraldPulse else MutedSlate,
+                            modifier = Modifier.size(12.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "${syncedDomains.size} COOKIES",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (syncedDomains.isNotEmpty()) EmeraldPulse else MutedSlate,
+                        )
+                    }
                 }
             }
 
+            // Pinned Zoom Out / Reset % / Zoom In Capsule
             Surface(
-                color = if (syncedDomains.isNotEmpty()) {
-                    EmeraldPulse.copy(alpha = 0.16f)
-                } else {
-                    Color.White.copy(alpha = 0.05f)
-                },
+                color = Color.White.copy(alpha = 0.06f),
                 shape = RoundedCornerShape(50),
-                border = BorderStroke(
-                    width = 0.8.dp,
-                    color = if (syncedDomains.isNotEmpty()) {
-                        EmeraldPulse.copy(alpha = 0.6f)
-                    } else {
-                        GlassStrokeBright.copy(alpha = 0.22f)
-                    },
-                ),
+                border = BorderStroke(0.8.dp, GlassStrokeBright.copy(alpha = 0.3f)),
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Lock,
-                        contentDescription = null,
-                        tint = if (syncedDomains.isNotEmpty()) EmeraldPulse else MutedSlate,
-                        modifier = Modifier.size(12.dp),
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    IconButton(
+                        onClick = { zoomPageBy(-20) },
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("browser_zoom_out_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.ZoomOut,
+                            contentDescription = "Zoom out page",
+                            tint = ChromeSilver,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
                     Text(
-                        text = "${syncedDomains.size} COOKIES",
+                        text = "$zoomPercent%",
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (syncedDomains.isNotEmpty()) EmeraldPulse else MutedSlate,
+                        color = if (zoomPercent == 100) MutedSlate else NeonCyan,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { resetZoom() }
+                            .padding(horizontal = 4.dp, vertical = 6.dp)
+                            .testTag("browser_zoom_reset_button"),
                     )
+                    IconButton(
+                        onClick = { zoomPageBy(+20) },
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("browser_zoom_in_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.ZoomIn,
+                            contentDescription = "Zoom in page",
+                            tint = NeonCyan,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
                 }
             }
         }
@@ -428,8 +536,20 @@ fun DownloadedVideosBrowserPanel(
                                 request: WebResourceRequest?,
                             ): Boolean = false
 
+                            override fun onScaleChanged(view: WebView?, oldScale: Float, newScale: Float) {
+                                super.onScaleChanged(view, oldScale, newScale)
+                                val base = baseScale ?: oldScale.takeIf { it > 0f } ?: newScale
+                                if (baseScale == null && base > 0f) {
+                                    baseScale = base
+                                }
+                                if (base > 0f && newScale > 0f) {
+                                    zoomPercent = ((newScale / base) * 100f).toInt().coerceIn(50, 300)
+                                }
+                            }
+
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
+                                view?.evaluateJavascript(UNLOCK_VIEWPORT_JS, null)
                                 if (!url.isNullOrBlank()) {
                                     addressText = url
                                     currentUrl = url

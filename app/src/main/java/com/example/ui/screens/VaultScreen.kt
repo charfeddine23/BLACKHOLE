@@ -61,6 +61,8 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.material.icons.rounded.ZoomIn
+import androidx.compose.material.icons.rounded.ZoomOut
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -659,7 +661,50 @@ private fun InlineWebLoginPanel(
     var addressText by remember(initialUrl) { mutableStateOf(initialUrl) }
     var activeLoadUrl by remember(initialUrl) { mutableStateOf(initialUrl) }
     var loadProgress by remember { mutableIntStateOf(0) }
+    var zoomPercent by remember { mutableIntStateOf(100) }
+    var cssFallbackZoom by remember { mutableIntStateOf(100) }
+    var baseScale by remember { mutableStateOf<Float?>(null) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+
+    val unlockViewportScript = """
+        (function(){
+          try {
+            var m = document.querySelector('meta[name="viewport"]');
+            if (m) {
+              var c = m.getAttribute('content') || 'width=device-width';
+              c = c.replace(/user-scalable\s*=\s*(no|0)/gi, 'user-scalable=yes')
+                   .replace(/maximum-scale\s*=\s*[0-9.]+/gi, 'maximum-scale=5.0');
+              if (!/user-scalable/i.test(c)) c += ', user-scalable=yes';
+              if (!/maximum-scale/i.test(c)) c += ', maximum-scale=5.0';
+              m.setAttribute('content', c);
+            }
+          } catch (e) {}
+        })();
+    """.trimIndent()
+
+    fun zoomVaultPageBy(step: Int) {
+        val wv = webViewRef ?: return
+        wv.evaluateJavascript(unlockViewportScript, null)
+        val nativeChanged = if (step > 0) wv.zoomIn() else wv.zoomOut()
+        val nextPercent = (zoomPercent + step).coerceIn(50, 250)
+        zoomPercent = nextPercent
+        if (!nativeChanged) {
+            val nextCss = (cssFallbackZoom + step).coerceIn(50, 250)
+            cssFallbackZoom = nextCss
+            wv.evaluateJavascript("document.documentElement.style.zoom = '${nextCss}%';", null)
+        }
+    }
+
+    fun resetVaultZoom() {
+        val wv = webViewRef ?: return
+        cssFallbackZoom = 100
+        zoomPercent = 100
+        wv.evaluateJavascript("document.documentElement.style.zoom = '100%';", null)
+        var guard = 0
+        while (wv.zoomOut() && guard < 16) {
+            guard++
+        }
+    }
 
     LiquidGlassCard(
         modifier = Modifier
@@ -710,17 +755,55 @@ private fun InlineWebLoginPanel(
                     }
                 }
 
-                IconButton(
-                    onClick = onClose,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .testTag("vault_close_webview_button"),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Close,
-                        contentDescription = "Close inline login browser",
-                        tint = ChromeSilver,
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = { zoomVaultPageBy(-20) },
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("vault_zoom_out_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.ZoomOut,
+                            contentDescription = "Zoom out page",
+                            tint = ChromeSilver,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                    Text(
+                        text = "$zoomPercent%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (zoomPercent == 100) MutedSlate else NeonCyan,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { resetVaultZoom() }
+                            .padding(horizontal = 4.dp, vertical = 4.dp)
+                            .testTag("vault_zoom_reset_button"),
                     )
+                    IconButton(
+                        onClick = { zoomVaultPageBy(+20) },
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("vault_zoom_in_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.ZoomIn,
+                            contentDescription = "Zoom in page",
+                            tint = NeonCyan,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                    IconButton(
+                        onClick = onClose,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("vault_close_webview_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Close inline login browser",
+                            tint = ChromeSilver,
+                        )
+                    }
                 }
             }
 
@@ -825,6 +908,9 @@ private fun InlineWebLoginPanel(
                             settings.domStorageEnabled = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
+                            settings.setSupportZoom(true)
+                            settings.builtInZoomControls = true
+                            settings.displayZoomControls = false
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                             settings.userAgentString = ClientSpoofer.ANDROID_CHROME_USER_AGENT
                             webViewClient = object : WebViewClient() {
@@ -833,7 +919,19 @@ private fun InlineWebLoginPanel(
                                     request: WebResourceRequest?,
                                 ): Boolean = false
 
+                                override fun onScaleChanged(view: WebView?, oldScale: Float, newScale: Float) {
+                                    super.onScaleChanged(view, oldScale, newScale)
+                                    val base = baseScale ?: oldScale.takeIf { it > 0f } ?: newScale
+                                    if (baseScale == null && base > 0f) {
+                                        baseScale = base
+                                    }
+                                    if (base > 0f && newScale > 0f) {
+                                        zoomPercent = ((newScale / base) * 100f).toInt().coerceIn(50, 300)
+                                    }
+                                }
+
                                 override fun onPageFinished(view: WebView?, url: String?) {
+                                    view?.evaluateJavascript(unlockViewportScript, null)
                                     if (!url.isNullOrBlank()) {
                                         addressText = url
                                         onUrlChanged(url)
