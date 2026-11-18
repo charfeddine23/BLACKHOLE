@@ -57,7 +57,6 @@ android {
     }
   }
   compileOptions {
-    isCoreLibraryDesugaringEnabled = true
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
   }
@@ -110,10 +109,7 @@ dependencies {
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
   implementation(libs.androidx.security.crypto)
-  implementation(libs.androidx.work.runtime.ktx)
-  implementation(libs.coil.compose)
-  implementation(libs.newpipe.extractor)
-  coreLibraryDesugaring(libs.desugar.jdk.libs.nio)
+  // implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
   // implementation(libs.firebase.ai)
   // Uncomment to use Firestore:

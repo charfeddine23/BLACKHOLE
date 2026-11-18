@@ -1,7 +1,6 @@
 package com.example.ui.components
 
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -13,9 +12,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +29,7 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -47,13 +46,10 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.onLongClick
-import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -70,23 +66,20 @@ import com.example.ui.theme.PlasmaViolet
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
-private const val VAULT_HOLD_DURATION_MS = 1000L
-
 @Composable
 fun BlackholeCoreButton(
     phase: DownloadPhase,
     qualityLabel: String,
     controller: BlackholeAnimationController,
     onTapBlackhole: () -> Unit,
-    onHoldOneSecondVault: () -> Unit,
     modifier: Modifier = Modifier,
-    coreDiameter: Dp = 200.dp,
+    coreDiameter: Dp = 264.dp,
     isUpdateActive: Boolean = false,
     updateProgress: Float = 0f,
 ) {
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
-    val vaultChargeProgress = remember { Animatable(0f) }
+    val interactionSource = remember { MutableInteractionSource() }
 
     val smoothUpdateProgress by animateFloatAsState(
         targetValue = updateProgress.coerceIn(0f, 1f),
@@ -119,20 +112,20 @@ fun BlackholeCoreButton(
         else -> PlasmaViolet
     }
 
-    val holdScale = 1f - (vaultChargeProgress.value * 0.08f)
-    val coreButtonScale = controller.absorptionScale.value * controller.coreBreathingScale.value * holdScale
+    val coreButtonScale = controller.absorptionScale.value * controller.coreBreathingScale.value
 
     Box(
         modifier = modifier
-            .size(coreDiameter + 52.dp),
+            .size(coreDiameter + 64.dp),
         contentAlignment = Alignment.Center,
     ) {
-        // Outer concentric radar / pulse waves + orbital accretion rings + 1s Vault Hold charge ring
+        // Outer concentric radar / pulse waves + orbital accretion rings
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = Offset(size.width / 2f, size.height / 2f)
             val maxWaveRadius = size.minDimension / 2f
             val innerHorizonRadius = (coreDiameter.toPx() / 2f) * 0.68f
 
+            // Staggered Radar Pulse Waves
             val waves = listOf(
                 controller.waveOneProgress.value,
                 controller.waveTwoProgress.value,
@@ -159,6 +152,7 @@ fun BlackholeCoreButton(
                 )
             }
 
+            // Cybernetic Tap Implosion Shockwave
             val implosionAlpha = controller.implosionRingAlpha.value
             if (implosionAlpha > 0.01f) {
                 drawCircle(
@@ -169,6 +163,7 @@ fun BlackholeCoreButton(
                 )
             }
 
+            // Ambient Deep Radial Halo behind the Blackhole
             drawCircle(
                 brush = Brush.radialGradient(
                     colors = listOf(
@@ -183,25 +178,7 @@ fun BlackholeCoreButton(
                 center = center,
             )
 
-            // 1-second Hold Progress Ring for Vault entry
-            if (vaultChargeProgress.value > 0.02f) {
-                val holdRadius = (coreDiameter.toPx() / 2f) + 10.dp.toPx()
-                val arcSize = Size(holdRadius * 2f, holdRadius * 2f)
-                val arcTopLeft = Offset(center.x - holdRadius, center.y - holdRadius)
-                drawArc(
-                    brush = Brush.sweepGradient(
-                        colors = listOf(PlasmaViolet, NeonCyan, EmeraldPulse, PlasmaViolet),
-                        center = center,
-                    ),
-                    startAngle = -90f,
-                    sweepAngle = 360f * vaultChargeProgress.value,
-                    useCenter = false,
-                    topLeft = arcTopLeft,
-                    size = arcSize,
-                    style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round),
-                )
-            }
-
+            // Silent In-App Update Ring spinning & sweeping around Blackhole perimeter (0° -> 360° full circle)
             if (isUpdateActive) {
                 val perimeterRadius = (coreDiameter.toPx() / 2f) + 6.dp.toPx()
                 val arcSize = Size(perimeterRadius * 2f, perimeterRadius * 2f)
@@ -210,6 +187,7 @@ fun BlackholeCoreButton(
                     center.y - perimeterRadius,
                 )
 
+                // Subtle guide ring around Blackhole perimeter
                 drawCircle(
                     color = NeonCyan.copy(alpha = 0.14f),
                     radius = perimeterRadius,
@@ -217,9 +195,15 @@ fun BlackholeCoreButton(
                     style = Stroke(width = 3.dp.toPx()),
                 )
 
+                // Cumulative sweep arc reaching full 360° circle upon completion
                 drawArc(
                     brush = Brush.sweepGradient(
-                        colors = listOf(NeonCyan, ElectricBlue, EmeraldPulse, NeonCyan),
+                        colors = listOf(
+                            NeonCyan,
+                            ElectricBlue,
+                            EmeraldPulse,
+                            NeonCyan,
+                        ),
                         center = center,
                     ),
                     startAngle = -90f,
@@ -230,6 +214,7 @@ fun BlackholeCoreButton(
                     style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round),
                 )
 
+                // Spinning orbital flare along the perimeter while downloading
                 if (smoothUpdateProgress < 0.995f) {
                     drawArc(
                         brush = Brush.sweepGradient(
@@ -252,7 +237,7 @@ fun BlackholeCoreButton(
             }
         }
 
-        // Interactive Blackhole Sphere supporting Tap + 1-Second Press to enter Vault
+        // Interactive Blackhole Sphere
         Box(
             modifier = Modifier
                 .size(coreDiameter)
@@ -262,49 +247,24 @@ fun BlackholeCoreButton(
                 }
                 .clip(CircleShape)
                 .semantics {
-                    role = Role.Button
                     contentDescription = when (phase) {
-                        DownloadPhase.DOWNLOADING -> "Downloading video at ${(controller.animatedDownloadProgress.value * 100).roundToInt()} percent. Hold 1 second for Vault."
-                        DownloadPhase.ABSORBING -> "Extracting stream link. Hold 1 second for Vault."
-                        else -> "Tap Blackhole core to extract link, or press and hold for 1 second to open Vault"
-                    }
-                    onLongClick(label = "Open Vault") {
-                        onHoldOneSecondVault()
-                        true
+                        DownloadPhase.DOWNLOADING -> "Downloading video at ${(controller.animatedDownloadProgress.value * 100).roundToInt()} percent"
+                        DownloadPhase.ABSORBING -> "Absorbing stream link"
+                        DownloadPhase.CLIPBOARD_ARMED -> "Tap Blackhole core to pull armed video link"
+                        DownloadPhase.COMPLETED -> "Download complete. Tap to pull again"
+                        else -> "Tap Blackhole core to detect clipboard and download video"
                     }
                 }
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        var vaultTriggered = false
-                        val chargeJob = scope.launch {
-                            vaultChargeProgress.snapTo(0f)
-                            vaultChargeProgress.animateTo(
-                                targetValue = 1f,
-                                animationSpec = tween(
-                                    durationMillis = VAULT_HOLD_DURATION_MS.toInt(),
-                                    easing = LinearEasing,
-                                ),
-                            )
-                            vaultTriggered = true
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onHoldOneSecondVault()
-                            vaultChargeProgress.snapTo(0f)
-                        }
-
-                        val upChange = waitForUpOrCancellation()
-                        chargeJob.cancel()
-
-                        if (!vaultTriggered) {
-                            scope.launch { vaultChargeProgress.animateTo(0f, tween(150)) }
-                            if (upChange != null) {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                scope.launch { controller.triggerTapImplosion() }
-                                onTapBlackhole()
-                            }
-                        }
-                    }
-                }
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = ripple(bounded = true, color = NeonCyan),
+                    role = Role.Button,
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        scope.launch { controller.triggerTapImplosion() }
+                        onTapBlackhole()
+                    },
+                )
                 .testTag("blackhole_core_button"),
             contentAlignment = Alignment.Center,
         ) {
@@ -312,6 +272,7 @@ fun BlackholeCoreButton(
                 val center = Offset(size.width / 2f, size.height / 2f)
                 val outerRadius = size.minDimension / 2f - 4.dp.toPx()
 
+                // Rotating Accretion Halo
                 rotate(degrees = controller.orbitalAngle.value, pivot = center) {
                     drawCircle(
                         brush = Brush.sweepGradient(
@@ -326,10 +287,11 @@ fun BlackholeCoreButton(
                         ),
                         radius = outerRadius - 6.dp.toPx(),
                         center = center,
-                        style = Stroke(width = 4.5.dp.toPx()),
+                        style = Stroke(width = 5.dp.toPx()),
                     )
                 }
 
+                // Subtle Metallic Brushed Bezel
                 drawCircle(
                     brush = Brush.linearGradient(
                         colors = listOf(
@@ -344,7 +306,8 @@ fun BlackholeCoreButton(
                     style = Stroke(width = 1.5.dp.toPx()),
                 )
 
-                val coreRadius = outerRadius - 12.dp.toPx()
+                // Deep Obsidian Singularity Core
+                val coreRadius = outerRadius - 14.dp.toPx()
                 drawCircle(
                     brush = Brush.radialGradient(
                         colors = listOf(
@@ -359,6 +322,7 @@ fun BlackholeCoreButton(
                     center = center,
                 )
 
+                // Inner Event Horizon Rim
                 drawCircle(
                     brush = Brush.radialGradient(
                         colors = listOf(
@@ -373,6 +337,7 @@ fun BlackholeCoreButton(
                     style = Stroke(width = 1.dp.toPx()),
                 )
 
+                // Precision Live Progress Arc when Downloading
                 if (phase == DownloadPhase.DOWNLOADING) {
                     val arcDiameter = (outerRadius - 6.dp.toPx()) * 2f
                     val topLeft = Offset(
@@ -394,6 +359,7 @@ fun BlackholeCoreButton(
                 }
             }
 
+            // Center Core Readout
             AnimatedContent(
                 targetState = phase,
                 transitionSpec = { fadeIn() togetherWith fadeOut() },
@@ -408,10 +374,10 @@ fun BlackholeCoreButton(
                             val percent = (controller.animatedDownloadProgress.value * 100f).roundToInt()
                             Text(
                                 text = "$percent%",
-                                style = MaterialTheme.typography.headlineMedium,
+                                style = MaterialTheme.typography.displaySmall,
                                 color = ChromeSilver,
                             )
-                            Spacer(modifier = Modifier.height(2.dp))
+                            Spacer(modifier = Modifier.height(4.dp))
                             Text(
                                 text = qualityLabel.ifBlank { "PULLING" },
                                 style = MaterialTheme.typography.labelSmall,
@@ -424,11 +390,11 @@ fun BlackholeCoreButton(
                                 imageVector = Icons.Rounded.Bolt,
                                 contentDescription = null,
                                 tint = NeonCyan,
-                                modifier = Modifier.size(30.dp),
+                                modifier = Modifier.size(34.dp),
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "EXTRACTING",
+                                text = "ABSORBING",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = NeonCyan,
                             )
@@ -439,9 +405,9 @@ fun BlackholeCoreButton(
                                 imageVector = Icons.Rounded.Check,
                                 contentDescription = null,
                                 tint = EmeraldPulse,
-                                modifier = Modifier.size(34.dp),
+                                modifier = Modifier.size(38.dp),
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = "CAPTURED",
                                 style = MaterialTheme.typography.labelMedium,
@@ -454,9 +420,9 @@ fun BlackholeCoreButton(
                                 imageVector = Icons.Rounded.ArrowDownward,
                                 contentDescription = null,
                                 tint = NeonCyan,
-                                modifier = Modifier.size(30.dp),
+                                modifier = Modifier.size(34.dp),
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = "PULL MAX",
                                 style = MaterialTheme.typography.labelLarge,
@@ -464,9 +430,9 @@ fun BlackholeCoreButton(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "HOLD 1S · VAULT",
+                                text = "4K · 1080P",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = PlasmaViolet.copy(alpha = 0.85f),
+                                color = NeonCyan.copy(alpha = 0.85f),
                             )
                         }
 
@@ -475,11 +441,11 @@ fun BlackholeCoreButton(
                                 imageVector = Icons.Rounded.Bolt,
                                 contentDescription = null,
                                 tint = PlasmaViolet,
-                                modifier = Modifier.size(30.dp),
+                                modifier = Modifier.size(34.dp),
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "MUXING A/V",
+                                text = "MERGING A/V",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = ChromeSilver,
                             )
@@ -494,11 +460,7 @@ fun BlackholeCoreButton(
                         }
 
                         DownloadPhase.ERROR -> {
-                            Text(
-                                text = "TAP TO RETRY",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = CrimsonAlert,
-                            )
+                            // Keep singularity core clean without RETRY PULL text or arrow
                         }
 
                         DownloadPhase.IDLE -> {
@@ -506,9 +468,9 @@ fun BlackholeCoreButton(
                                 imageVector = Icons.Rounded.ArrowDownward,
                                 contentDescription = null,
                                 tint = ChromeSilver.copy(alpha = 0.88f),
-                                modifier = Modifier.size(28.dp),
+                                modifier = Modifier.size(32.dp),
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = "TAP CORE",
                                 style = MaterialTheme.typography.labelLarge,
@@ -516,7 +478,7 @@ fun BlackholeCoreButton(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "HOLD 1S · VAULT",
+                                text = "AUTO CLIPBOARD",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MutedSlate,
                             )
