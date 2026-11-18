@@ -45,18 +45,22 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.DesktopWindows
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material.icons.rounded.ZoomIn
 import androidx.compose.material.icons.rounded.ZoomOut
 import androidx.compose.material3.HorizontalDivider
@@ -159,6 +163,22 @@ private const val UNLOCK_VIEWPORT_JS = """
 })();
 """
 
+private const val DESKTOP_VIEWPORT_JS = """
+(function(){
+  try {
+    var m = document.querySelector('meta[name="viewport"]');
+    if (!m) {
+      m = document.createElement('meta');
+      m.setAttribute('name', 'viewport');
+      document.head && document.head.appendChild(m);
+    }
+    if (m) {
+      m.setAttribute('content', 'width=1280, initial-scale=0.35, user-scalable=yes, maximum-scale=5.0');
+    }
+  } catch (e) {}
+})();
+"""
+
 // Samsung Internet light chrome + warm dark nebula start page palette
 private val ChromeBarSurface = Color(0xFFF3F4F6)
 private val ChromePillWhite = Color(0xFFFFFFFF)
@@ -171,10 +191,16 @@ private val ChromeDivider = Color(0xFFDDE0E4)
 @Composable
 fun DownloadedVideosBrowserPanel(
     syncedDomains: List<String>,
+    storedCookieCount: Int,
+    isPermanentCookieLock: Boolean,
     statusMessage: String?,
     onAutoSyncCookies: (String) -> Unit,
     onManualSyncCookies: (String) -> Unit,
+    onRestoreCookiesToBrowser: () -> Unit,
+    onTogglePermanentCookieLock: () -> Unit,
+    onClearCookies: () -> Unit,
     onPullCurrentPage: (String) -> Unit,
+    onExitBrowser: () -> Unit,
     onDismissStatus: () -> Unit,
     onBindWebViewRef: (WebView?) -> Unit,
     modifier: Modifier = Modifier,
@@ -189,12 +215,19 @@ fun DownloadedVideosBrowserPanel(
     var showPromoBanner by remember { mutableStateOf(true) }
     var showToolsBar by remember { mutableStateOf(false) }
     var showTabsBarTray by remember { mutableStateOf(false) }
+    var isDesktopMode by remember { mutableStateOf(false) }
+    var confirmClearCookies by remember { mutableStateOf(false) }
 
     var zoomPercent by remember { mutableIntStateOf(100) }
     var cssFallbackZoom by remember { mutableIntStateOf(100) }
     var baseScale by remember { mutableStateOf<Float?>(null) }
 
     val activeWebView = webViews[activeTab.id]
+
+    // Ensure AES-256 permanently saved cookies are injected into WebView CookieManager on entry
+    LaunchedEffect(Unit) {
+        onRestoreCookiesToBrowser()
+    }
 
     LaunchedEffect(activeTab.id, activeTab.url, activeWebView) {
         onBindWebViewRef(if (activeTab.isHome) null else activeWebView)
@@ -205,6 +238,12 @@ fun DownloadedVideosBrowserPanel(
 
     DisposableEffect(Unit) {
         onDispose {
+            val currentUrl = webViews[activeTab.id]?.url ?: activeTab.url
+            if (currentUrl.startsWith("http", ignoreCase = true)) {
+                onAutoSyncCookies(currentUrl)
+            } else {
+                onAutoSyncCookies("https://www.instagram.com/")
+            }
             onBindWebViewRef(null)
             webViews.values.forEach { wv ->
                 runCatching {
@@ -234,9 +273,50 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
+    fun applyDesktopSettings(wv: WebView, desktop: Boolean) {
+        wv.settings.apply {
+            userAgentString = if (desktop) {
+                ClientSpoofer.CHROME_DESKTOP_USER_AGENT
+            } else {
+                ClientSpoofer.ANDROID_CHROME_USER_AGENT
+            }
+            useWideViewPort = true
+            loadWithOverviewMode = true
+        }
+    }
+
+    fun resolveUrlForDesktopMode(url: String, desktop: Boolean): String {
+        if (!desktop) return url
+        return when {
+            url.startsWith("https://m.youtube.com", ignoreCase = true) ->
+                url.replaceFirst("https://m.youtube.com", "https://www.youtube.com", ignoreCase = true)
+            url.startsWith("https://m.facebook.com", ignoreCase = true) ->
+                url.replaceFirst("https://m.facebook.com", "https://www.facebook.com", ignoreCase = true)
+            url.startsWith("https://m.twitch.tv", ignoreCase = true) ->
+                url.replaceFirst("https://m.twitch.tv", "https://www.twitch.tv", ignoreCase = true)
+            else -> url
+        }
+    }
+
+    fun toggleDesktopMode() {
+        val next = !isDesktopMode
+        isDesktopMode = next
+        webViews.values.forEach { wv -> applyDesktopSettings(wv, next) }
+        val currentWv = webViews[activeTab.id]
+        if (!activeTab.isHome && currentWv != null) {
+            val currentUrl = currentWv.url ?: activeTab.url
+            val mappedUrl = resolveUrlForDesktopMode(currentUrl, next)
+            if (mappedUrl != currentUrl) {
+                currentWv.loadUrl(mappedUrl)
+            } else {
+                currentWv.reload()
+            }
+        }
+    }
+
     fun openUrlInActiveTab(raw: String) {
-        val normalized = normalizeInputToUrl(raw)
-        if (normalized == HOME_TAB_URL) {
+        val rawNormalized = normalizeInputToUrl(raw)
+        if (rawNormalized == HOME_TAB_URL) {
             updateTabById(activeTab.id) {
                 it.copy(title = "New tab", url = HOME_TAB_URL, progress = 0, canGoBack = false, canGoForward = false)
             }
@@ -244,6 +324,7 @@ fun DownloadedVideosBrowserPanel(
             onBindWebViewRef(null)
             return
         }
+        val normalized = resolveUrlForDesktopMode(rawNormalized, isDesktopMode)
         val tabId = activeTab.id
         baseScale = null
         zoomPercent = 100
@@ -252,7 +333,10 @@ fun DownloadedVideosBrowserPanel(
         updateTabById(tabId) {
             it.copy(url = normalized, title = deriveHostLabel(normalized), progress = 12)
         }
-        webViews[tabId]?.loadUrl(normalized)
+        webViews[tabId]?.let { wv ->
+            applyDesktopSettings(wv, isDesktopMode)
+            wv.loadUrl(normalized)
+        }
     }
 
     fun openNewTab(initialUrl: String = HOME_TAB_URL) {
@@ -420,6 +504,41 @@ fun DownloadedVideosBrowserPanel(
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.width(6.dp))
+
+            // Compact Exit Full-Screen Browser -> Downloaded Videos button
+            Surface(
+                color = Color(0xFF101622),
+                shape = RoundedCornerShape(50),
+                border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.55f)),
+                modifier = Modifier
+                    .height(34.dp)
+                    .clip(RoundedCornerShape(50))
+                    .clickable { onExitBrowser() }
+                    .testTag("browser_exit_fullscreen_button"),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Movie,
+                        contentDescription = "Back to downloaded videos",
+                        tint = NeonCyan,
+                        modifier = Modifier.size(15.dp),
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "VIDEOS",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                        ),
+                        color = Color.White,
+                    )
+                }
+            }
         }
 
         // 2. Samsung-Style Rounded Search / URL Pill Bar
@@ -502,6 +621,38 @@ fun DownloadedVideosBrowserPanel(
                     }
                 }
 
+                if (isDesktopMode) {
+                    Surface(
+                        color = Color(0xFF2563EB).copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { toggleDesktopMode() }
+                            .padding(end = 4.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.DesktopWindows,
+                                contentDescription = "Desktop view enabled",
+                                tint = Color(0xFF2563EB),
+                                modifier = Modifier.size(13.dp),
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = "PC",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                ),
+                                color = Color(0xFF2563EB),
+                            )
+                        }
+                    }
+                }
+
                 if (!activeTab.isHome) {
                     if (zoomPercent != 100) {
                         Text(
@@ -553,6 +704,8 @@ fun DownloadedVideosBrowserPanel(
             if (activeTab.isHome) {
                 SamsungStartPageHome(
                     syncedDomainsCount = syncedDomains.size,
+                    storedCookieCount = storedCookieCount,
+                    isPermanentCookieLock = isPermanentCookieLock,
                     showBanner = showPromoBanner,
                     onDismissBanner = { showPromoBanner = false },
                     onOpenShortcut = { shortcutUrl -> openUrlInActiveTab(shortcutUrl) },
@@ -588,7 +741,11 @@ fun DownloadedVideosBrowserPanel(
                                     displayZoomControls = false
                                     mediaPlaybackRequiresUserGesture = false
                                     mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                                    userAgentString = ClientSpoofer.ANDROID_CHROME_USER_AGENT
+                                    userAgentString = if (isDesktopMode) {
+                                        ClientSpoofer.CHROME_DESKTOP_USER_AGENT
+                                    } else {
+                                        ClientSpoofer.ANDROID_CHROME_USER_AGENT
+                                    }
                                 }
 
                                 webViewClient = object : WebViewClient() {
@@ -600,6 +757,18 @@ fun DownloadedVideosBrowserPanel(
                                         return nextUrl.isNotBlank() &&
                                             !nextUrl.startsWith("http://", ignoreCase = true) &&
                                             !nextUrl.startsWith("https://", ignoreCase = true)
+                                    }
+
+                                    override fun onPageStarted(
+                                        view: WebView?,
+                                        url: String?,
+                                        favicon: android.graphics.Bitmap?,
+                                    ) {
+                                        super.onPageStarted(view, url, favicon)
+                                        val loadingUrl = url.orEmpty()
+                                        if (loadingUrl.startsWith("http", ignoreCase = true)) {
+                                            onAutoSyncCookies(loadingUrl)
+                                        }
                                     }
 
                                     override fun onScaleChanged(
@@ -619,6 +788,7 @@ fun DownloadedVideosBrowserPanel(
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
+                                        CookieManager.getInstance().flush()
                                         val loaded = url.orEmpty()
                                         if (loaded.isNotBlank()) {
                                             val pageTitle = view?.title?.takeIf { it.isNotBlank() }
@@ -636,7 +806,10 @@ fun DownloadedVideosBrowserPanel(
                                             }
                                             onAutoSyncCookies(loaded)
                                         }
-                                        view?.evaluateJavascript(UNLOCK_VIEWPORT_JS, null)
+                                        view?.evaluateJavascript(
+                                            if (isDesktopMode) DESKTOP_VIEWPORT_JS else UNLOCK_VIEWPORT_JS,
+                                            null,
+                                        )
                                     }
                                 }
 
@@ -787,6 +960,74 @@ fun DownloadedVideosBrowserPanel(
                             }
                         }
 
+                        // Desktop View Toggle Action
+                        Surface(
+                            color = if (isDesktopMode) Color(0xFF0E1726) else ChromePillWhite,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.85.dp,
+                                if (isDesktopMode) Color(0xFF2563EB) else ChromeDivider,
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { toggleDesktopMode() }
+                                .testTag("browser_desktop_mode_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.DesktopWindows,
+                                    contentDescription = "Toggle desktop view",
+                                    tint = if (isDesktopMode) NeonCyan else ChromeTextPrimary,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isDesktopMode) "DESKTOP ON" else "DESKTOP VIEW",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (isDesktopMode) Color.White else ChromeTextPrimary,
+                                )
+                            }
+                        }
+
+                        // Permanent AES-256 Cookie Lock Pill
+                        Surface(
+                            color = if (isPermanentCookieLock) Color(0xFFECFDF5) else ChromePillWhite,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.85.dp,
+                                if (isPermanentCookieLock) EmeraldPulse else ChromeDivider,
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { onTogglePermanentCookieLock() }
+                                .testTag("browser_permanent_cookie_lock_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.VerifiedUser,
+                                    contentDescription = "Permanent cookie protection",
+                                    tint = if (isPermanentCookieLock) Color(0xFF059669) else ChromeTextMuted,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isPermanentCookieLock) {
+                                        "FOREVER LOCK · $storedCookieCount"
+                                    } else {
+                                        "TEMP SESSION · $storedCookieCount"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (isPermanentCookieLock) Color(0xFF065F46) else ChromeTextPrimary,
+                                )
+                            }
+                        }
+
                         // Sync Cookies Action
                         Surface(
                             color = ChromePillWhite,
@@ -813,10 +1054,51 @@ fun DownloadedVideosBrowserPanel(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = "SYNC COOKIES (${syncedDomains.size})",
+                                    text = "SYNC (${syncedDomains.size})",
                                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
                                     color = ChromeTextPrimary,
                                 )
+                            }
+                        }
+
+                        // Clear Cookies (Inline 2-tap confirm, zero dialog)
+                        if (storedCookieCount > 0) {
+                            Surface(
+                                color = if (confirmClearCookies) Color(0xFFDC2626) else ChromePillWhite,
+                                shape = RoundedCornerShape(50),
+                                border = BorderStroke(
+                                    0.8.dp,
+                                    if (confirmClearCookies) Color(0xFFDC2626) else ChromeDivider,
+                                ),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .clickable {
+                                        if (confirmClearCookies) {
+                                            confirmClearCookies = false
+                                            onClearCookies()
+                                        } else {
+                                            confirmClearCookies = true
+                                        }
+                                    }
+                                    .testTag("browser_clear_cookies_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.DeleteOutline,
+                                        contentDescription = "Clear cookie vault",
+                                        tint = if (confirmClearCookies) Color.White else Color(0xFFDC2626),
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = if (confirmClearCookies) "TAP AGAIN TO CLEAR" else "CLEAR VAULT",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                        color = if (confirmClearCookies) Color.White else Color(0xFFDC2626),
+                                    )
+                                }
                             }
                         }
 
@@ -1152,6 +1434,8 @@ fun DownloadedVideosBrowserPanel(
 @Composable
 private fun SamsungStartPageHome(
     syncedDomainsCount: Int,
+    storedCookieCount: Int,
+    isPermanentCookieLock: Boolean,
     showBanner: Boolean,
     onDismissBanner: () -> Unit,
     onOpenShortcut: (String) -> Unit,
@@ -1192,7 +1476,7 @@ private fun SamsungStartPageHome(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Tune,
-                        contentDescription = "Browser settings & zoom",
+                        contentDescription = "Browser settings, desktop & zoom",
                         tint = Color.White.copy(alpha = 0.88f),
                         modifier = Modifier.size(20.dp),
                     )
@@ -1297,16 +1581,16 @@ private fun SamsungStartPageHome(
                                 color = Color.White,
                             )
                             Text(
-                                text = "for Session Vault",
+                                text = if (isPermanentCookieLock) "AES-256 Forever Vault" else "for Session Vault",
                                 style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
                                 color = Color.White.copy(alpha = 0.9f),
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = if (syncedDomainsCount > 0) {
-                                    "$syncedDomainsCount authenticated domains ready for HD capture."
+                                text = if (storedCookieCount > 0) {
+                                    "$storedCookieCount cookies encrypted & locked forever across $syncedDomainsCount domains."
                                 } else {
-                                    "Sign in once to unlock private & HD videos with full sound."
+                                    "Sign in once — AES-256 encrypted & saved forever for effortless downloads."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color.White.copy(alpha = 0.82f),
@@ -1320,7 +1604,7 @@ private fun SamsungStartPageHome(
                                     .clickable { onManualSync() },
                             ) {
                                 Text(
-                                    text = if (syncedDomainsCount > 0) "Sync cookies" else "Sync session",
+                                    text = if (storedCookieCount > 0) "Sync forever vault" else "Sync session",
                                     style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
                                     color = Color.White,
                                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),

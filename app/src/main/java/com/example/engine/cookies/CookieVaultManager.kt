@@ -5,10 +5,15 @@ import android.webkit.CookieManager
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
 import com.pulse.blackhole.data.vault.SessionVaultManager
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -29,12 +34,16 @@ data class StoredCookieEntry(
     val value: String,
     val httpOnly: Boolean = false,
 ) {
-    fun isExpired(nowMs: Long = System.currentTimeMillis()): Boolean {
+    fun isExpired(
+        nowMs: Long = System.currentTimeMillis(),
+        respectExpiry: Boolean = true,
+    ): Boolean {
+        if (!respectExpiry) return false
         return expiresAtMs in 1L until nowMs
     }
 
-    fun matches(url: HttpUrl): Boolean {
-        if (isExpired()) return false
+    fun matches(url: HttpUrl, respectExpiry: Boolean = true): Boolean {
+        if (isExpired(respectExpiry = respectExpiry)) return false
         if (secure && !url.isHttps) return false
         val host = url.host.lowercase()
         val targetDomain = domain.lowercase().trimStart('.')
@@ -50,13 +59,19 @@ data class StoredCookieEntry(
             path == "/"
     }
 
-    fun toOkHttpCookie(): Cookie? {
+    fun toOkHttpCookie(keepForever: Boolean = true): Cookie? {
         return runCatching {
+            val nowMs = System.currentTimeMillis()
+            val effectiveExpiry = when {
+                keepForever && (expiresAtMs <= nowMs) -> nowMs + TEN_YEARS_MS
+                expiresAtMs > 0L -> expiresAtMs
+                else -> nowMs + TEN_YEARS_MS
+            }
             val builder = Cookie.Builder()
                 .name(name)
                 .value(value)
                 .path(path.ifBlank { "/" })
-                .expiresAt(if (expiresAtMs > 0L) expiresAtMs else Long.MAX_VALUE)
+                .expiresAt(effectiveExpiry)
             if (includeSubdomains) {
                 builder.domain(domain.trimStart('.'))
             } else {
@@ -67,17 +82,30 @@ data class StoredCookieEntry(
             builder.build()
         }.getOrNull()
     }
+
+    companion object {
+        const val TEN_YEARS_MS = 315_360_000_000L
+    }
 }
 
 class CookieVaultManager private constructor(private val appContext: Context) {
 
     private val mutex = Mutex()
+    private val vaultScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var debouncedPersistJob: Job? = null
+
     val sessionVault = SessionVaultManager(appContext)
     private val legacyPlaintextFile = File(appContext.filesDir, "blackhole_cookies_vault.json")
     private val cookieCache = ConcurrentHashMap<String, MutableList<StoredCookieEntry>>()
 
     private val _syncedDomains = MutableStateFlow<List<String>>(emptyList())
     val syncedDomains: StateFlow<List<String>> = _syncedDomains.asStateFlow()
+
+    private val _storedCookieCount = MutableStateFlow(0)
+    val storedCookieCount: StateFlow<Int> = _storedCookieCount.asStateFlow()
+
+    private val _keepForeverEnabled = MutableStateFlow(sessionVault.isPermanentLockEnabled())
+    val keepForeverEnabled: StateFlow<Boolean> = _keepForeverEnabled.asStateFlow()
 
     init {
         loadFromDiskSync()
@@ -87,33 +115,56 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         return sessionVault.hasActiveSession() || cookieCache.values.any { it.isNotEmpty() }
     }
 
+    fun setKeepForeverEnabled(enabled: Boolean) {
+        _keepForeverEnabled.value = enabled
+        sessionVault.setPermanentLockEnabled(enabled)
+        vaultScope.launch {
+            mutex.withLock {
+                persistToDisk()
+            }
+        }
+    }
+
     val okHttpCookieJar: CookieJar = object : CookieJar {
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
             if (cookies.isEmpty()) return
+            val permanentMode = _keepForeverEnabled.value
+            val nowMs = System.currentTimeMillis()
             val entries = cookies.map { c ->
+                val rawExp = if (c.persistent) c.expiresAt else 0L
+                val safeExp = if (permanentMode && rawExp <= nowMs) {
+                    nowMs + StoredCookieEntry.TEN_YEARS_MS
+                } else {
+                    rawExp
+                }
                 StoredCookieEntry(
                     domain = c.domain,
                     includeSubdomains = !c.hostOnly,
                     path = c.path,
                     secure = c.secure,
-                    expiresAtMs = if (c.persistent) c.expiresAt else 0L,
+                    expiresAtMs = safeExp,
                     name = c.name,
                     value = c.value,
                     httpOnly = c.httpOnly,
                 )
             }
-            mergeEntriesSync(entries)
+            val changed = mergeEntriesSync(entries)
+            if (changed) {
+                scheduleDebouncedPersist(immediate = entries.any { isProtectedSessionCookie(it.name) })
+            }
         }
 
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
+            val permanentMode = _keepForeverEnabled.value
+            val respectExpiry = !permanentMode
             val matched = mutableListOf<Cookie>()
             val seenNames = mutableSetOf<String>()
 
-            // 1. Vault cookies (imported cookies.txt + synced WebView cookies)
+            // 1. Vault cookies (imported cookies.txt + synced WebView cookies + persisted OkHttp cookies)
             cookieCache.values.flatten()
-                .filter { it.matches(url) }
+                .filter { it.matches(url, respectExpiry = respectExpiry) }
                 .forEach { entry ->
-                    entry.toOkHttpCookie()?.let { okCookie ->
+                    entry.toOkHttpCookie(keepForever = permanentMode)?.let { okCookie ->
                         if (seenNames.add("${okCookie.name}@${okCookie.domain}")) {
                             matched.add(okCookie)
                         }
@@ -146,6 +197,16 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         }
     }
 
+    private fun scheduleDebouncedPersist(immediate: Boolean) {
+        debouncedPersistJob?.cancel()
+        debouncedPersistJob = vaultScope.launch {
+            if (!immediate) delay(350L)
+            mutex.withLock {
+                persistToDisk()
+            }
+        }
+    }
+
     suspend fun importNetscapeCookiesTxt(rawContent: String): Int = withContext(Dispatchers.IO) {
         val parsed = parseCookiesText(rawContent)
         if (parsed.isEmpty()) return@withContext 0
@@ -153,46 +214,83 @@ class CookieVaultManager private constructor(private val appContext: Context) {
             mergeEntriesSync(parsed)
             persistToDisk()
         }
+        restoreVaultCookiesToWebView()
         parsed.size
+    }
+
+    /**
+     * Pushes all permanently saved AES-256 cookies back into Android WebView's CookieManager
+     * so users only need to log in ONCE even if WebView cache clears or after restarts/updates.
+     */
+    suspend fun restoreVaultCookiesToWebView(): Int {
+        val snapshot = cookieCache.values.flatten()
+        if (snapshot.isEmpty()) return 0
+
+        val permanentMode = _keepForeverEnabled.value
+        val respectExpiry = !permanentMode
+        val validEntries = snapshot.filter {
+            !it.isExpired(respectExpiry = respectExpiry) && it.value.isNotBlank()
+        }
+        if (validEntries.isEmpty()) return 0
+
+        return withContext(Dispatchers.Main) {
+            var restored = 0
+            runCatching {
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
+                val nowSec = System.currentTimeMillis() / 1000L
+
+                validEntries.forEach { entry ->
+                    val bareDomain = entry.domain.trimStart('.')
+                    if (bareDomain.isBlank() || entry.name.isBlank()) return@forEach
+                    val scheme = if (entry.secure) "https" else "https"
+                    val targetUrl = "$scheme://$bareDomain/"
+                    val path = entry.path.ifBlank { "/" }
+                    val maxAgeSec = when {
+                        permanentMode || entry.expiresAtMs <= 0L -> TEN_YEARS_SECONDS
+                        else -> ((entry.expiresAtMs / 1000L) - nowSec).coerceAtLeast(3600L)
+                    }
+                    val cookieLine = buildString {
+                        append("${entry.name}=${entry.value}")
+                        if (entry.includeSubdomains) {
+                            append("; Domain=.$bareDomain")
+                        }
+                        append("; Path=$path")
+                        append("; Max-Age=$maxAgeSec")
+                        if (entry.secure) append("; Secure")
+                    }
+                    cookieManager.setCookie(targetUrl, cookieLine)
+                    restored++
+                }
+                cookieManager.flush()
+            }
+            restored
+        }
     }
 
     suspend fun syncFromWebView(url: String): Int = withContext(Dispatchers.Main) {
         val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(true)
         cookieManager.flush()
 
-        val candidateUrls = linkedSetOf(url)
-        val lower = url.lowercase()
-        when {
-            lower.contains("instagram") || lower.contains("instagr.am") -> {
-                candidateUrls.add("https://www.instagram.com/")
-                candidateUrls.add("https://i.instagram.com/")
-                candidateUrls.add("https://instagram.com/")
-            }
-            lower.contains("facebook") || lower.contains("fb.") -> {
-                candidateUrls.add("https://www.facebook.com/")
-                candidateUrls.add("https://m.facebook.com/")
-                candidateUrls.add("https://facebook.com/")
-            }
-            lower.contains("youtube") || lower.contains("google") || lower.contains("youtu.be") -> {
-                candidateUrls.add("https://www.youtube.com/")
-                candidateUrls.add("https://youtube.com/")
-                candidateUrls.add("https://accounts.google.com/")
-            }
-            lower.contains("tiktok") -> {
-                candidateUrls.add("https://www.tiktok.com/")
-                candidateUrls.add("https://m.tiktok.com/")
-            }
-            lower.contains("twitter") || lower.contains("x.com") -> {
-                candidateUrls.add("https://x.com/")
-                candidateUrls.add("https://twitter.com/")
-            }
+        val candidateUrls = linkedSetOf<String>()
+        if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
+            candidateUrls.add(url)
         }
+        // Always sweep primary social/video domains + SSO origins so a single sign-in
+        // locks all related session cookies safely into the AES-256 vault forever.
+        candidateUrls.addAll(KNOWN_PLATFORM_COOKIE_URLS)
 
         val collected = mutableListOf<StoredCookieEntry>()
         val seenKeys = mutableSetOf<String>()
+        val permanentExpiryMs = if (_keepForeverEnabled.value) {
+            System.currentTimeMillis() + StoredCookieEntry.TEN_YEARS_MS
+        } else {
+            0L
+        }
 
         candidateUrls.forEach { target ->
-            val rawHeader = cookieManager.getCookie(target).orEmpty()
+            val rawHeader = runCatching { cookieManager.getCookie(target) }.getOrNull().orEmpty()
             if (rawHeader.isBlank()) return@forEach
             val host = runCatching { java.net.URI(target).host.orEmpty() }.getOrDefault("")
             if (host.isBlank()) return@forEach
@@ -203,7 +301,7 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                 if (idx <= 0) return@forEach
                 val name = segment.substring(0, idx).trim()
                 val value = segment.substring(idx + 1).trim()
-                if (name.isBlank()) return@forEach
+                if (name.isBlank() || isInvalidClearedValue(value)) return@forEach
                 val dedupKey = "$normalizedDomain:$name"
                 if (seenKeys.add(dedupKey)) {
                     collected.add(
@@ -212,7 +310,7 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                             includeSubdomains = true,
                             path = "/",
                             secure = target.startsWith("https://", ignoreCase = true),
-                            expiresAtMs = 0L,
+                            expiresAtMs = permanentExpiryMs,
                             name = name,
                             value = value,
                         ),
@@ -236,21 +334,28 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         val clean = host.lowercase().trimStart('.')
         return when {
             clean == "instagram.com" || clean.endsWith(".instagram.com") -> "instagram.com"
+            clean == "cdninstagram.com" || clean.endsWith(".cdninstagram.com") -> "cdninstagram.com"
             clean == "facebook.com" || clean.endsWith(".facebook.com") -> "facebook.com"
+            clean == "fbcdn.net" || clean.endsWith(".fbcdn.net") -> "fbcdn.net"
             clean == "youtube.com" || clean.endsWith(".youtube.com") -> "youtube.com"
+            clean == "google.com" || clean.endsWith(".google.com") -> "google.com"
             clean == "tiktok.com" || clean.endsWith(".tiktok.com") -> "tiktok.com"
             clean == "x.com" || clean.endsWith(".x.com") -> "x.com"
             clean == "twitter.com" || clean.endsWith(".twitter.com") -> "twitter.com"
+            clean == "reddit.com" || clean.endsWith(".reddit.com") -> "reddit.com"
+            clean == "vimeo.com" || clean.endsWith(".vimeo.com") -> "vimeo.com"
+            clean == "twitch.tv" || clean.endsWith(".twitch.tv") -> "twitch.tv"
             else -> clean.removePrefix("www.").removePrefix("m.")
         }
     }
 
     suspend fun clearAllCookies() = withContext(Dispatchers.IO) {
+        debouncedPersistJob?.cancel()
         mutex.withLock {
             cookieCache.clear()
             sessionVault.clearVault()
             if (legacyPlaintextFile.exists()) legacyPlaintextFile.delete()
-            _syncedDomains.value = emptyList()
+            refreshFlowCounters()
         }
         withContext(Dispatchers.Main) {
             runCatching {
@@ -308,12 +413,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
 
     fun getTikTokExtractionCommand(targetUrl: String): List<String> {
         return buildExtractionCommand(targetUrl, sessionVault)
-    }
-
-    private fun writeCookiesToTempFile(cookiesContent: String): String {
-        val tempFile = File.createTempFile("session_cookies", ".txt", appContext.cacheDir)
-        tempFile.writeText(cookiesContent)
-        return tempFile.absolutePath
     }
 
     fun getCookieHeaderForUrl(url: String): String {
@@ -412,18 +511,63 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         return entries
     }
 
-    private fun mergeEntriesSync(entries: List<StoredCookieEntry>) {
-        entries.forEach { entry ->
+    private fun mergeEntriesSync(entries: List<StoredCookieEntry>): Boolean {
+        val permanentMode = _keepForeverEnabled.value
+        val respectExpiry = !permanentMode
+        val nowMs = System.currentTimeMillis()
+        var mutated = false
+
+        entries.forEach { rawEntry ->
+            val entry = if (permanentMode && rawEntry.expiresAtMs <= nowMs) {
+                rawEntry.copy(expiresAtMs = nowMs + StoredCookieEntry.TEN_YEARS_MS)
+            } else {
+                rawEntry
+            }
             val key = entry.domain.lowercase().trimStart('.')
             val list = cookieCache.getOrPut(key) { mutableListOf() }
             synchronized(list) {
+                val existing = list.firstOrNull {
+                    it.name == entry.name && it.path == entry.path
+                }
+
+                // Never let an empty/"deleted" anonymous response wipe out a protected login cookie
+                if (isInvalidClearedValue(entry.value) &&
+                    existing != null &&
+                    !isInvalidClearedValue(existing.value) &&
+                    (permanentMode || isProtectedSessionCookie(entry.name))
+                ) {
+                    return@synchronized
+                }
+
+                if (existing != null &&
+                    existing.value == entry.value &&
+                    existing.secure == entry.secure &&
+                    existing.httpOnly == entry.httpOnly &&
+                    existing.expiresAtMs >= entry.expiresAtMs
+                ) {
+                    return@synchronized
+                }
+
                 list.removeAll { it.name == entry.name && it.path == entry.path }
-                if (!entry.isExpired()) {
+                if (!entry.isExpired(nowMs = nowMs, respectExpiry = respectExpiry) &&
+                    !isInvalidClearedValue(entry.value)
+                ) {
                     list.add(entry)
+                    mutated = true
                 }
             }
         }
-        _syncedDomains.value = cookieCache.keys.sorted()
+        refreshFlowCounters()
+        return mutated
+    }
+
+    private fun refreshFlowCounters() {
+        val nonEmptyKeys = cookieCache.entries
+            .filter { it.value.isNotEmpty() }
+            .map { it.key }
+            .sorted()
+        _syncedDomains.value = nonEmptyKeys
+        _storedCookieCount.value = cookieCache.values.sumOf { it.size }
     }
 
     private fun loadFromDiskSync() {
@@ -468,10 +612,17 @@ class CookieVaultManager private constructor(private val appContext: Context) {
 
     private fun persistToDisk() {
         runCatching {
+            val permanentMode = _keepForeverEnabled.value
+            val respectExpiry = !permanentMode
+            val nowMs = System.currentTimeMillis()
+            val eternalExpSeconds = (nowMs / 1000L) + TEN_YEARS_SECONDS
+
             val sb = StringBuilder("# Netscape HTTP Cookie File\n")
             var written = 0
             cookieCache.values.flatten().forEach { entry ->
-                if (!entry.isExpired()) {
+                if (!entry.isExpired(nowMs = nowMs, respectExpiry = respectExpiry) &&
+                    !isInvalidClearedValue(entry.value)
+                ) {
                     val domainField = if (entry.includeSubdomains && !entry.domain.startsWith(".")) {
                         ".${entry.domain}"
                     } else {
@@ -480,7 +631,11 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                     val prefix = if (entry.httpOnly) "#HttpOnly_" else ""
                     val includeSubField = if (entry.includeSubdomains) "TRUE" else "FALSE"
                     val secureField = if (entry.secure) "TRUE" else "FALSE"
-                    val expSeconds = if (entry.expiresAtMs > 0L) entry.expiresAtMs / 1000L else 0L
+                    val expSeconds = when {
+                        permanentMode && entry.expiresAtMs <= nowMs -> eternalExpSeconds
+                        entry.expiresAtMs > 0L -> entry.expiresAtMs / 1000L
+                        else -> eternalExpSeconds
+                    }
                     sb.append(prefix)
                         .append(domainField).append('\t')
                         .append(includeSubField).append('\t')
@@ -500,7 +655,79 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         }
     }
 
+    private fun isInvalidClearedValue(value: String): Boolean {
+        val v = value.trim()
+        return v.isEmpty() ||
+            v.equals("deleted", ignoreCase = true) ||
+            v.equals("\"\"", ignoreCase = true) ||
+            v.equals("null", ignoreCase = true)
+    }
+
+    private fun isProtectedSessionCookie(name: String): Boolean {
+        return PROTECTED_SESSION_COOKIE_NAMES.contains(name.lowercase())
+    }
+
     companion object {
+        private const val TEN_YEARS_SECONDS = 315_360_000L
+
+        private val KNOWN_PLATFORM_COOKIE_URLS = listOf(
+            "https://www.instagram.com/",
+            "https://i.instagram.com/",
+            "https://instagram.com/",
+            "https://www.facebook.com/",
+            "https://m.facebook.com/",
+            "https://facebook.com/",
+            "https://www.youtube.com/",
+            "https://m.youtube.com/",
+            "https://accounts.google.com/",
+            "https://www.google.com/",
+            "https://www.tiktok.com/",
+            "https://m.tiktok.com/",
+            "https://x.com/",
+            "https://twitter.com/",
+            "https://www.reddit.com/",
+            "https://vimeo.com/",
+            "https://m.twitch.tv/",
+        )
+
+        private val PROTECTED_SESSION_COOKIE_NAMES = setOf(
+            "sessionid",
+            "ds_user_id",
+            "csrftoken",
+            "mid",
+            "ig_did",
+            "rur",
+            "c_user",
+            "xs",
+            "datr",
+            "sb",
+            "fr",
+            "sid",
+            "ssid",
+            "hsid",
+            "apisid",
+            "sapisid",
+            "__secure-1psid",
+            "__secure-3psid",
+            "__secure-1papisid",
+            "__secure-3papisid",
+            "login_info",
+            "ps_l",
+            "ps_n",
+            "sessionid_ss",
+            "sid_tt",
+            "uid_tt",
+            "ttwid",
+            "passport_csrf_token",
+            "auth_token",
+            "ct0",
+            "kdt",
+            "twid",
+            "reddit_session",
+            "token_v2",
+            "vuid",
+        )
+
         @Volatile
         private var INSTANCE: CookieVaultManager? = null
 

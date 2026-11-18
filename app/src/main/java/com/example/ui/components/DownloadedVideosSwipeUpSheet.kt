@@ -112,9 +112,14 @@ fun DownloadedVideosSwipeUpSheet(
     onDeleteVideo: (DownloadedVideoEntity) -> Unit,
     modifier: Modifier = Modifier,
     syncedDomains: List<String> = emptyList(),
+    storedCookieCount: Int = 0,
+    isPermanentCookieLock: Boolean = true,
     vaultStatusMessage: String? = null,
     onAutoSyncCookies: (String) -> Unit = {},
     onManualSyncCookies: (String) -> Unit = {},
+    onRestoreCookiesToBrowser: () -> Unit = {},
+    onTogglePermanentCookieLock: () -> Unit = {},
+    onClearCookies: () -> Unit = {},
     onPullFromBrowser: (String) -> Unit = {},
     onDismissVaultStatus: () -> Unit = {},
 ) {
@@ -186,63 +191,69 @@ fun DownloadedVideosSwipeUpSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color(0xFF0A1019),
-                            ObsidianVoid,
-                        ),
-                    ),
+                    if (showBrowserTab) {
+                        Brush.verticalGradient(
+                            colors = listOf(Color(0xFFF3F4F6), Color(0xFFF3F4F6)),
+                        )
+                    } else {
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0xFF0A1019),
+                                ObsidianVoid,
+                            ),
+                        )
+                    },
                 )
                 .statusBarsPadding()
                 .navigationBarsPadding(),
         ) {
-            // Draggable Sheet Header & Pull-Down Handle
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .pointerInput(Unit) {
-                        val velocityTracker = VelocityTracker()
-                        detectVerticalDragGestures(
-                            onDragStart = { velocityTracker.resetTracking() },
-                            onVerticalDrag = { change, dragAmount ->
-                                change.consume()
-                                velocityTracker.addPosition(change.uptimeMillis, change.position)
-                                onDragByPx(dragAmount)
-                            },
-                            onDragEnd = {
-                                val velocityY = velocityTracker.calculateVelocity().y
-                                onDragFinish(velocityY)
-                            },
-                            onDragCancel = {
-                                onDragFinish(0f)
-                            },
-                        )
-                    }
-                    .padding(horizontal = 18.dp, vertical = if (showBrowserTab) 6.dp else 10.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Box(
+            if (!showBrowserTab) {
+                // Draggable Sheet Header & Pull-Down Handle (hidden when Browser is Full Screen)
+                Column(
                     modifier = Modifier
-                        .width(44.dp)
-                        .height(4.dp)
-                        .clip(CircleShape)
-                        .background(GlassStrokeBright.copy(alpha = 0.45f)),
-                )
-                Spacer(modifier = Modifier.height(if (showBrowserTab) 6.dp else 12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                        .fillMaxWidth()
+                        .pointerInput(Unit) {
+                            val velocityTracker = VelocityTracker()
+                            detectVerticalDragGestures(
+                                onDragStart = { velocityTracker.resetTracking() },
+                                onVerticalDrag = { change, dragAmount ->
+                                    change.consume()
+                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                    onDragByPx(dragAmount)
+                                },
+                                onDragEnd = {
+                                    val velocityY = velocityTracker.calculateVelocity().y
+                                    onDragFinish(velocityY)
+                                },
+                                onDragCancel = {
+                                    onDragFinish(0f)
+                                },
+                            )
+                        }
+                        .padding(horizontal = 18.dp, vertical = 10.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = if (showBrowserTab) "IN-APP BROWSER" else "DOWNLOADED VIDEOS",
-                            style = if (showBrowserTab) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
-                            color = ChromeSilver,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        if (!showBrowserTab) {
+                    Box(
+                        modifier = Modifier
+                            .width(44.dp)
+                            .height(4.dp)
+                            .clip(CircleShape)
+                            .background(GlassStrokeBright.copy(alpha = 0.45f)),
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "DOWNLOADED VIDEOS",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = ChromeSilver,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                             Text(
                                 text = "${videos.size} LOCAL VAULT ${if (videos.size == 1) "CAPTURE" else "CAPTURES"}",
                                 style = MaterialTheme.typography.labelSmall,
@@ -251,51 +262,51 @@ fun DownloadedVideosSwipeUpSheet(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Surface(
-                            color = if (showBrowserTab) NeonCyan.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.06f),
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                width = 0.85.dp,
-                                color = if (showBrowserTab) NeonCyan.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.3f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable { showBrowserTab = !showBrowserTab }
-                                .minimumInteractiveComponentSize()
-                                .testTag("downloaded_sheet_browser_toggle"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Surface(
+                                color = Color.White.copy(alpha = 0.06f),
+                                shape = RoundedCornerShape(50),
+                                border = BorderStroke(
+                                    width = 0.85.dp,
+                                    color = GlassStrokeBright.copy(alpha = 0.3f),
+                                ),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .clickable { showBrowserTab = true }
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("downloaded_sheet_browser_toggle"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Public,
+                                        contentDescription = "Open full-screen browser",
+                                        tint = ChromeSilver,
+                                        modifier = Modifier.size(15.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = "BROWSER",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = ChromeSilver,
+                                    )
+                                }
+                            }
+
+                            IconButton(
+                                onClick = onCollapse,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("collapse_videos_sheet_button"),
                             ) {
                                 Icon(
-                                    imageVector = if (showBrowserTab) Icons.Outlined.Movie else Icons.Outlined.Public,
-                                    contentDescription = if (showBrowserTab) "Show downloaded videos" else "Open in-app browser",
-                                    tint = if (showBrowserTab) NeonCyan else ChromeSilver,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = if (showBrowserTab) "VIDEOS" else "BROWSER",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (showBrowserTab) NeonCyan else ChromeSilver,
+                                    imageVector = Icons.Rounded.KeyboardArrowDown,
+                                    contentDescription = "Swipe down to close videos",
+                                    tint = ChromeSilver,
                                 )
                             }
-                        }
-
-                        IconButton(
-                            onClick = onCollapse,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("collapse_videos_sheet_button"),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.KeyboardArrowDown,
-                                contentDescription = "Swipe down to close videos",
-                                tint = ChromeSilver,
-                            )
                         }
                     }
                 }
@@ -309,13 +320,19 @@ fun DownloadedVideosSwipeUpSheet(
                 ) {
                     DownloadedVideosBrowserPanel(
                         syncedDomains = syncedDomains,
+                        storedCookieCount = storedCookieCount,
+                        isPermanentCookieLock = isPermanentCookieLock,
                         statusMessage = vaultStatusMessage,
                         onAutoSyncCookies = onAutoSyncCookies,
                         onManualSyncCookies = onManualSyncCookies,
+                        onRestoreCookiesToBrowser = onRestoreCookiesToBrowser,
+                        onTogglePermanentCookieLock = onTogglePermanentCookieLock,
+                        onClearCookies = onClearCookies,
                         onPullCurrentPage = { pageUrl ->
                             onPullFromBrowser(pageUrl)
                             onCollapse()
                         },
+                        onExitBrowser = { showBrowserTab = false },
                         onDismissStatus = onDismissVaultStatus,
                         onBindWebViewRef = { embeddedWebView = it },
                     )

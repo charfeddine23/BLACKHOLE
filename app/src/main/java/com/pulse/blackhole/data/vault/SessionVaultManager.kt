@@ -2,14 +2,21 @@ package com.pulse.blackhole.data.vault
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.security.crypto.EncryptedFile
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import org.json.JSONArray
 import java.io.File
+import java.nio.charset.StandardCharsets
 
+/**
+ * Hardware-backed AES-256-GCM persistent cookie vault with atomic commits and redundant
+ * encrypted backup so user login sessions remain locked safely forever ("login once only").
+ */
 class SessionVaultManager(context: Context) {
 
     private val appContext = context.applicationContext
+    private val vaultLock = Any()
 
     private val masterKey: MasterKey by lazy {
         MasterKey.Builder(appContext)
@@ -21,6 +28,9 @@ class SessionVaultManager(context: Context) {
         createEncryptedPrefs()
     }
 
+    private val backupVaultFile: File
+        get() = File(appContext.filesDir, BACKUP_ENCRYPTED_FILE_NAME)
+
     private fun createEncryptedPrefs(): SharedPreferences {
         return try {
             EncryptedSharedPreferences.create(
@@ -31,43 +41,111 @@ class SessionVaultManager(context: Context) {
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
         } catch (_: Exception) {
-            // Recover cleanly if Keystore key material became invalid after backup/reinstall
+            val recoveredFromBackup = readFromEncryptedBackupFile()
             runCatching {
                 val prefsFile = File(appContext.filesDir.parentFile, "shared_prefs/$PREFS_NAME.xml")
                 if (prefsFile.exists()) prefsFile.delete()
             }
-            EncryptedSharedPreferences.create(
+            val recreated = EncryptedSharedPreferences.create(
                 appContext,
                 PREFS_NAME,
                 masterKey,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
+            if (!recoveredFromBackup.isNullOrBlank()) {
+                recreated.edit()
+                    .putString(KEY_COOKIES_CONTENT, recoveredFromBackup)
+                    .putLong(KEY_LAST_SAVED_MS, System.currentTimeMillis())
+                    .commit()
+            }
+            recreated
         }
     }
 
-    // حفظ ملف الـ Cookies المستورد
+    /**
+     * Encrypts and commits cookies synchronously to both AES-256 SharedPreferences and the
+     * redundant AES-256 EncryptedFile backup so sessions survive app updates, reboots, and kills.
+     */
     fun saveCookies(cookiesText: String) {
         val normalized = normalizeToNetscapeFormat(cookiesText)
-        sharedPreferences.edit().putString(KEY_COOKIES_CONTENT, normalized).apply()
+        if (normalized.isBlank()) return
+        synchronized(vaultLock) {
+            sharedPreferences.edit()
+                .putString(KEY_COOKIES_CONTENT, normalized)
+                .putLong(KEY_LAST_SAVED_MS, System.currentTimeMillis())
+                .commit()
+            writeToEncryptedBackupFile(normalized)
+        }
     }
 
-    // استرجاع الـ Cookies لحقنها في محرك التحميل
+    /**
+     * Retrieves encrypted cookies from primary vault, transparently recovering from the
+     * redundant AES-256 backup file if primary preferences were unavailable.
+     */
     fun getCookies(): String? {
-        return sharedPreferences.getString(KEY_COOKIES_CONTENT, null)
+        synchronized(vaultLock) {
+            val primary = runCatching {
+                sharedPreferences.getString(KEY_COOKIES_CONTENT, null)
+            }.getOrNull()
+            if (!primary.isNullOrBlank()) return primary
+
+            val backup = readFromEncryptedBackupFile()
+            if (!backup.isNullOrBlank()) {
+                runCatching {
+                    sharedPreferences.edit()
+                        .putString(KEY_COOKIES_CONTENT, backup)
+                        .commit()
+                }
+                return backup
+            }
+            return null
+        }
     }
 
-    // التحقق هل خزنة الجلسات تحتوي على بيانات صالحة
+    fun isPermanentLockEnabled(): Boolean {
+        return synchronized(vaultLock) {
+            runCatching {
+                sharedPreferences.getBoolean(KEY_PERMANENT_LOCK, true)
+            }.getOrDefault(true)
+        }
+    }
+
+    fun setPermanentLockEnabled(enabled: Boolean) {
+        synchronized(vaultLock) {
+            sharedPreferences.edit()
+                .putBoolean(KEY_PERMANENT_LOCK, enabled)
+                .commit()
+        }
+    }
+
+    fun getLastSavedTimestampMs(): Long {
+        return synchronized(vaultLock) {
+            runCatching {
+                sharedPreferences.getLong(KEY_LAST_SAVED_MS, 0L)
+            }.getOrDefault(0L)
+        }
+    }
+
     fun hasActiveSession(): Boolean {
         return !getCookies().isNullOrBlank()
     }
 
-    // مسح الجلسة
     fun clearVault() {
-        sharedPreferences.edit().remove(KEY_COOKIES_CONTENT).apply()
-        runCatching {
-            val tempFile = File(appContext.cacheDir, COOKIE_TEMP_FILE_NAME)
-            if (tempFile.exists()) tempFile.delete()
+        synchronized(vaultLock) {
+            runCatching {
+                sharedPreferences.edit()
+                    .remove(KEY_COOKIES_CONTENT)
+                    .remove(KEY_LAST_SAVED_MS)
+                    .commit()
+            }
+            runCatching {
+                if (backupVaultFile.exists()) backupVaultFile.delete()
+            }
+            runCatching {
+                val tempFile = File(appContext.cacheDir, COOKIE_TEMP_FILE_NAME)
+                if (tempFile.exists()) tempFile.delete()
+            }
         }
     }
 
@@ -83,7 +161,7 @@ class SessionVaultManager(context: Context) {
     }
 
     /**
-     * Writes stored Netscape-format cookies into a private temporary file for CLI/router injection.
+     * Writes stored Netscape-format cookies into a private temporary file for extractor injection.
      */
     fun writeTempNetscapeCookiesFile(targetDir: File = appContext.cacheDir): File? {
         val raw = getCookies()?.trim().orEmpty()
@@ -98,6 +176,43 @@ class SessionVaultManager(context: Context) {
         }.getOrNull()
     }
 
+    private fun writeToEncryptedBackupFile(content: String) {
+        runCatching {
+            val staging = File(appContext.filesDir, "$BACKUP_ENCRYPTED_FILE_NAME.tmp")
+            if (staging.exists()) staging.delete()
+            val encryptedFile = EncryptedFile.Builder(
+                appContext,
+                staging,
+                masterKey,
+                EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB,
+            ).build()
+            encryptedFile.openFileOutput().use { output ->
+                output.write(content.toByteArray(StandardCharsets.UTF_8))
+                output.flush()
+            }
+            if (staging.exists() && staging.length() > 0L) {
+                if (backupVaultFile.exists()) backupVaultFile.delete()
+                staging.renameTo(backupVaultFile)
+            }
+        }
+    }
+
+    private fun readFromEncryptedBackupFile(): String? {
+        return runCatching {
+            val target = backupVaultFile
+            if (!target.exists() || target.length() == 0L) return@runCatching null
+            val encryptedFile = EncryptedFile.Builder(
+                appContext,
+                target,
+                masterKey,
+                EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB,
+            ).build()
+            encryptedFile.openFileInput().use { input ->
+                input.readBytes().toString(StandardCharsets.UTF_8)
+            }.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
     private fun normalizeToNetscapeFormat(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.isBlank()) return ""
@@ -106,6 +221,7 @@ class SessionVaultManager(context: Context) {
         if (trimmed.startsWith("[")) {
             val sb = StringBuilder("# Netscape HTTP Cookie File\n")
             var count = 0
+            val permanentExpSec = (System.currentTimeMillis() / 1000L) + TEN_YEARS_SECONDS
             runCatching {
                 val arr = JSONArray(trimmed)
                 for (i in 0 until arr.length()) {
@@ -120,13 +236,14 @@ class SessionVaultManager(context: Context) {
                     val secure = obj.optBoolean("secure", false)
                     val httpOnly = obj.optBoolean("httpOnly", false)
                     val exp = obj.optDouble("expirationDate", 0.0).toLong()
+                    val effectiveExp = if (exp > 0L) exp else permanentExpSec
                     val prefix = if (httpOnly) "#HttpOnly_" else ""
                     sb.append(prefix)
                         .append(domainField).append('\t')
-                        .append(if (includeSub) "TRUE" else "TRUE").append('\t')
+                        .append("TRUE").append('\t')
                         .append(path).append('\t')
                         .append(if (secure) "TRUE" else "FALSE").append('\t')
-                        .append(if (exp > 0L) exp else 0L).append('\t')
+                        .append(effectiveExp).append('\t')
                         .append(name).append('\t')
                         .append(value).append('\n')
                     count++
@@ -144,7 +261,11 @@ class SessionVaultManager(context: Context) {
 
     companion object {
         private const val PREFS_NAME = "blackhole_secure_vault"
+        private const val BACKUP_ENCRYPTED_FILE_NAME = "blackhole_eternal_vault.enc"
         private const val KEY_COOKIES_CONTENT = "KEY_COOKIES_CONTENT"
+        private const val KEY_PERMANENT_LOCK = "KEY_PERMANENT_LOCK"
+        private const val KEY_LAST_SAVED_MS = "KEY_LAST_SAVED_MS"
         private const val COOKIE_TEMP_FILE_NAME = "blackhole_session_cookies.txt"
+        private const val TEN_YEARS_SECONDS = 315_360_000L
     }
 }

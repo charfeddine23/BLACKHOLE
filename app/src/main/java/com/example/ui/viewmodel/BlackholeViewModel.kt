@@ -42,6 +42,8 @@ data class BlackholeUiState(
     val videoCount: Int = 0,
     val updateState: UpdateCheckState = UpdateCheckState.Idle,
     val syncedDomains: List<String> = emptyList(),
+    val storedCookieCount: Int = 0,
+    val isPermanentCookieLock: Boolean = true,
     val vaultStatusMessage: String? = null,
 )
 
@@ -92,10 +94,14 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     val uiState: StateFlow<BlackholeUiState> = combine(
         coreSnapshotFlow,
         cookieVault.syncedDomains,
+        cookieVault.storedCookieCount,
+        cookieVault.keepForeverEnabled,
         _vaultStatusMessage,
-    ) { base, domains, vaultMsg ->
+    ) { base, domains, cookieCount, keepForever, vaultMsg ->
         base.copy(
             syncedDomains = domains,
+            storedCookieCount = cookieCount,
+            isPermanentCookieLock = keepForever,
             vaultStatusMessage = vaultMsg,
         )
     }.stateIn(
@@ -115,6 +121,9 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         }
         viewModelScope.launch(Dispatchers.IO) {
             appUpdateManager.cleanupInstalledUpdates(context)
+        }
+        viewModelScope.launch {
+            cookieVault.restoreVaultCookiesToWebView()
         }
         refreshClipboardOnLaunch()
         checkForUpdates(force = true)
@@ -303,14 +312,30 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun restoreBrowserCookies() {
+        viewModelScope.launch {
+            cookieVault.restoreVaultCookiesToWebView()
+        }
+    }
+
+    fun togglePermanentCookieLock() {
+        val next = !cookieVault.keepForeverEnabled.value
+        cookieVault.setKeepForeverEnabled(next)
+        _vaultStatusMessage.value = if (next) {
+            "Permanent AES-256 lock ON — login cookies stay saved forever."
+        } else {
+            "Standard cookie expiration enabled."
+        }
+    }
+
     fun syncWebViewSession(url: String, silent: Boolean = false) {
         viewModelScope.launch {
             val syncedCount = cookieVault.syncFromWebView(url)
             if (!silent || syncedCount > 0) {
                 _vaultStatusMessage.value = if (syncedCount > 0) {
-                    "Synced $syncedCount live session cookies into AES-256 Vault."
+                    "Encrypted & saved $syncedCount session cookies forever in AES-256 Vault."
                 } else {
-                    "No session cookies captured yet — complete login first, then tap Sync."
+                    "No session cookies captured yet — sign in once, then tap Sync."
                 }
             }
         }
@@ -319,7 +344,7 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     fun clearAllCookies() {
         viewModelScope.launch {
             cookieVault.clearAllCookies()
-            _vaultStatusMessage.value = "Session Vault cleared."
+            _vaultStatusMessage.value = "Encrypted Cookie Vault cleared."
         }
     }
 
