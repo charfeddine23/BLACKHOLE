@@ -273,12 +273,20 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
+    fun resolveNativeMobileUserAgent(ctx: android.content.Context): String {
+        return runCatching {
+            WebSettings.getDefaultUserAgent(ctx)
+                .replace("; wv)", ")")
+                .replace("Version/4.0 ", "")
+        }.getOrElse { ClientSpoofer.ANDROID_CHROME_USER_AGENT }
+    }
+
     fun applyDesktopSettings(wv: WebView, desktop: Boolean) {
         wv.settings.apply {
             userAgentString = if (desktop) {
                 ClientSpoofer.CHROME_DESKTOP_USER_AGENT
             } else {
-                ClientSpoofer.ANDROID_CHROME_USER_AGENT
+                resolveNativeMobileUserAgent(wv.context)
             }
             useWideViewPort = true
             loadWithOverviewMode = true
@@ -721,6 +729,7 @@ fun DownloadedVideosBrowserPanel(
                                 (existing.parent as? ViewGroup)?.removeView(existing)
                                 return@AndroidView existing
                             }
+                            CookieManager.getInstance().setAcceptCookie(true)
                             WebView(ctx).apply {
                                 layoutParams = FrameLayout.LayoutParams(
                                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -732,8 +741,11 @@ fun DownloadedVideosBrowserPanel(
 
                                 settings.apply {
                                     javaScriptEnabled = true
+                                    javaScriptCanOpenWindowsAutomatically = true
+                                    setSupportMultipleWindows(false)
                                     domStorageEnabled = true
                                     databaseEnabled = true
+                                    cacheMode = WebSettings.LOAD_DEFAULT
                                     useWideViewPort = true
                                     loadWithOverviewMode = true
                                     setSupportZoom(true)
@@ -744,7 +756,7 @@ fun DownloadedVideosBrowserPanel(
                                     userAgentString = if (isDesktopMode) {
                                         ClientSpoofer.CHROME_DESKTOP_USER_AGENT
                                     } else {
-                                        ClientSpoofer.ANDROID_CHROME_USER_AGENT
+                                        resolveNativeMobileUserAgent(ctx)
                                     }
                                 }
 
@@ -765,10 +777,6 @@ fun DownloadedVideosBrowserPanel(
                                         favicon: android.graphics.Bitmap?,
                                     ) {
                                         super.onPageStarted(view, url, favicon)
-                                        val loadingUrl = url.orEmpty()
-                                        if (loadingUrl.startsWith("http", ignoreCase = true)) {
-                                            onAutoSyncCookies(loadingUrl)
-                                        }
                                     }
 
                                     override fun onScaleChanged(
@@ -788,8 +796,16 @@ fun DownloadedVideosBrowserPanel(
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
-                                        CookieManager.getInstance().flush()
+                                        val cm = CookieManager.getInstance()
+                                        cm.flush()
                                         val loaded = url.orEmpty()
+                                        if (loaded.contains("CookieMismatch", ignoreCase = true)) {
+                                            cm.setCookie("https://google.com/", "__Host-GAPS=; Path=/; Max-Age=0; Secure")
+                                            cm.setCookie("https://google.com/", "GAPS=; Domain=.google.com; Path=/; Max-Age=0; Secure")
+                                            cm.setCookie("https://accounts.google.com/", "__Host-GAPS=; Path=/; Max-Age=0; Secure")
+                                            cm.setCookie("https://accounts.google.com/", "GAPS=; Path=/; Max-Age=0; Secure")
+                                            cm.flush()
+                                        }
                                         if (loaded.isNotBlank()) {
                                             val pageTitle = view?.title?.takeIf { it.isNotBlank() }
                                                 ?: deriveHostLabel(loaded)
@@ -804,7 +820,9 @@ fun DownloadedVideosBrowserPanel(
                                             if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
                                                 addressText = loaded
                                             }
-                                            onAutoSyncCookies(loaded)
+                                            if (!loaded.contains("CookieMismatch", ignoreCase = true)) {
+                                                onAutoSyncCookies(loaded)
+                                            }
                                         }
                                         view?.evaluateJavascript(
                                             if (isDesktopMode) DESKTOP_VIEWPORT_JS else UNLOCK_VIEWPORT_JS,
