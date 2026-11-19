@@ -1,9 +1,11 @@
 package com.example.ui.screens
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.storage.StorageManager
@@ -41,6 +43,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -113,10 +116,12 @@ import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeViewModel
 import com.example.vault.crypto.VaultOperationStage
 import com.example.vault.data.VaultFileEntry
+import com.example.vault.data.VaultStorageMode
 import com.example.vault.ui.VaultPlaybackSession
 import com.example.vault.ui.VaultTransferUiState
 import com.example.vault.ui.VaultUiState
 import com.example.vault.ui.VaultViewModel
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -238,21 +243,44 @@ fun VaultScreen(
         }
     }
 
+    var pendingPhoneFallbackNotice by remember { mutableStateOf<String?>(null) }
+
+    val legacyWritePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted: Boolean ->
+        vaultViewModel.endExternalSystemFlow()
+        val notice = pendingPhoneFallbackNotice
+        pendingPhoneFallbackNotice = null
+        if (granted) {
+            vaultViewModel.activatePhoneDownloadsVault(notice)
+        } else {
+            vaultViewModel.reportStatusError(
+                "Storage write permission denied. Internal Vault remains active.",
+            )
+        }
+    }
+
+    val switchToPhoneDownloadsVault: (String?) -> Unit = { autoNotice ->
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            vaultViewModel.activatePhoneDownloadsVault(autoNotice)
+        } else {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                vaultViewModel.activatePhoneDownloadsVault(autoNotice)
+            } else {
+                pendingPhoneFallbackNotice = autoNotice
+                vaultViewModel.beginExternalSystemFlow()
+                legacyWritePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        }
+    }
+
     val launchVideoSelection: () -> Unit = {
-        val pm = context.packageManager
         vaultViewModel.beginExternalSystemFlow()
 
-        fun canResolve(intent: Intent): Boolean =
-            runCatching { intent.resolveActivity(pm) != null }.getOrDefault(false)
-
-        val openDocIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "video/*"
-        }
-        val getContentVideoIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "video/*"
-        }
         val actionPickVideoIntent = Intent(
             Intent.ACTION_PICK,
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
@@ -262,43 +290,47 @@ fun VaultScreen(
             type = "*/*"
         }
 
+        val photoPickerAvailable = runCatching {
+            ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(context)
+        }.getOrDefault(false)
+
         val launched = when {
-            canResolve(openDocIntent) && runCatching {
-                openVideoDocumentLauncher.launch(arrayOf("video/*"))
-            }.isSuccess -> true
-
-            canResolve(getContentVideoIntent) && runCatching {
-                getContentVideoLauncher.launch("video/*")
-            }.isSuccess -> true
-
-            canResolve(actionPickVideoIntent) && runCatching {
-                legacyVideoIntentLauncher.launch(actionPickVideoIntent)
-            }.isSuccess -> true
-
-            canResolve(getContentAnyIntent) && runCatching {
-                legacyVideoIntentLauncher.launch(
-                    Intent.createChooser(getContentAnyIntent, "Select Video"),
-                )
-            }.isSuccess -> true
-
-            runCatching {
-                ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(context)
-            }.getOrDefault(false) && runCatching {
+            photoPickerAvailable && runCatching {
                 videoPickerLauncher.launch(
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly),
                 )
             }.isSuccess -> true
 
-            else -> runCatching {
+            runCatching {
+                openVideoDocumentLauncher.launch(arrayOf("video/*"))
+            }.isSuccess -> true
+
+            runCatching {
+                getContentVideoLauncher.launch("video/*")
+            }.isSuccess -> true
+
+            runCatching {
+                legacyVideoIntentLauncher.launch(actionPickVideoIntent)
+            }.isSuccess -> true
+
+            runCatching {
                 legacyVideoIntentLauncher.launch(
-                    Intent.createChooser(getContentVideoIntent, "Select Video"),
+                    Intent.createChooser(getContentAnyIntent, "Select Video"),
                 )
-            }.isSuccess
+            }.isSuccess -> true
+
+            else -> false
         }
 
         if (!launched) {
             vaultViewModel.endExternalSystemFlow()
-            vaultViewModel.reportStatusError("Unable to open phone file picker on this device.")
+            vaultViewModel.reportStatusError(
+                if (uiState.availableDownloadedVideos.isNotEmpty()) {
+                    "System video picker unavailable — tap a downloaded video below to encrypt it into the Vault."
+                } else {
+                    "Unable to open system video picker on this device."
+                },
+            )
         }
     }
 
@@ -364,8 +396,8 @@ fun VaultScreen(
 
         if (!launched) {
             vaultViewModel.endExternalSystemFlow()
-            vaultViewModel.reportStatusError(
-                "No system Files/Documents app found to pick an external folder — Private Internal Vault remains active.",
+            switchToPhoneDownloadsVault(
+                "System SAF picker unavailable on this device — Phone Storage Vault (Download/BlackholeVault) activated automatically.",
             )
         }
     }
@@ -531,8 +563,10 @@ fun VaultScreen(
                         onBack()
                     },
                     onLockNow = vaultViewModel::lockVaultAndWipe,
+                    onSelectPhoneDownloads = { switchToPhoneDownloadsVault(null) },
                     onSelectSafFolder = launchSafFolderSelection,
                     onRevertInternalStorage = vaultViewModel::revertToInternalVaultStorage,
+                    onEncryptDownloadedVideo = vaultViewModel::encryptDownloadedVideo,
                     onCancelTransfer = vaultViewModel::cancelActiveTransfer,
                     onPlayEntry = vaultViewModel::decryptAndPlayEntry,
                     onDeleteEntry = vaultViewModel::deleteEntry,
@@ -732,8 +766,10 @@ private fun VaultUnlockedDashboard(
     uiState: VaultUiState,
     onBack: () -> Unit,
     onLockNow: () -> Unit,
+    onSelectPhoneDownloads: () -> Unit,
     onSelectSafFolder: () -> Unit,
     onRevertInternalStorage: () -> Unit,
+    onEncryptDownloadedVideo: (File) -> Unit,
     onCancelTransfer: () -> Unit,
     onPlayEntry: (VaultFileEntry) -> Unit,
     onDeleteEntry: (VaultFileEntry) -> Unit,
@@ -803,7 +839,7 @@ private fun VaultUnlockedDashboard(
             }
         }
 
-        // Persistent SAF Folder Banner Card
+        // Persistent Storage Mode Banner Card (Phone Downloads / SAF External / Private Internal)
         Surface(
             color = Color(0xFF0E1420),
             shape = RoundedCornerShape(20.dp),
@@ -815,16 +851,14 @@ private fun VaultUnlockedDashboard(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Row(
+                    modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f),
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.FolderOpen,
@@ -833,7 +867,7 @@ private fun VaultUnlockedDashboard(
                         modifier = Modifier.size(22.dp),
                     )
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = uiState.storageLabel,
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
@@ -842,10 +876,13 @@ private fun VaultUnlockedDashboard(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = if (uiState.isExternalSafActive) {
-                                "External SAF folder keeps .bhv files intact."
-                            } else {
-                                "Pick an external SAF folder or use private storage."
+                            text = when (uiState.storageMode) {
+                                VaultStorageMode.PHONE_DOWNLOADS ->
+                                    "Saved directly to phone Download/BlackholeVault folder."
+                                VaultStorageMode.SAF_EXTERNAL ->
+                                    "Custom external SAF folder keeps .bhv files across uninstall."
+                                VaultStorageMode.INTERNAL ->
+                                    "Saved inside private app storage. Switch to Phone Folder anytime."
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MutedSlate,
@@ -853,27 +890,91 @@ private fun VaultUnlockedDashboard(
                         )
                     }
                 }
-                Column(horizontalAlignment = Alignment.End) {
-                    TextButton(
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    VaultStorageChip(
+                        label = "PHONE FOLDER",
+                        selected = uiState.storageMode == VaultStorageMode.PHONE_DOWNLOADS,
+                        accent = EmeraldPulse,
+                        onClick = onSelectPhoneDownloads,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("vault_phone_folder_button"),
+                    )
+                    VaultStorageChip(
+                        label = "PICK SAF",
+                        selected = uiState.storageMode == VaultStorageMode.SAF_EXTERNAL,
+                        accent = NeonCyan,
                         onClick = onSelectSafFolder,
-                        modifier = Modifier.testTag("vault_choose_saf_folder_button"),
-                    ) {
-                        Text(
-                            text = if (uiState.isExternalSafActive) "CHANGE" else "CHOOSE SAF",
-                            color = NeonCyan,
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                        )
-                    }
-                    if (uiState.isExternalSafActive) {
-                        Text(
-                            text = "Use Internal",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MutedSlate,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("vault_choose_saf_folder_button"),
+                    )
+                    VaultStorageChip(
+                        label = "INTERNAL",
+                        selected = uiState.storageMode == VaultStorageMode.INTERNAL,
+                        accent = PlasmaViolet,
+                        onClick = onRevertInternalStorage,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("vault_internal_folder_button"),
+                    )
+                }
+            }
+        }
+
+        // Inline Quick Import Strip from Blackhole Downloaded Videos
+        if (uiState.availableDownloadedVideos.isNotEmpty() && uiState.transferState is VaultTransferUiState.Idle) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "ENCRYPT FROM DOWNLOADED VIDEOS (${uiState.availableDownloadedVideos.size})",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = NeonCyan,
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp),
+                )
+                LazyRow(
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(uiState.availableDownloadedVideos.take(10), key = { it.absolutePath }) { file ->
+                        Surface(
+                            color = Color(0xFF101928),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.45f)),
                             modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable { onRevertInternalStorage() }
-                                .padding(horizontal = 8.dp, vertical = 2.dp),
-                        )
+                                .clip(RoundedCornerShape(14.dp))
+                                .clickable { onEncryptDownloadedVideo(file) }
+                                .minimumInteractiveComponentSize()
+                                .testTag("vault_import_download_${file.name}"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Lock,
+                                    contentDescription = "Encrypt ${file.name}",
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = file.nameWithoutExtension,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = ChromeSilver,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.widthIn(max = 160.dp),
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1101,7 +1202,7 @@ private fun EncryptedVaultFileCard(
                     )
                     Spacer(modifier = Modifier.height(3.dp))
                     Text(
-                        text = "${if (entry.isSafExternal) "SAF .bhv" else "Internal .bhv"} · ${formatVaultMb(entry.sizeBytes)} · ${formatVaultDate(entry.lastModifiedMs)}",
+                        text = "${if (entry.isSafExternal) "External .bhv" else "Internal .bhv"} · ${formatVaultMb(entry.sizeBytes)} · ${formatVaultDate(entry.lastModifiedMs)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                         maxLines = 1,
@@ -1260,6 +1361,43 @@ private tailrec fun Context.findFragmentActivity(): FragmentActivity? = when (th
     is FragmentActivity -> this
     is ContextWrapper -> baseContext.findFragmentActivity()
     else -> null
+}
+
+@Composable
+private fun VaultStorageChip(
+    label: String,
+    selected: Boolean,
+    accent: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = if (selected) accent.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.04f),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(
+            0.85.dp,
+            if (selected) accent else GlassStrokeBright.copy(alpha = 0.22f),
+        ),
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onClick() }
+            .minimumInteractiveComponentSize(),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 10.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                ),
+                color = if (selected) accent else ChromeSilver,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
 }
 
 private fun formatVaultMb(bytes: Long): String {

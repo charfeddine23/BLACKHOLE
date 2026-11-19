@@ -8,6 +8,7 @@ import com.example.vault.crypto.UltraVaultEngine
 import com.example.vault.crypto.VaultOperationStage
 import com.example.vault.data.SafVaultRepository
 import com.example.vault.data.VaultFileEntry
+import com.example.vault.data.VaultStorageMode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,8 +43,10 @@ data class VaultUiState(
     val isLocked: Boolean = true,
     val biometricVerified: Boolean = false,
     val isExternalSafActive: Boolean = false,
+    val storageMode: VaultStorageMode = VaultStorageMode.INTERNAL,
     val storageLabel: String = "Private Internal Vault (App Storage)",
     val entries: List<VaultFileEntry> = emptyList(),
+    val availableDownloadedVideos: List<File> = emptyList(),
     val transferState: VaultTransferUiState = VaultTransferUiState.Idle,
     val statusMessage: String? = null,
     val isErrorStatus: Boolean = false,
@@ -67,12 +70,13 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     init {
         viewModelScope.launch(Dispatchers.IO) {
             UltraVaultEngine.purgeAllDecryptedTempFiles(context)
-            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
             val label = runCatching { repository.getStorageDisplayLabel() }
                 .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
                 it.copy(
-                    isExternalSafActive = isSaf,
+                    isExternalSafActive = mode != VaultStorageMode.INTERNAL,
+                    storageMode = mode,
                     storageLabel = label,
                 )
             }
@@ -105,7 +109,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             }
             wipeSessionPassword()
             sessionPasswordChars = secretChars
-            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
             val label = runCatching { repository.getStorageDisplayLabel() }
                 .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
@@ -114,7 +118,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     biometricVerified = true,
                     statusMessage = noticeMessage,
                     isErrorStatus = false,
-                    isExternalSafActive = isSaf,
+                    isExternalSafActive = mode != VaultStorageMode.INTERNAL,
+                    storageMode = mode,
                     storageLabel = label,
                 )
             }
@@ -146,13 +151,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshEntries() {
         viewModelScope.launch {
             val items = runCatching { repository.listVaultEntries() }.getOrDefault(emptyList())
-            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val downloadedVideos = runCatching { repository.listBlackholeDownloadedVideos() }.getOrDefault(emptyList())
+            val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
             val label = runCatching { repository.getStorageDisplayLabel() }
                 .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
                 it.copy(
                     entries = items,
-                    isExternalSafActive = isSaf,
+                    availableDownloadedVideos = downloadedVideos,
+                    isExternalSafActive = mode != VaultStorageMode.INTERNAL,
+                    storageMode = mode,
                     storageLabel = label,
                 )
             }
@@ -162,12 +170,13 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun onSafDirectorySelected(treeUri: Uri) {
         viewModelScope.launch {
             val persisted = runCatching { repository.persistSafTreeUri(treeUri) }.getOrDefault(false)
-            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
             val label = runCatching { repository.getStorageDisplayLabel() }
                 .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
                 it.copy(
-                    isExternalSafActive = isSaf,
+                    isExternalSafActive = mode != VaultStorageMode.INTERNAL,
+                    storageMode = mode,
                     storageLabel = label,
                     statusMessage = if (persisted) {
                         "External SAF Vault bound. Encrypted .bhv files persist even across app uninstall."
@@ -181,15 +190,39 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun revertToInternalVaultStorage() {
+    fun activatePhoneDownloadsVault(autoFallbackNotice: String? = null) {
         viewModelScope.launch {
-            runCatching { repository.clearSafTreeUri() }
-            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val activated = runCatching { repository.activatePhoneDownloadsVault() }.getOrDefault(false)
+            val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
             val label = runCatching { repository.getStorageDisplayLabel() }
                 .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
                 it.copy(
-                    isExternalSafActive = isSaf,
+                    isExternalSafActive = mode != VaultStorageMode.INTERNAL,
+                    storageMode = mode,
+                    storageLabel = label,
+                    statusMessage = when {
+                        activated && !autoFallbackNotice.isNullOrBlank() -> autoFallbackNotice
+                        activated -> "Phone Storage Vault active (Download/BlackholeVault)."
+                        else -> "Storage write permission is required on Android 9 or earlier to use Download/BlackholeVault."
+                    },
+                    isErrorStatus = !activated,
+                )
+            }
+            refreshEntries()
+        }
+    }
+
+    fun revertToInternalVaultStorage() {
+        viewModelScope.launch {
+            runCatching { repository.clearSafTreeUri() }
+            val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
+            val label = runCatching { repository.getStorageDisplayLabel() }
+                .getOrDefault("Private Internal Vault (App Storage)")
+            _uiState.update {
+                it.copy(
+                    isExternalSafActive = mode != VaultStorageMode.INTERNAL,
+                    storageMode = mode,
                     storageLabel = label,
                     statusMessage = "Switched active vault index back to Private Internal Storage.",
                     isErrorStatus = false,
@@ -197,6 +230,14 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             }
             refreshEntries()
         }
+    }
+
+    fun encryptDownloadedVideo(file: File) {
+        if (!file.exists()) {
+            reportStatusError("Downloaded video file no longer exists.")
+            return
+        }
+        encryptVideoFromPicker(Uri.fromFile(file))
     }
 
     fun encryptVideoFromPicker(sourceUri: Uri) {
