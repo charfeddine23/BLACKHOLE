@@ -276,7 +276,7 @@ fun DownloadedVideosBrowserPanel(
     fun resolveNativeMobileUserAgent(ctx: android.content.Context): String {
         return runCatching {
             WebSettings.getDefaultUserAgent(ctx)
-                .replace("; wv)", ")")
+                .replace(Regex(";\\s*wv\\b"), "")
                 .replace("Version/4.0 ", "")
         }.getOrElse { ClientSpoofer.ANDROID_CHROME_USER_AGENT }
     }
@@ -794,17 +794,43 @@ fun DownloadedVideosBrowserPanel(
                                         }
                                     }
 
+                                    private var retriedGoogleMismatch = false
+
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
                                         val cm = CookieManager.getInstance()
                                         cm.flush()
                                         val loaded = url.orEmpty()
                                         if (loaded.contains("CookieMismatch", ignoreCase = true)) {
-                                            cm.setCookie("https://google.com/", "__Host-GAPS=; Path=/; Max-Age=0; Secure")
-                                            cm.setCookie("https://google.com/", "GAPS=; Domain=.google.com; Path=/; Max-Age=0; Secure")
-                                            cm.setCookie("https://accounts.google.com/", "__Host-GAPS=; Path=/; Max-Age=0; Secure")
-                                            cm.setCookie("https://accounts.google.com/", "GAPS=; Path=/; Max-Age=0; Secure")
+                                            val staleNames = listOf(
+                                                "__Host-GAPS", "GAPS", "LSID", "__Host-1PLSID", "__Host-3PLSID",
+                                                "ACCOUNT_CHOOSER", "SMSV", "OSID", "OTZ", "NID", "AEC", "SOCS", "CONSENT",
+                                            )
+                                            val hostPairs = listOf(
+                                                "https://accounts.google.com/" to null,
+                                                "https://accounts.youtube.com/" to null,
+                                                "https://google.com/" to ".google.com",
+                                                "https://www.google.com/" to ".google.com",
+                                                "https://google.fr/" to ".google.fr",
+                                                "https://www.google.fr/" to ".google.fr",
+                                            )
+                                            hostPairs.forEach { (target, domain) ->
+                                                staleNames.forEach { n ->
+                                                    cm.setCookie(target, "$n=; Path=/; Max-Age=0; Secure")
+                                                    if (domain != null && !n.startsWith("__Host-", true)) {
+                                                        cm.setCookie(target, "$n=; Domain=$domain; Path=/; Max-Age=0; Secure")
+                                                    }
+                                                }
+                                            }
                                             cm.flush()
+                                            if (!retriedGoogleMismatch) {
+                                                retriedGoogleMismatch = true
+                                                view?.clearCache(false)
+                                                view?.post {
+                                                    view.loadUrl("https://accounts.google.com/ServiceLogin?service=youtube")
+                                                }
+                                            }
+                                            return
                                         }
                                         if (loaded.isNotBlank()) {
                                             val pageTitle = view?.title?.takeIf { it.isNotBlank() }
@@ -820,9 +846,7 @@ fun DownloadedVideosBrowserPanel(
                                             if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
                                                 addressText = loaded
                                             }
-                                            if (!loaded.contains("CookieMismatch", ignoreCase = true)) {
-                                                onAutoSyncCookies(loaded)
-                                            }
+                                            onAutoSyncCookies(loaded)
                                         }
                                         view?.evaluateJavascript(
                                             if (isDesktopMode) DESKTOP_VIEWPORT_JS else UNLOCK_VIEWPORT_JS,

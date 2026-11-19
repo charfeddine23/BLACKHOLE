@@ -2,15 +2,15 @@ package com.example
 
 import android.content.Intent
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.fragment.app.FragmentActivity
 import com.example.ui.navigation.BlackholeNavGraph
 import com.example.ui.theme.BlackholeTheme
 import com.example.ui.viewmodel.BlackholeViewModel
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
 
     private val blackholeViewModel: BlackholeViewModel by viewModels()
 

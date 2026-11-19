@@ -127,6 +127,22 @@ class SessionVaultManager(context: Context) {
         }
     }
 
+    fun hasCompletedGoogleCookieResetV3(): Boolean {
+        return synchronized(vaultLock) {
+            runCatching {
+                sharedPreferences.getBoolean(KEY_GOOGLE_COOKIE_RESET_V3, false)
+            }.getOrDefault(false)
+        }
+    }
+
+    fun markGoogleCookieResetV3Done() {
+        synchronized(vaultLock) {
+            sharedPreferences.edit()
+                .putBoolean(KEY_GOOGLE_COOKIE_RESET_V3, true)
+                .commit()
+        }
+    }
+
     fun hasActiveSession(): Boolean {
         return !getCookies().isNullOrBlank()
     }
@@ -265,6 +281,7 @@ class SessionVaultManager(context: Context) {
         private const val KEY_COOKIES_CONTENT = "KEY_COOKIES_CONTENT"
         private const val KEY_PERMANENT_LOCK = "KEY_PERMANENT_LOCK"
         private const val KEY_LAST_SAVED_MS = "KEY_LAST_SAVED_MS"
+        private const val KEY_GOOGLE_COOKIE_RESET_V3 = "KEY_GOOGLE_COOKIE_RESET_V3"
         private const val COOKIE_TEMP_FILE_NAME = "blackhole_session_cookies.txt"
         private const val TEN_YEARS_SECONDS = 315_360_000L
     }

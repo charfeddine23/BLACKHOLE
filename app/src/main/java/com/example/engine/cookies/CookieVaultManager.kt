@@ -220,27 +220,34 @@ class CookieVaultManager private constructor(private val appContext: Context) {
 
     /**
      * Pushes missing permanently saved AES-256 cookies back into Android WebView's CookieManager
-     * without overwriting live Chromium cookies or corrupting strict host-only (__Host- / GAPS / LSID) attributes.
+     * without overwriting live Chromium cookies or touching Google's native Sign-In handshake cookies.
      */
     suspend fun restoreVaultCookiesToWebView(): Int {
-        // Purge any legacy entries where a __Host- or accounts-only cookie was wrongly stored under google.com
-        var purgedCorrupt = false
-        listOf("google.com", "youtube.com").forEach { rootKey ->
-            cookieCache[rootKey]?.let { list ->
+        val needsResetV3 = !sessionVault.hasCompletedGoogleCookieResetV3()
+        var cacheCleaned = false
+
+        listOf("google.com", "google.fr", "youtube.com", "accounts.google.com", "accounts.youtube.com").forEach { key ->
+            cookieCache[key]?.let { list ->
                 synchronized(list) {
                     val removed = list.removeAll { entry ->
-                        entry.name.startsWith("__Host-", ignoreCase = true) ||
+                        isTransientGoogleHandshakeCookie(entry.name) ||
+                            entry.name.startsWith("__Host-", ignoreCase = true) ||
                             isGoogleAccountsHostOnlyCookie(entry.name)
                     }
-                    if (removed) purgedCorrupt = true
+                    if (removed) cacheCleaned = true
                 }
             }
         }
-        if (purgedCorrupt) {
+        if (cacheCleaned) {
             refreshFlowCounters()
             vaultScope.launch {
                 mutex.withLock { persistToDisk() }
             }
+        }
+
+        if (needsResetV3) {
+            resetGoogleWebViewCookies()
+            sessionVault.markGoogleCookieResetV3Done()
         }
 
         val snapshot = cookieCache.values.flatten()
@@ -248,8 +255,14 @@ class CookieVaultManager private constructor(private val appContext: Context) {
 
         val permanentMode = _keepForeverEnabled.value
         val respectExpiry = !permanentMode
-        val validEntries = snapshot.filter {
-            !it.isExpired(respectExpiry = respectExpiry) && it.value.isNotBlank()
+        // Never re-inject Google/accounts handshake cookies into WebView; let Chromium manage Google auth natively.
+        val validEntries = snapshot.filter { entry ->
+            !entry.isExpired(respectExpiry = respectExpiry) &&
+                entry.value.isNotBlank() &&
+                !isTransientGoogleHandshakeCookie(entry.name) &&
+                !entry.domain.startsWith("accounts.", ignoreCase = true) &&
+                !entry.domain.equals("google.com", ignoreCase = true) &&
+                !entry.domain.equals("google.fr", ignoreCase = true)
         }
         if (validEntries.isEmpty()) return 0
 
@@ -258,12 +271,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
             runCatching {
                 val cookieManager = CookieManager.getInstance()
                 cookieManager.setAcceptCookie(true)
-                if (purgedCorrupt) {
-                    cookieManager.setCookie("https://google.com/", "__Host-GAPS=; Path=/; Max-Age=0; Secure")
-                    cookieManager.setCookie("https://google.com/", "GAPS=; Domain=.google.com; Path=/; Max-Age=0; Secure")
-                    cookieManager.setCookie("https://google.com/", "LSID=; Domain=.google.com; Path=/; Max-Age=0; Secure")
-                    cookieManager.flush()
-                }
                 val nowSec = System.currentTimeMillis() / 1000L
                 val liveNamesByUrl = mutableMapOf<String, Set<String>>()
 
@@ -272,7 +279,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                     if (bareDomain.isBlank() || entry.name.isBlank()) return@forEach
                     val targetUrl = "https://$bareDomain/"
 
-                    // Never clobber cookies that Chromium WebView already holds natively on disk
                     val existingNames = liveNamesByUrl.getOrPut(targetUrl) {
                         val raw = runCatching { cookieManager.getCookie(targetUrl) }.getOrNull().orEmpty()
                         if (raw.isBlank()) {
@@ -289,8 +295,7 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                     if (existingNames.contains(entry.name)) return@forEach
 
                     val isStrictHostOnly = entry.name.startsWith("__Host-", ignoreCase = true) ||
-                        !entry.includeSubdomains ||
-                        bareDomain.startsWith("accounts.", ignoreCase = true)
+                        !entry.includeSubdomains
 
                     val path = if (entry.name.startsWith("__Host-", ignoreCase = true)) {
                         "/"
@@ -303,14 +308,13 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                     }
                     val cookieLine = buildString {
                         append("${entry.name}=${entry.value}")
-                        // RFC 6265bis: __Host- and host-only cookies MUST NOT include Domain=
                         if (!isStrictHostOnly && entry.includeSubdomains) {
                             append("; Domain=.$bareDomain")
                         }
                         append("; Path=$path")
                         append("; Max-Age=$maxAgeSec")
                         if (entry.secure || entry.name.startsWith("__Host-", true) || entry.name.startsWith("__Secure-", true)) {
-                            append("; Secure")
+                            append("; Secure; SameSite=None")
                         }
                     }
                     cookieManager.setCookie(targetUrl, cookieLine)
@@ -324,6 +328,37 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         }
     }
 
+    suspend fun resetGoogleWebViewCookies() = withContext(Dispatchers.Main) {
+        runCatching {
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            val staleNames = listOf(
+                "__Host-GAPS", "GAPS", "LSID", "__Host-1PLSID", "__Host-3PLSID",
+                "ACCOUNT_CHOOSER", "SMSV", "OSID", "OTZ", "NID", "AEC", "SOCS",
+                "CONSENT", "1P_JAR", "__Secure-ENID", "DV", "UULE",
+            )
+            val targetHosts = listOf(
+                "https://accounts.google.com/" to null,
+                "https://accounts.youtube.com/" to null,
+                "https://google.com/" to ".google.com",
+                "https://www.google.com/" to ".google.com",
+                "https://google.fr/" to ".google.fr",
+                "https://www.google.fr/" to ".google.fr",
+                "https://youtube.com/" to ".youtube.com",
+                "https://m.youtube.com/" to ".youtube.com",
+            )
+            targetHosts.forEach { (url, domain) ->
+                staleNames.forEach { name ->
+                    cm.setCookie(url, "$name=; Path=/; Max-Age=0; Secure")
+                    if (domain != null && !name.startsWith("__Host-", true)) {
+                        cm.setCookie(url, "$name=; Domain=$domain; Path=/; Max-Age=0; Secure")
+                    }
+                }
+            }
+            cm.flush()
+        }
+    }
+
     suspend fun syncFromWebView(url: String): Int = withContext(Dispatchers.Main) {
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
@@ -332,8 +367,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
             candidateUrls.add(url)
         }
-        // Always sweep primary social/video domains + SSO origins so a single sign-in
-        // locks all related session cookies safely into the AES-256 vault forever.
         candidateUrls.addAll(KNOWN_PLATFORM_COOKIE_URLS)
 
         val collected = mutableListOf<StoredCookieEntry>()
@@ -356,9 +389,11 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                 val name = segment.substring(0, idx).trim()
                 val value = segment.substring(idx + 1).trim()
                 if (name.isBlank() || isInvalidClearedValue(value)) return@forEach
+                if (isTransientGoogleHandshakeCookie(name) || isGoogleAccountsHostOnlyCookie(name)) {
+                    return@forEach
+                }
 
                 val isHostOnly = name.startsWith("__Host-", ignoreCase = true) ||
-                    isGoogleAccountsHostOnlyCookie(name) ||
                     host.startsWith("accounts.", ignoreCase = true)
 
                 val cookieDomain = if (isHostOnly) host else normalizeRootDomain(host)
@@ -397,7 +432,14 @@ class CookieVaultManager private constructor(private val appContext: Context) {
             name.equals("LSID", ignoreCase = true) ||
             name.equals("ACCOUNT_CHOOSER", ignoreCase = true) ||
             name.equals("SMSV", ignoreCase = true) ||
-            name.equals("OSID", ignoreCase = true)
+            name.equals("OSID", ignoreCase = true) ||
+            name.equals("__Host-GAPS", ignoreCase = true) ||
+            name.equals("__Host-1PLSID", ignoreCase = true) ||
+            name.equals("__Host-3PLSID", ignoreCase = true)
+    }
+
+    private fun isTransientGoogleHandshakeCookie(name: String): Boolean {
+        return TRANSIENT_GOOGLE_HANDSHAKE_COOKIES.contains(name.lowercase())
     }
 
     private fun normalizeRootDomain(host: String): String {
@@ -742,6 +784,27 @@ class CookieVaultManager private constructor(private val appContext: Context) {
     companion object {
         private const val TEN_YEARS_SECONDS = 315_360_000L
 
+        private val TRANSIENT_GOOGLE_HANDSHAKE_COOKIES = setOf(
+            "gaps",
+            "__host-gaps",
+            "lsid",
+            "__host-1plsid",
+            "__host-3plsid",
+            "account_chooser",
+            "smsv",
+            "osid",
+            "otz",
+            "check_cookie",
+            "nid",
+            "aec",
+            "socs",
+            "consent",
+            "1p_jar",
+            "__secure-enid",
+            "uule",
+            "dv",
+        )
+
         private val KNOWN_PLATFORM_COOKIE_URLS = listOf(
             "https://www.instagram.com/",
             "https://i.instagram.com/",
@@ -751,7 +814,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
             "https://facebook.com/",
             "https://www.youtube.com/",
             "https://m.youtube.com/",
-            "https://accounts.google.com/",
             "https://www.google.com/",
             "https://www.tiktok.com/",
             "https://m.tiktok.com/",

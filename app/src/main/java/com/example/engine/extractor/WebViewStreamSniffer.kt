@@ -49,13 +49,19 @@ class WebViewStreamSniffer(
                 cookieManager.setAcceptCookie(true)
                 cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-                // Inject stored cookies from CookieVaultManager into WebView before loading
-                val storedHeader = cookieVault.getCookieHeaderForUrl(targetUrl)
-                if (storedHeader.isNotBlank()) {
-                    storedHeader.split(";").forEach { cookiePair ->
-                        cookieManager.setCookie(targetUrl, cookiePair.trim())
+                // Only seed CookieManager from vault if live WebView lacks cookies for this URL
+                // (prevents corrupting Google/YouTube SameSite/HttpOnly/__Host- cookies)
+                val existingLive = cookieManager.getCookie(targetUrl)
+                val isGoogleFamily = targetUrl.contains("google.", ignoreCase = true) ||
+                    targetUrl.contains("youtube.com", ignoreCase = true)
+                if (existingLive.isNullOrBlank() && !isGoogleFamily) {
+                    val storedHeader = cookieVault.getCookieHeaderForUrl(targetUrl)
+                    if (storedHeader.isNotBlank()) {
+                        storedHeader.split(";").forEach { cookiePair ->
+                            cookieManager.setCookie(targetUrl, "${cookiePair.trim()}; Path=/; Secure")
+                        }
+                        cookieManager.flush()
                     }
-                    cookieManager.flush()
                 }
 
                 fun finish(loginGate: Boolean) {
