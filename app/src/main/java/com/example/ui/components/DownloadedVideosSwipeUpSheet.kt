@@ -22,14 +22,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -75,6 +77,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -125,6 +128,14 @@ fun DownloadedVideosSwipeUpSheet(
     onDismissVaultStatus: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
+    val cutoutTop = with(density) { WindowInsets.displayCutout.getTop(density).toDp() }
+    val statusTop = with(density) { WindowInsets.statusBars.getTop(density).toDp() }
+    val safeTopInset = maxOf(cutoutTop + 6.dp, statusTop, 32.dp)
+    val cutoutBottom = with(density) { WindowInsets.displayCutout.getBottom(density).toDp() }
+    val navBottom = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
+    val safeBottomInset = maxOf(cutoutBottom, navBottom, 12.dp)
+
     val gridState = rememberLazyGridState()
     var previewingVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
     var showBrowserTab by remember { mutableStateOf(false) }
@@ -266,8 +277,7 @@ fun DownloadedVideosSwipeUpSheet(
                         )
                     },
                 )
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                .padding(top = safeTopInset, bottom = safeBottomInset),
         ) {
             if (!showBrowserTab) {
                 // Sheet Header & Pull-Down Handle (hidden when Browser is Full Screen)
@@ -688,12 +698,23 @@ private fun InlineVideoPlayerView(
         }
     }
 
+    val playerDensity = LocalDensity.current
+    val playerTopInset = maxOf(
+        with(playerDensity) { WindowInsets.displayCutout.getTop(playerDensity).toDp() } + 6.dp,
+        with(playerDensity) { WindowInsets.statusBars.getTop(playerDensity).toDp() },
+        32.dp,
+    )
+    val playerBottomInset = maxOf(
+        with(playerDensity) { WindowInsets.displayCutout.getBottom(playerDensity).toDp() },
+        with(playerDensity) { WindowInsets.navigationBars.getBottom(playerDensity).toDp() },
+        12.dp,
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
+            .padding(top = playerTopInset, bottom = playerBottomInset),
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(

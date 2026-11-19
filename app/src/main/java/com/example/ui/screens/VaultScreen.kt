@@ -3,8 +3,10 @@ package com.example.ui.screens
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.MediaStore
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -26,13 +28,14 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -79,6 +82,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -168,8 +172,8 @@ fun VaultScreen(
         }
     }
 
-    val videoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia(),
+    val openVideoDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
@@ -177,8 +181,31 @@ fun VaultScreen(
         }
     }
 
-    val openVideoDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
+    val getContentVideoLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { selectedUri: Uri? ->
+        vaultViewModel.endExternalSystemFlow()
+        if (selectedUri != null) {
+            vaultViewModel.encryptVideoFromPicker(selectedUri)
+        }
+    }
+
+    val legacyVideoIntentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        vaultViewModel.endExternalSystemFlow()
+        val selectedUri = if (result.resultCode == Activity.RESULT_OK) {
+            result.data?.data ?: result.data?.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+        } else {
+            null
+        }
+        if (selectedUri != null) {
+            vaultViewModel.encryptVideoFromPicker(selectedUri)
+        }
+    }
+
+    val videoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
@@ -196,36 +223,84 @@ fun VaultScreen(
     }
 
     val launchVideoSelection: () -> Unit = {
+        val pm = context.packageManager
         vaultViewModel.beginExternalSystemFlow()
-        val launched = runCatching {
-            if (ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(context)) {
+
+        fun canResolve(intent: Intent): Boolean =
+            runCatching { intent.resolveActivity(pm) != null }.getOrDefault(false)
+
+        val openDocIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/*"
+        }
+        val getContentVideoIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/*"
+        }
+        val actionPickVideoIntent = Intent(
+            Intent.ACTION_PICK,
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+        )
+        val getContentAnyIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+
+        val launched = when {
+            canResolve(openDocIntent) && runCatching {
+                openVideoDocumentLauncher.launch(arrayOf("video/*"))
+            }.isSuccess -> true
+
+            canResolve(getContentVideoIntent) && runCatching {
+                getContentVideoLauncher.launch("video/*")
+            }.isSuccess -> true
+
+            canResolve(actionPickVideoIntent) && runCatching {
+                legacyVideoIntentLauncher.launch(actionPickVideoIntent)
+            }.isSuccess -> true
+
+            canResolve(getContentAnyIntent) && runCatching {
+                legacyVideoIntentLauncher.launch(
+                    Intent.createChooser(getContentAnyIntent, "Select Video"),
+                )
+            }.isSuccess -> true
+
+            runCatching {
+                ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(context)
+            }.getOrDefault(false) && runCatching {
                 videoPickerLauncher.launch(
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly),
                 )
-            } else {
-                openVideoDocumentLauncher.launch(arrayOf("video/*"))
-            }
-        }.isSuccess
+            }.isSuccess -> true
+
+            else -> runCatching {
+                legacyVideoIntentLauncher.launch(
+                    Intent.createChooser(getContentVideoIntent, "Select Video"),
+                )
+            }.isSuccess
+        }
 
         if (!launched) {
-            val fallbackOk = runCatching {
-                openVideoDocumentLauncher.launch(arrayOf("video/*"))
-            }.isSuccess
-            if (!fallbackOk) {
-                vaultViewModel.endExternalSystemFlow()
-                vaultViewModel.reportStatusError("No video file picker available on this device.")
-            }
+            vaultViewModel.endExternalSystemFlow()
+            vaultViewModel.reportStatusError("Unable to open phone file picker on this device.")
         }
     }
 
     val launchSafFolderSelection: () -> Unit = {
+        val pm = context.packageManager
+        val treeIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        val resolvable = runCatching { treeIntent.resolveActivity(pm) != null }.getOrDefault(false)
         vaultViewModel.beginExternalSystemFlow()
-        val ok = runCatching {
-            safFolderLauncher.launch(null)
-        }.isSuccess
+        val ok = if (resolvable) {
+            runCatching { safFolderLauncher.launch(null) }.isSuccess
+        } else {
+            false
+        }
         if (!ok) {
             vaultViewModel.endExternalSystemFlow()
-            vaultViewModel.reportStatusError("System folder picker unavailable on this device.")
+            vaultViewModel.reportStatusError(
+                "External SAF folder picker is not available on this device — Private Internal Vault remains active.",
+            )
         }
     }
 
@@ -313,6 +388,14 @@ fun VaultScreen(
         }
     }
 
+    val density = LocalDensity.current
+    val cutoutTop = with(density) { WindowInsets.displayCutout.getTop(density).toDp() }
+    val statusTop = with(density) { WindowInsets.statusBars.getTop(density).toDp() }
+    val safeTopInset = maxOf(cutoutTop + 8.dp, statusTop, 36.dp)
+    val cutoutBottom = with(density) { WindowInsets.displayCutout.getBottom(density).toDp() }
+    val navBottom = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
+    val safeBottomInset = maxOf(cutoutBottom, navBottom, 16.dp)
+
     Scaffold(
         modifier = modifier
             .fillMaxSize()
@@ -326,7 +409,7 @@ fun VaultScreen(
                     containerColor = NeonCyan,
                     contentColor = ObsidianVoid,
                     modifier = Modifier
-                        .navigationBarsPadding()
+                        .padding(bottom = safeBottomInset)
                         .testTag("vault_add_video_fab"),
                 ) {
                     Icon(
@@ -361,8 +444,7 @@ fun VaultScreen(
                         center = Offset(size.width * 0.5f, size.height * 0.35f),
                     )
                 }
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                .padding(top = safeTopInset, bottom = safeBottomInset),
         ) {
             if (uiState.isLocked) {
                 VaultLockedGate(

@@ -208,8 +208,13 @@ class SafVaultRepository(context: Context) {
         password: CharArray,
     ): Flow<VaultOperationProgress> = flow {
         val meta = resolveSourceMetadata(sourceUri)
-        val inputStream = appContext.contentResolver.openInputStream(sourceUri)
-            ?: throw IllegalStateException("Unable to open selected video stream.")
+        val inputStream = if (sourceUri.scheme.equals("file", ignoreCase = true)) {
+            val filePath = sourceUri.path ?: throw IllegalStateException("Invalid selected file path.")
+            File(filePath).inputStream()
+        } else {
+            appContext.contentResolver.openInputStream(sourceUri)
+                ?: throw IllegalStateException("Unable to open selected video stream.")
+        }
 
         val itemId = "bhv_${UUID.randomUUID().toString().replace("-", "").take(16)}"
         val finalName = "$itemId$VAULT_EXT"
@@ -356,6 +361,17 @@ class SafVaultRepository(context: Context) {
     }
 
     private fun resolveSourceMetadata(uri: Uri): VaultMediaMetadata {
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            val file = uri.path?.let(::File)
+            val name = file?.name?.takeIf { it.isNotBlank() }
+                ?: "vault_video_${System.currentTimeMillis()}.mp4"
+            val size = file?.takeIf { it.exists() }?.length() ?: 0L
+            return VaultMediaMetadata(
+                originalName = name,
+                mimeType = "video/mp4",
+                originalSizeBytes = size,
+            )
+        }
         var displayName = "vault_video_${System.currentTimeMillis()}.mp4"
         var sizeBytes = 0L
         runCatching {

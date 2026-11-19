@@ -25,13 +25,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -341,13 +342,23 @@ private fun BlackholeScreenContent(
                     },
                 contentAlignment = Alignment.Center,
             ) {
+                val cutoutTopDp = with(density) { WindowInsets.displayCutout.getTop(density).toDp() }
+                val statusTopDp = with(density) { WindowInsets.statusBars.getTop(density).toDp() }
+                val safeTopInset = maxOf(cutoutTopDp, statusTopDp, 44.dp)
+                val cutoutBottomDp = with(density) { WindowInsets.displayCutout.getBottom(density).toDp() }
+                val navBottomDp = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
+                val safeBottomInset = maxOf(cutoutBottomDp, navBottomDp, 22.dp)
+
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .widthIn(max = 600.dp)
-                        .statusBarsPadding()
-                        .navigationBarsPadding()
-                        .padding(horizontal = 24.dp, vertical = 16.dp),
+                        .padding(
+                            start = 24.dp,
+                            end = 24.dp,
+                            top = safeTopInset + 18.dp,
+                            bottom = safeBottomInset + 14.dp,
+                        ),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.SpaceBetween,
                 ) {
@@ -392,6 +403,7 @@ private fun BlackholeScreenContent(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
+                            .padding(top = 12.dp)
                             .nestedScroll(homeNestedScroll)
                             .verticalScroll(scrollState),
                         horizontalAlignment = Alignment.CenterHorizontally,
