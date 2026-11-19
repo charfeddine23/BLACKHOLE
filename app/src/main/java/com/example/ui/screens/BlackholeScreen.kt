@@ -49,8 +49,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -93,6 +96,7 @@ import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeUiState
 import com.example.ui.viewmodel.BlackholeViewModel
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -217,11 +221,16 @@ private fun BlackholeScreenContent(
                 with(density) { maxHeight.toPx().coerceAtLeast(1f) }
             }
 
+            var liveDragProgress by remember { mutableFloatStateOf(0f) }
+            var dragStartedOpen by remember { mutableStateOf(false) }
+
             val snapDrawer: (Boolean) -> Unit = remember(coroutineScope) {
                 { shouldOpen ->
+                    val target = if (shouldOpen) 1f else 0f
+                    liveDragProgress = target
                     coroutineScope.launch {
                         drawerProgress.animateTo(
-                            targetValue = if (shouldOpen) 1f else 0f,
+                            targetValue = target,
                             animationSpec = spring(
                                 dampingRatio = 0.86f,
                                 stiffness = Spring.StiffnessMediumLow,
@@ -231,10 +240,18 @@ private fun BlackholeScreenContent(
                 }
             }
 
+            val beginDrag: () -> Unit = remember {
+                {
+                    liveDragProgress = drawerProgress.value
+                    dragStartedOpen = liveDragProgress > 0.5f
+                }
+            }
+
             val applyDragDeltaPx: (Float) -> Unit = remember(coroutineScope, maxHeightPx) {
                 { deltaY ->
-                    coroutineScope.launch {
-                        val next = (drawerProgress.value - deltaY / maxHeightPx).coerceIn(0f, 1f)
+                    val next = (liveDragProgress - deltaY / maxHeightPx).coerceIn(0f, 1f)
+                    liveDragProgress = next
+                    coroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
                         drawerProgress.snapTo(next)
                     }
                 }
@@ -242,11 +259,12 @@ private fun BlackholeScreenContent(
 
             val finishDragWithVelocity: (Float) -> Unit = remember(snapDrawer) {
                 { velocityY ->
-                    val current = drawerProgress.value
+                    val current = liveDragProgress
                     val shouldOpen = when {
-                        velocityY < -420f -> true
-                        velocityY > 420f -> false
-                        else -> current > 0.25f
+                        velocityY < -220f -> true
+                        velocityY > 220f -> false
+                        dragStartedOpen -> current > 0.82f
+                        else -> current > 0.18f
                     }
                     snapDrawer(shouldOpen)
                 }
@@ -288,7 +306,10 @@ private fun BlackholeScreenContent(
                     .pointerInput(maxHeightPx) {
                         val velocityTracker = VelocityTracker()
                         detectVerticalDragGestures(
-                            onDragStart = { velocityTracker.resetTracking() },
+                            onDragStart = {
+                                velocityTracker.resetTracking()
+                                beginDrag()
+                            },
                             onVerticalDrag = { change, dragAmount ->
                                 change.consume()
                                 velocityTracker.addPosition(change.uptimeMillis, change.position)
@@ -416,6 +437,7 @@ private fun BlackholeScreenContent(
                     videos = videos,
                     drawerProgress = drawerProgress.value,
                     maxHeightPx = maxHeightPx,
+                    onDragStart = beginDrag,
                     onDragByPx = applyDragDeltaPx,
                     onDragFinish = finishDragWithVelocity,
                     onCollapse = { snapDrawer(false) },

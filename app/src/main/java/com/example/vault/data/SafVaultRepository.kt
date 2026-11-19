@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Base64
 import androidx.documentfile.provider.DocumentFile
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -13,10 +14,14 @@ import com.example.vault.crypto.VaultMediaMetadata
 import com.example.vault.crypto.VaultOperationProgress
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.security.SecureRandom
 import java.util.UUID
 
 data class VaultFileEntry(
@@ -32,33 +37,46 @@ data class VaultFileEntry(
 class SafVaultRepository(context: Context) {
 
     private val appContext = context.applicationContext
+    private val prefsLock = Any()
 
-    private val masterKey: MasterKey by lazy {
-        MasterKey.Builder(appContext)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-    }
+    @Volatile
+    private var cachedPrefs: SharedPreferences? = null
 
-    private val securePrefs: SharedPreferences by lazy {
-        runCatching {
-            EncryptedSharedPreferences.create(
-                appContext,
-                VAULT_PREFS_NAME,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
-        }.getOrElse {
-            runCatching {
-                File(appContext.filesDir.parentFile, "shared_prefs/$VAULT_PREFS_NAME.xml").delete()
+    private fun getSecurePrefs(): SharedPreferences {
+        cachedPrefs?.let { return it }
+        return synchronized(prefsLock) {
+            cachedPrefs?.let { return it }
+            val created = runCatching {
+                val masterKey = MasterKey.Builder(appContext)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+                EncryptedSharedPreferences.create(
+                    appContext,
+                    VAULT_PREFS_NAME,
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+                )
+            }.recoverCatching {
+                runCatching {
+                    File(appContext.filesDir.parentFile, "shared_prefs/$VAULT_PREFS_NAME.xml").delete()
+                }
+                val masterKey = MasterKey.Builder(appContext)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+                EncryptedSharedPreferences.create(
+                    appContext,
+                    VAULT_PREFS_NAME,
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+                )
+            }.getOrElse {
+                // Safe private fallback if OEM KeyStore/Tink is corrupted or unavailable
+                appContext.getSharedPreferences(VAULT_FALLBACK_PREFS_NAME, Context.MODE_PRIVATE)
             }
-            EncryptedSharedPreferences.create(
-                appContext,
-                VAULT_PREFS_NAME,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
+            cachedPrefs = created
+            created
         }
     }
 
@@ -67,56 +85,79 @@ class SafVaultRepository(context: Context) {
             if (!exists()) mkdirs()
         }
 
-    fun getSafTreeUri(): Uri? {
-        val raw = securePrefs.getString(KEY_SAF_TREE_URI, null) ?: return null
-        val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return null
-        val hasPersistedPerm = appContext.contentResolver.persistedUriPermissions.any { perm ->
-            perm.uri == uri && perm.isReadPermission && perm.isWritePermission
+    suspend fun getOrCreateBiometricVaultSecret(): CharArray = withContext(Dispatchers.IO) {
+        val prefs = getSecurePrefs()
+        val existing = prefs.getString(KEY_BIOMETRIC_MASTER_SECRET, null)
+        if (!existing.isNullOrBlank()) {
+            return@withContext existing.toCharArray()
         }
-        val doc = DocumentFile.fromTreeUri(appContext, uri)
-        if (!hasPersistedPerm || doc == null || !doc.exists() || !doc.canWrite()) {
+        val randomBytes = ByteArray(32)
+        SecureRandom().nextBytes(randomBytes)
+        val encoded = Base64.encodeToString(randomBytes, Base64.NO_WRAP)
+        randomBytes.fill(0)
+        prefs.edit().putString(KEY_BIOMETRIC_MASTER_SECRET, encoded).commit()
+        encoded.toCharArray()
+    }
+
+    suspend fun getSafTreeUri(): Uri? = withContext(Dispatchers.IO) {
+        getSafTreeUriBlocking()
+    }
+
+    private fun getSafTreeUriBlocking(): Uri? {
+        val raw = getSecurePrefs().getString(KEY_SAF_TREE_URI, null) ?: return null
+        val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return null
+        val hasPersistedPerm = runCatching {
+            appContext.contentResolver.persistedUriPermissions.any { perm ->
+                perm.uri == uri && perm.isReadPermission && perm.isWritePermission
+            }
+        }.getOrDefault(false)
+        val doc = runCatching { DocumentFile.fromTreeUri(appContext, uri) }.getOrNull()
+        val writable = runCatching { doc != null && doc.exists() && doc.canWrite() }.getOrDefault(false)
+        if (!hasPersistedPerm || !writable) {
             return null
         }
         return uri
     }
 
-    fun isExternalSafActive(): Boolean = getSafTreeUri() != null
+    suspend fun isExternalSafActive(): Boolean = getSafTreeUri() != null
 
-    fun getStorageDisplayLabel(): String {
-        val uri = getSafTreeUri() ?: return "Private Internal Vault (App Storage)"
+    suspend fun getStorageDisplayLabel(): String = withContext(Dispatchers.IO) {
+        val uri = getSafTreeUriBlocking() ?: return@withContext "Private Internal Vault (App Storage)"
         val docName = runCatching {
             DocumentFile.fromTreeUri(appContext, uri)?.name
         }.getOrNull().orEmpty()
-        return if (docName.isNotBlank()) {
+        if (docName.isNotBlank()) {
             "SAF External: $docName (Survives Uninstall)"
         } else {
             "SAF External Folder (Survives Uninstall)"
         }
     }
 
-    fun persistSafTreeUri(treeUri: Uri): Boolean {
+    suspend fun persistSafTreeUri(treeUri: Uri): Boolean = withContext(Dispatchers.IO) {
         val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
         runCatching {
             appContext.contentResolver.takePersistableUriPermission(treeUri, flags)
         }
-        val doc = DocumentFile.fromTreeUri(appContext, treeUri)
-        if (doc == null || !doc.exists() || !doc.canWrite()) {
-            return false
+        val doc = runCatching { DocumentFile.fromTreeUri(appContext, treeUri) }.getOrNull()
+        val writable = runCatching { doc != null && doc.exists() && doc.canWrite() }.getOrDefault(false)
+        if (!writable) {
+            return@withContext false
         }
-        securePrefs.edit().putString(KEY_SAF_TREE_URI, treeUri.toString()).commit()
-        return true
+        getSecurePrefs().edit().putString(KEY_SAF_TREE_URI, treeUri.toString()).commit()
+        true
     }
 
-    fun clearSafTreeUri() {
-        securePrefs.edit().remove(KEY_SAF_TREE_URI).commit()
+    suspend fun clearSafTreeUri() = withContext(Dispatchers.IO) {
+        getSecurePrefs().edit().remove(KEY_SAF_TREE_URI).commit()
     }
 
     suspend fun listVaultEntries(): List<VaultFileEntry> = withContext(Dispatchers.IO) {
-        val safUri = getSafTreeUri()
+        val prefs = getSecurePrefs()
+        val safUri = getSafTreeUriBlocking()
         if (safUri != null) {
-            val tree = DocumentFile.fromTreeUri(appContext, safUri)
-            if (tree != null && tree.exists()) {
-                val files = tree.listFiles()
+            val tree = runCatching { DocumentFile.fromTreeUri(appContext, safUri) }.getOrNull()
+            if (tree != null && runCatching { tree.exists() }.getOrDefault(false)) {
+                val files = runCatching { tree.listFiles() }.getOrDefault(emptyArray())
                 // Scrub orphaned staging files from prior crashes
                 files.filter { it.name?.endsWith(STAGING_SUFFIX, ignoreCase = true) == true }
                     .forEach { runCatching { it.delete() } }
@@ -125,7 +166,7 @@ class SafVaultRepository(context: Context) {
                     .filter { it.isFile && it.name?.endsWith(VAULT_EXT, ignoreCase = true) == true }
                     .map { doc ->
                         val name = doc.name ?: "vault_item$VAULT_EXT"
-                        val cachedTitle = securePrefs.getString("$KEY_TITLE_PREFIX$name", null)
+                        val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX$name", null)
                         VaultFileEntry(
                             id = name.removeSuffix(VAULT_EXT),
                             fileName = name,
@@ -148,7 +189,7 @@ class SafVaultRepository(context: Context) {
         (dir.listFiles()?.toList() ?: emptyList())
             .filter { it.isFile && it.name.endsWith(VAULT_EXT, ignoreCase = true) }
             .map { file ->
-                val cachedTitle = securePrefs.getString("$KEY_TITLE_PREFIX${file.name}", null)
+                val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX${file.name}", null)
                 VaultFileEntry(
                     id = file.name.removeSuffix(VAULT_EXT),
                     fileName = file.name,
@@ -165,7 +206,7 @@ class SafVaultRepository(context: Context) {
     fun encryptMediaFromUri(
         sourceUri: Uri,
         password: CharArray,
-    ): Flow<VaultOperationProgress> {
+    ): Flow<VaultOperationProgress> = flow {
         val meta = resolveSourceMetadata(sourceUri)
         val inputStream = appContext.contentResolver.openInputStream(sourceUri)
             ?: throw IllegalStateException("Unable to open selected video stream.")
@@ -174,25 +215,34 @@ class SafVaultRepository(context: Context) {
         val finalName = "$itemId$VAULT_EXT"
         val stagingName = "$finalName$STAGING_SUFFIX"
 
-        val safUri = getSafTreeUri()
+        val safUri = getSafTreeUriBlocking()
         if (safUri != null) {
             val tree = DocumentFile.fromTreeUri(appContext, safUri)
-                ?: throw IllegalStateException("External SAF Vault directory unavailable.")
+                ?: run {
+                    runCatching { inputStream.close() }
+                    throw IllegalStateException("External SAF Vault directory unavailable.")
+                }
             val stagingDoc = tree.createFile("application/octet-stream", stagingName)
-                ?: throw IllegalStateException("Failed to create encrypted SAF staging file.")
+                ?: run {
+                    runCatching { inputStream.close() }
+                    throw IllegalStateException("Failed to create encrypted SAF staging file.")
+                }
             val outStream = appContext.contentResolver.openOutputStream(stagingDoc.uri, "w")
                 ?: run {
-                    stagingDoc.delete()
+                    runCatching { stagingDoc.delete() }
+                    runCatching { inputStream.close() }
                     throw IllegalStateException("Failed to open SAF output stream.")
                 }
 
-            return UltraVaultEngine.encryptStream(
+            val streamFlow = UltraVaultEngine.encryptStream(
                 inputStream = inputStream,
                 outputStream = outStream,
                 password = password,
                 metadata = meta,
                 onCommitAtomic = {
-                    val renamed = stagingDoc.renameTo(finalName)
+                    runCatching { outStream.close() }
+                    runCatching { inputStream.close() }
+                    val renamed = runCatching { stagingDoc.renameTo(finalName) }.getOrDefault(false)
                     if (!renamed) {
                         // Fallback for strict OEM DocumentProviders that block renameTo across extensions
                         val committedDoc = tree.createFile("application/octet-stream", finalName)
@@ -203,7 +253,7 @@ class SafVaultRepository(context: Context) {
                                 dst.flush()
                             }
                         }
-                        stagingDoc.delete()
+                        runCatching { stagingDoc.delete() }
                     }
                     cacheEncryptedDisplayTitle(finalName, meta.originalName)
                 },
@@ -213,18 +263,26 @@ class SafVaultRepository(context: Context) {
                     runCatching { inputStream.close() }
                 },
             )
+            emitAll(streamFlow)
         } else {
             val dir = internalVaultDir
             val stagingFile = File(dir, stagingName)
             val finalFile = File(dir, finalName)
-            val outStream: OutputStream = stagingFile.outputStream()
+            val outStream: OutputStream = try {
+                stagingFile.outputStream()
+            } catch (t: Throwable) {
+                runCatching { inputStream.close() }
+                throw t
+            }
 
-            return UltraVaultEngine.encryptStream(
+            val streamFlow = UltraVaultEngine.encryptStream(
                 inputStream = inputStream,
                 outputStream = outStream,
                 password = password,
                 metadata = meta,
                 onCommitAtomic = {
+                    runCatching { outStream.close() }
+                    runCatching { inputStream.close() }
                     if (finalFile.exists()) finalFile.delete()
                     val renamed = stagingFile.renameTo(finalFile)
                     if (!renamed) {
@@ -239,22 +297,29 @@ class SafVaultRepository(context: Context) {
                     runCatching { inputStream.close() }
                 },
             )
+            emitAll(streamFlow)
         }
-    }
+    }.flowOn(Dispatchers.IO)
 
     fun decryptEntryToTempCache(
         entry: VaultFileEntry,
         password: CharArray,
-    ): Flow<VaultOperationProgress> {
+    ): Flow<VaultOperationProgress> = flow {
         val input: InputStream = openEntryInputStream(entry)
             ?: throw IllegalStateException("Encrypted file could not be opened.")
-        return UltraVaultEngine.decryptToTempFile(
-            context = appContext,
-            inputStream = input,
-            encryptedFileLengthHint = entry.sizeBytes,
-            password = password,
-        )
-    }
+        try {
+            emitAll(
+                UltraVaultEngine.decryptToTempFile(
+                    context = appContext,
+                    inputStream = input,
+                    encryptedFileLengthHint = entry.sizeBytes,
+                    password = password,
+                ),
+            )
+        } finally {
+            runCatching { input.close() }
+        }
+    }.flowOn(Dispatchers.IO)
 
     suspend fun deleteEntry(entry: VaultFileEntry): Boolean = withContext(Dispatchers.IO) {
         val deleted = if (entry.isSafExternal) {
@@ -270,14 +335,15 @@ class SafVaultRepository(context: Context) {
             }.getOrDefault(false)
         }
         if (deleted) {
-            securePrefs.edit().remove("$KEY_TITLE_PREFIX${entry.fileName}").commit()
+            getSecurePrefs().edit().remove("$KEY_TITLE_PREFIX${entry.fileName}").commit()
         }
         deleted
     }
 
-    fun cacheEncryptedDisplayTitle(fileName: String, originalTitle: String) {
-        securePrefs.edit().putString("$KEY_TITLE_PREFIX$fileName", originalTitle).commit()
-    }
+    suspend fun cacheEncryptedDisplayTitle(fileName: String, originalTitle: String) =
+        withContext(Dispatchers.IO) {
+            getSecurePrefs().edit().putString("$KEY_TITLE_PREFIX$fileName", originalTitle).commit()
+        }
 
     private fun openEntryInputStream(entry: VaultFileEntry): InputStream? {
         return if (entry.isSafExternal) {
@@ -319,7 +385,9 @@ class SafVaultRepository(context: Context) {
                 }
             }
         }
-        val mime = appContext.contentResolver.getType(uri)?.takeIf { it.isNotBlank() } ?: "video/mp4"
+        val mime = runCatching { appContext.contentResolver.getType(uri) }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() } ?: "video/mp4"
         return VaultMediaMetadata(
             originalName = displayName,
             mimeType = mime,
@@ -329,7 +397,9 @@ class SafVaultRepository(context: Context) {
 
     companion object {
         private const val VAULT_PREFS_NAME = "blackhole_vault_saf_prefs"
+        private const val VAULT_FALLBACK_PREFS_NAME = "blackhole_vault_saf_prefs_fb"
         private const val KEY_SAF_TREE_URI = "KEY_SAF_TREE_URI"
+        private const val KEY_BIOMETRIC_MASTER_SECRET = "KEY_BIOMETRIC_MASTER_SECRET"
         private const val KEY_TITLE_PREFIX = "TITLE_"
         private const val INTERNAL_VAULT_FOLDER = "blackhole_vault"
         private const val VAULT_EXT = ".bhv"

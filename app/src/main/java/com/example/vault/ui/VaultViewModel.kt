@@ -9,12 +9,15 @@ import com.example.vault.crypto.VaultOperationStage
 import com.example.vault.data.SafVaultRepository
 import com.example.vault.data.VaultFileEntry
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 sealed interface VaultTransferUiState {
@@ -52,62 +55,79 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val context = application.applicationContext
     private val repository = SafVaultRepository(context)
 
-    private val _uiState = MutableStateFlow(
-        VaultUiState(
-            isExternalSafActive = repository.isExternalSafActive(),
-            storageLabel = repository.getStorageDisplayLabel(),
-        ),
-    )
+    private val _uiState = MutableStateFlow(VaultUiState())
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
 
     private var sessionPasswordChars: CharArray? = null
     private var activeTransferJob: Job? = null
 
+    @Volatile
+    private var awaitingExternalSystemFlow: Boolean = false
+
     init {
-        UltraVaultEngine.purgeAllDecryptedTempFiles(context)
-    }
-
-    fun markBiometricVerified() {
-        _uiState.update {
-            it.copy(
-                biometricVerified = true,
-                statusMessage = null,
-                isErrorStatus = false,
-            )
-        }
-    }
-
-    fun unlockWithMasterPassword(passwordInput: String) {
-        if (passwordInput.length < 4) {
+        viewModelScope.launch(Dispatchers.IO) {
+            UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val label = runCatching { repository.getStorageDisplayLabel() }
+                .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
                 it.copy(
-                    statusMessage = "Enter a master password (minimum 4 characters) to derive AES-256 keys.",
-                    isErrorStatus = true,
+                    isExternalSafActive = isSaf,
+                    storageLabel = label,
                 )
             }
-            return
         }
-        wipeSessionPassword()
-        sessionPasswordChars = passwordInput.toCharArray()
-        _uiState.update {
-            it.copy(
-                isLocked = false,
-                statusMessage = null,
-                isErrorStatus = false,
-                isExternalSafActive = repository.isExternalSafActive(),
-                storageLabel = repository.getStorageDisplayLabel(),
-            )
+    }
+
+    fun beginExternalSystemFlow() {
+        awaitingExternalSystemFlow = true
+    }
+
+    fun endExternalSystemFlow() {
+        awaitingExternalSystemFlow = false
+    }
+
+    fun isAwaitingExternalSystemFlow(): Boolean = awaitingExternalSystemFlow
+
+    fun unlockAfterBiometricVerification(noticeMessage: String? = null) {
+        viewModelScope.launch {
+            val secretChars = runCatching { repository.getOrCreateBiometricVaultSecret() }.getOrNull()
+            if (secretChars == null) {
+                _uiState.update {
+                    it.copy(
+                        isLocked = true,
+                        biometricVerified = false,
+                        statusMessage = "Unable to initialize Vault key store.",
+                        isErrorStatus = true,
+                    )
+                }
+                return@launch
+            }
+            wipeSessionPassword()
+            sessionPasswordChars = secretChars
+            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val label = runCatching { repository.getStorageDisplayLabel() }
+                .getOrDefault("Private Internal Vault (App Storage)")
+            _uiState.update {
+                it.copy(
+                    isLocked = false,
+                    biometricVerified = true,
+                    statusMessage = noticeMessage,
+                    isErrorStatus = false,
+                    isExternalSafActive = isSaf,
+                    storageLabel = label,
+                )
+            }
+            refreshEntries()
         }
-        refreshEntries()
     }
 
     fun lockVaultAndWipe() {
+        awaitingExternalSystemFlow = false
         activeTransferJob?.cancel()
         activeTransferJob = null
         wipeSessionPassword()
         val currentPlayback = _uiState.value.activePlayback
-        UltraVaultEngine.secureDeleteFile(currentPlayback?.tempFile)
-        UltraVaultEngine.purgeAllDecryptedTempFiles(context)
         _uiState.update {
             it.copy(
                 isLocked = true,
@@ -117,67 +137,89 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 transferState = VaultTransferUiState.Idle,
             )
         }
+        viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+            UltraVaultEngine.secureDeleteFile(currentPlayback?.tempFile)
+            UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+        }
     }
 
     fun refreshEntries() {
         viewModelScope.launch {
             val items = runCatching { repository.listVaultEntries() }.getOrDefault(emptyList())
+            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val label = runCatching { repository.getStorageDisplayLabel() }
+                .getOrDefault("Private Internal Vault (App Storage)")
             _uiState.update {
                 it.copy(
                     entries = items,
-                    isExternalSafActive = repository.isExternalSafActive(),
-                    storageLabel = repository.getStorageDisplayLabel(),
+                    isExternalSafActive = isSaf,
+                    storageLabel = label,
                 )
             }
         }
     }
 
     fun onSafDirectorySelected(treeUri: Uri) {
-        val persisted = repository.persistSafTreeUri(treeUri)
-        _uiState.update {
-            it.copy(
-                isExternalSafActive = repository.isExternalSafActive(),
-                storageLabel = repository.getStorageDisplayLabel(),
-                statusMessage = if (persisted) {
-                    "External SAF Vault bound. Encrypted .bhv files persist even across app uninstall."
-                } else {
-                    "Selected folder is not writable. Keeping previous storage."
-                },
-                isErrorStatus = !persisted,
-            )
+        viewModelScope.launch {
+            val persisted = runCatching { repository.persistSafTreeUri(treeUri) }.getOrDefault(false)
+            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val label = runCatching { repository.getStorageDisplayLabel() }
+                .getOrDefault("Private Internal Vault (App Storage)")
+            _uiState.update {
+                it.copy(
+                    isExternalSafActive = isSaf,
+                    storageLabel = label,
+                    statusMessage = if (persisted) {
+                        "External SAF Vault bound. Encrypted .bhv files persist even across app uninstall."
+                    } else {
+                        "Selected folder is not writable. Keeping previous storage."
+                    },
+                    isErrorStatus = !persisted,
+                )
+            }
+            refreshEntries()
         }
-        refreshEntries()
     }
 
     fun revertToInternalVaultStorage() {
-        repository.clearSafTreeUri()
-        _uiState.update {
-            it.copy(
-                isExternalSafActive = repository.isExternalSafActive(),
-                storageLabel = repository.getStorageDisplayLabel(),
-                statusMessage = "Switched active vault index back to Private Internal Storage.",
-                isErrorStatus = false,
-            )
+        viewModelScope.launch {
+            runCatching { repository.clearSafTreeUri() }
+            val isSaf = runCatching { repository.isExternalSafActive() }.getOrDefault(false)
+            val label = runCatching { repository.getStorageDisplayLabel() }
+                .getOrDefault("Private Internal Vault (App Storage)")
+            _uiState.update {
+                it.copy(
+                    isExternalSafActive = isSaf,
+                    storageLabel = label,
+                    statusMessage = "Switched active vault index back to Private Internal Storage.",
+                    isErrorStatus = false,
+                )
+            }
+            refreshEntries()
         }
-        refreshEntries()
     }
 
     fun encryptVideoFromPicker(sourceUri: Uri) {
-        val pwd = sessionPasswordChars
-        if (pwd == null) {
-            _uiState.update {
-                it.copy(
-                    isLocked = true,
-                    statusMessage = "Vault locked — re-enter master password first.",
-                    isErrorStatus = true,
-                )
-            }
-            return
-        }
         if (activeTransferJob?.isActive == true) return
-
-        val pwdCopy = pwd.copyOf()
         activeTransferJob = viewModelScope.launch {
+            val pwd = sessionPasswordChars ?: runCatching {
+                repository.getOrCreateBiometricVaultSecret()
+            }.getOrNull()?.also {
+                sessionPasswordChars = it
+            }
+
+            if (pwd == null || _uiState.value.isLocked) {
+                _uiState.update {
+                    it.copy(
+                        isLocked = true,
+                        statusMessage = "Verify biometric to unlock Vault first.",
+                        isErrorStatus = true,
+                    )
+                }
+                return@launch
+            }
+
+            val pwdCopy = pwd.copyOf()
             try {
                 repository.encryptMediaFromUri(sourceUri, pwdCopy).collect { progress ->
                     val label = progress.metadata?.originalName ?: "Encrypting video"
@@ -186,7 +228,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                             _uiState.update {
                                 it.copy(
                                     transferState = VaultTransferUiState.Idle,
-                                    statusMessage = "Encrypted '$label' with AES-256-GCM (PBKDF2 210k).",
+                                    statusMessage = "Encrypted '$label' with AES-256-GCM.",
                                     isErrorStatus = false,
                                 )
                             }
@@ -233,11 +275,11 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     fun decryptAndPlayEntry(entry: VaultFileEntry) {
         val pwd = sessionPasswordChars
-        if (pwd == null) {
+        if (pwd == null || _uiState.value.isLocked) {
             _uiState.update {
                 it.copy(
                     isLocked = true,
-                    statusMessage = "Vault locked — unlock with your master password first.",
+                    statusMessage = "Vault locked — verify biometric first.",
                     isErrorStatus = true,
                 )
             }
@@ -296,7 +338,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } catch (_: CancellationException) {
-                UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+                withContext(Dispatchers.IO + NonCancellable) {
+                    UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+                }
                 _uiState.update {
                     it.copy(
                         transferState = VaultTransferUiState.Idle,
@@ -305,11 +349,13 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             } catch (t: Throwable) {
-                UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+                withContext(Dispatchers.IO + NonCancellable) {
+                    UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+                }
                 _uiState.update {
                     it.copy(
                         transferState = VaultTransferUiState.Idle,
-                        statusMessage = t.message ?: "Authentication failed — wrong password or tampered file.",
+                        statusMessage = t.message ?: "Authentication failed — unable to decrypt file.",
                         isErrorStatus = true,
                     )
                 }
@@ -325,9 +371,11 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     fun closePlayerAndWipeTemp() {
         val current = _uiState.value.activePlayback
-        UltraVaultEngine.secureDeleteFile(current?.tempFile)
-        UltraVaultEngine.purgeAllDecryptedTempFiles(context)
         _uiState.update { it.copy(activePlayback = null) }
+        viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+            UltraVaultEngine.secureDeleteFile(current?.tempFile)
+            UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+        }
     }
 
     fun deleteEntry(entry: VaultFileEntry) {
@@ -347,6 +395,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun reportStatusError(message: String) {
+        _uiState.update { it.copy(statusMessage = message, isErrorStatus = true) }
+    }
+
     fun dismissStatus() {
         _uiState.update { it.copy(statusMessage = null, isErrorStatus = false) }
     }
@@ -360,6 +412,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         activeTransferJob?.cancel()
         wipeSessionPassword()
-        UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+        // Run cleanup in a daemon background thread without touching Main Thread during teardown
+        Thread {
+            UltraVaultEngine.purgeAllDecryptedTempFiles(context)
+        }.start()
     }
 }

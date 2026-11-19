@@ -13,7 +13,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -54,30 +55,29 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
@@ -106,6 +106,7 @@ fun DownloadedVideosSwipeUpSheet(
     videos: List<DownloadedVideoEntity>,
     drawerProgress: Float,
     maxHeightPx: Float,
+    onDragStart: () -> Unit = {},
     onDragByPx: (Float) -> Unit,
     onDragFinish: (Float) -> Unit,
     onCollapse: () -> Unit,
@@ -128,6 +129,15 @@ fun DownloadedVideosSwipeUpSheet(
     var previewingVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
     var showBrowserTab by remember { mutableStateOf(false) }
     var embeddedWebView by remember { mutableStateOf<WebView?>(null) }
+    val headerHeightPx = remember { mutableFloatStateOf(0f) }
+
+    val currentShowBrowser by rememberUpdatedState(showBrowserTab)
+    val currentHasPreview by rememberUpdatedState(previewingVideo != null)
+    val currentHasVideos by rememberUpdatedState(videos.isNotEmpty())
+    val currentProgress by rememberUpdatedState(drawerProgress)
+    val currentOnDragStart by rememberUpdatedState(onDragStart)
+    val currentOnDragByPx by rememberUpdatedState(onDragByPx)
+    val currentOnDragFinish by rememberUpdatedState(onDragFinish)
 
     BackHandler(enabled = previewingVideo != null || showBrowserTab || drawerProgress > 0.05f) {
         when {
@@ -138,34 +148,86 @@ fun DownloadedVideosSwipeUpSheet(
         }
     }
 
-    val sheetNestedScroll = remember(maxHeightPx) {
-        object : NestedScrollConnection {
-            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (source != NestedScrollSource.UserInput) return Offset.Zero
-                val atTop = gridState.firstVisibleItemIndex == 0 &&
-                    gridState.firstVisibleItemScrollOffset == 0
-                val isPullingDownFromTop = atTop && available.y > 0f
-                val isMidTransition = drawerProgress < 0.999f
-
-                if (isMidTransition || isPullingDownFromTop) {
-                    onDragByPx(available.y)
-                    return Offset(0f, available.y)
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                if (drawerProgress < 0.999f) {
-                    onDragFinish(available.y)
-                    return available
-                }
-                return Velocity.Zero
-            }
-        }
-    }
-
-    Surface(
+    // Untranslated outer Box catches vertical downward swipes in stationary screen coordinates
+    // so translationY on the sheet Surface never fights or cancels pointer deltas.
+    Box(
         modifier = modifier
+            .fillMaxSize()
+            .pointerInput(gridState) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(
+                        requireUnconsumed = false,
+                        pass = PointerEventPass.Initial,
+                    )
+                    if (currentShowBrowser || currentHasPreview) {
+                        return@awaitEachGesture
+                    }
+
+                    val touchSlop = viewConfiguration.touchSlop
+                    val velocityTracker = VelocityTracker()
+                    velocityTracker.addPosition(down.uptimeMillis, down.position)
+                    val sheetTopPx = ((1f - currentProgress) * maxHeightPx).coerceAtLeast(0f)
+                    val startInHeader = down.position.y <= sheetTopPx + headerHeightPx.floatValue + 48f
+                    var totalDx = 0f
+                    var totalDy = 0f
+                    var decided = false
+                    var draggingSheet = false
+                    var activePointerId = down.id
+
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == activePointerId }
+                            ?: event.changes.firstOrNull()
+                            ?: break
+
+                        if (!change.pressed) {
+                            if (draggingSheet) {
+                                change.consume()
+                                currentOnDragFinish(velocityTracker.calculateVelocity().y)
+                            }
+                            break
+                        }
+
+                        activePointerId = change.id
+                        val delta = change.position - change.previousPosition
+                        totalDx += delta.x
+                        totalDy += delta.y
+                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+
+                        if (!decided) {
+                            val absX = kotlin.math.abs(totalDx)
+                            val absY = kotlin.math.abs(totalDy)
+                            if (absY > touchSlop || absX > touchSlop) {
+                                val isVertical = absY >= absX
+                                val atGridTop = !currentHasVideos || (
+                                    gridState.firstVisibleItemIndex == 0 &&
+                                        gridState.firstVisibleItemScrollOffset == 0
+                                )
+                                val pullingDown = totalDy > 0f
+                                val midSheet = currentProgress < 0.995f
+                                val shouldIntercept = isVertical && (
+                                    startInHeader ||
+                                        midSheet ||
+                                        (pullingDown && atGridTop)
+                                )
+                                decided = true
+                                draggingSheet = shouldIntercept
+                                if (draggingSheet) {
+                                    currentOnDragStart()
+                                    change.consume()
+                                    currentOnDragByPx(totalDy)
+                                }
+                            }
+                        } else if (draggingSheet) {
+                            change.consume()
+                            currentOnDragByPx(delta.y)
+                        }
+                    }
+                }
+            },
+    ) {
+    Surface(
+        modifier = Modifier
             .fillMaxSize()
             .graphicsLayer {
                 translationY = ((1f - drawerProgress) * maxHeightPx).coerceAtLeast(0f)
@@ -208,28 +270,11 @@ fun DownloadedVideosSwipeUpSheet(
                 .navigationBarsPadding(),
         ) {
             if (!showBrowserTab) {
-                // Draggable Sheet Header & Pull-Down Handle (hidden when Browser is Full Screen)
+                // Sheet Header & Pull-Down Handle (hidden when Browser is Full Screen)
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .pointerInput(Unit) {
-                            val velocityTracker = VelocityTracker()
-                            detectVerticalDragGestures(
-                                onDragStart = { velocityTracker.resetTracking() },
-                                onVerticalDrag = { change, dragAmount ->
-                                    change.consume()
-                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
-                                    onDragByPx(dragAmount)
-                                },
-                                onDragEnd = {
-                                    val velocityY = velocityTracker.calculateVelocity().y
-                                    onDragFinish(velocityY)
-                                },
-                                onDragCancel = {
-                                    onDragFinish(0f)
-                                },
-                            )
-                        }
+                        .onSizeChanged { headerHeightPx.floatValue = it.height.toFloat() }
                         .padding(horizontal = 18.dp, vertical = 10.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
@@ -342,21 +387,6 @@ fun DownloadedVideosSwipeUpSheet(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .pointerInput(Unit) {
-                            val velocityTracker = VelocityTracker()
-                            detectVerticalDragGestures(
-                                onDragStart = { velocityTracker.resetTracking() },
-                                onVerticalDrag = { change, dragAmount ->
-                                    change.consume()
-                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
-                                    onDragByPx(dragAmount)
-                                },
-                                onDragEnd = {
-                                    onDragFinish(velocityTracker.calculateVelocity().y)
-                                },
-                                onDragCancel = { onDragFinish(0f) },
-                            )
-                        }
                         .padding(32.dp),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -413,8 +443,7 @@ fun DownloadedVideosSwipeUpSheet(
                 BoxWithConstraints(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxWidth()
-                        .nestedScroll(sheetNestedScroll),
+                        .fillMaxWidth(),
                 ) {
                     val columns = if (maxWidth >= 600.dp) 2 else 1
                     LazyVerticalGrid(
@@ -454,6 +483,7 @@ fun DownloadedVideosSwipeUpSheet(
                 onDismiss = { previewingVideo = null },
             )
         }
+    }
     }
 }
 

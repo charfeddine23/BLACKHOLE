@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.net.Uri
+import android.os.Build
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -15,8 +16,6 @@ import androidx.annotation.OptIn
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -41,24 +40,17 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.FolderOpen
-import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.VerifiedUser
-import androidx.compose.material.icons.rounded.Visibility
-import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -67,8 +59,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -76,6 +66,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,10 +81,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -149,11 +136,20 @@ fun VaultScreen(
         }
     }
 
-    // Auto-lock and scrub decrypted temp cache on backgrounding or leaving screen
+    // Auto-lock and scrub decrypted temp cache on genuine backgrounding or leaving screen,
+    // while ignoring temporary ON_STOP transitions caused by system file/biometric pickers.
     DisposableEffect(lifecycleOwner, vaultViewModel) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
-                vaultViewModel.lockVaultAndWipe()
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    if (!vaultViewModel.isAwaitingExternalSystemFlow()) {
+                        vaultViewModel.lockVaultAndWipe()
+                    }
+                }
+                Lifecycle.Event.ON_RESUME -> {
+                    vaultViewModel.endExternalSystemFlow()
+                }
+                else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -175,6 +171,16 @@ fun VaultScreen(
     val videoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
     ) { selectedUri: Uri? ->
+        vaultViewModel.endExternalSystemFlow()
+        if (selectedUri != null) {
+            vaultViewModel.encryptVideoFromPicker(selectedUri)
+        }
+    }
+
+    val openVideoDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { selectedUri: Uri? ->
+        vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
             vaultViewModel.encryptVideoFromPicker(selectedUri)
         }
@@ -183,8 +189,43 @@ fun VaultScreen(
     val safFolderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree(),
     ) { treeUri: Uri? ->
+        vaultViewModel.endExternalSystemFlow()
         if (treeUri != null) {
             vaultViewModel.onSafDirectorySelected(treeUri)
+        }
+    }
+
+    val launchVideoSelection: () -> Unit = {
+        vaultViewModel.beginExternalSystemFlow()
+        val launched = runCatching {
+            if (ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(context)) {
+                videoPickerLauncher.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly),
+                )
+            } else {
+                openVideoDocumentLauncher.launch(arrayOf("video/*"))
+            }
+        }.isSuccess
+
+        if (!launched) {
+            val fallbackOk = runCatching {
+                openVideoDocumentLauncher.launch(arrayOf("video/*"))
+            }.isSuccess
+            if (!fallbackOk) {
+                vaultViewModel.endExternalSystemFlow()
+                vaultViewModel.reportStatusError("No video file picker available on this device.")
+            }
+        }
+    }
+
+    val launchSafFolderSelection: () -> Unit = {
+        vaultViewModel.beginExternalSystemFlow()
+        val ok = runCatching {
+            safFolderLauncher.launch(null)
+        }.isSuccess
+        if (!ok) {
+            vaultViewModel.endExternalSystemFlow()
+            vaultViewModel.reportStatusError("System folder picker unavailable on this device.")
         }
     }
 
@@ -195,49 +236,80 @@ fun VaultScreen(
         if (fragmentActivity == null) {
             biometricError = "Biometric prompt unavailable in current host."
         } else {
-            val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL
             val bioManager = BiometricManager.from(fragmentActivity)
+            val authenticators = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                    BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            } else {
+                BiometricManager.Authenticators.BIOMETRIC_WEAK
+            }
+
             when (bioManager.canAuthenticate(authenticators)) {
                 BiometricManager.BIOMETRIC_SUCCESS -> {
                     biometricError = null
-                    val promptInfo = BiometricPrompt.PromptInfo.Builder()
-                        .setTitle("Authenticate Ultra Vault")
-                        .setSubtitle("Verify fingerprint, face, or device PIN")
-                        .setAllowedAuthenticators(authenticators)
-                        .build()
+                    vaultViewModel.beginExternalSystemFlow()
+                    val promptBuilder = BiometricPrompt.PromptInfo.Builder()
+                        .setTitle("Unlock BlackHole Vault")
+                        .setSubtitle("Verify your fingerprint or biometric")
 
-                    val prompt = BiometricPrompt(
-                        fragmentActivity,
-                        ContextCompat.getMainExecutor(fragmentActivity),
-                        object : BiometricPrompt.AuthenticationCallback() {
-                            override fun onAuthenticationSucceeded(
-                                result: BiometricPrompt.AuthenticationResult,
-                            ) {
-                                biometricError = null
-                                vaultViewModel.markBiometricVerified()
-                            }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        promptBuilder.setAllowedAuthenticators(authenticators)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        promptBuilder.setDeviceCredentialAllowed(true)
+                    }
 
-                            override fun onAuthenticationError(
-                                errorCode: Int,
-                                errString: CharSequence,
-                            ) {
-                                biometricError = errString.toString()
-                            }
+                    val launched = runCatching {
+                        val promptInfo = promptBuilder.build()
+                        val prompt = BiometricPrompt(
+                            fragmentActivity,
+                            ContextCompat.getMainExecutor(fragmentActivity),
+                            object : BiometricPrompt.AuthenticationCallback() {
+                                override fun onAuthenticationSucceeded(
+                                    result: BiometricPrompt.AuthenticationResult,
+                                ) {
+                                    vaultViewModel.endExternalSystemFlow()
+                                    biometricError = null
+                                    vaultViewModel.unlockAfterBiometricVerification()
+                                }
 
-                            override fun onAuthenticationFailed() {
-                                biometricError = "Biometric verification did not match."
-                            }
-                        },
-                    )
-                    prompt.authenticate(promptInfo)
+                                override fun onAuthenticationError(
+                                    errorCode: Int,
+                                    errString: CharSequence,
+                                ) {
+                                    vaultViewModel.endExternalSystemFlow()
+                                    biometricError = errString.toString()
+                                }
+
+                                override fun onAuthenticationFailed() {
+                                    biometricError = "Biometric did not match. Try again."
+                                }
+                            },
+                        )
+                        prompt.authenticate(promptInfo)
+                    }
+
+                    if (launched.isFailure) {
+                        vaultViewModel.endExternalSystemFlow()
+                        biometricError = launched.exceptionOrNull()?.message
+                            ?: "Unable to open biometric prompt."
+                    }
                 }
                 else -> {
-                    // Hardware has no enrolled biometrics/PIN; allow master password fallback cleanly
-                    biometricError = "No device biometric/PIN enrolled — enter master password directly."
-                    vaultViewModel.markBiometricVerified()
+                    biometricError = null
+                    vaultViewModel.unlockAfterBiometricVerification(
+                        noticeMessage = "No biometric enrolled on this device — unlocked with local key.",
+                    )
                 }
             }
+        }
+    }
+
+    var autoPromptedOnEntry by remember { mutableStateOf(false) }
+    LaunchedEffect(uiState.isLocked) {
+        if (uiState.isLocked && !autoPromptedOnEntry) {
+            autoPromptedOnEntry = true
+            triggerBiometricAuth()
         }
     }
 
@@ -250,11 +322,7 @@ fun VaultScreen(
         floatingActionButton = {
             if (!uiState.isLocked && uiState.activePlayback == null) {
                 ExtendedFloatingActionButton(
-                    onClick = {
-                        videoPickerLauncher.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly),
-                        )
-                    },
+                    onClick = launchVideoSelection,
                     containerColor = NeonCyan,
                     contentColor = ObsidianVoid,
                     modifier = Modifier
@@ -305,9 +373,6 @@ fun VaultScreen(
                         onBack()
                     },
                     onTriggerBiometric = triggerBiometricAuth,
-                    onUnlockWithPassword = { password ->
-                        vaultViewModel.unlockWithMasterPassword(password)
-                    },
                     onDismissStatus = vaultViewModel::dismissStatus,
                 )
             } else {
@@ -318,7 +383,7 @@ fun VaultScreen(
                         onBack()
                     },
                     onLockNow = vaultViewModel::lockVaultAndWipe,
-                    onSelectSafFolder = { safFolderLauncher.launch(null) },
+                    onSelectSafFolder = launchSafFolderSelection,
                     onRevertInternalStorage = vaultViewModel::revertToInternalVaultStorage,
                     onCancelTransfer = vaultViewModel::cancelActiveTransfer,
                     onPlayEntry = vaultViewModel::decryptAndPlayEntry,
@@ -343,12 +408,8 @@ private fun VaultLockedGate(
     biometricMessage: String?,
     onBack: () -> Unit,
     onTriggerBiometric: () -> Unit,
-    onUnlockWithPassword: (String) -> Unit,
     onDismissStatus: () -> Unit,
 ) {
-    var passwordInput by remember { mutableStateOf("") }
-    var showPassword by remember { mutableStateOf(false) }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -391,7 +452,7 @@ private fun VaultLockedGate(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "FLAG_SECURE · NO SCREENSHOTS",
+                        text = "FLAG_SECURE · BIOMETRIC ONLY",
                         style = MaterialTheme.typography.labelSmall,
                         color = EmeraldPulse,
                     )
@@ -399,7 +460,7 @@ private fun VaultLockedGate(
             }
         }
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(52.dp))
 
         Surface(
             color = Color(0xFF0E1420).copy(alpha = 0.92f),
@@ -410,18 +471,18 @@ private fun VaultLockedGate(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(24.dp),
+                    .padding(28.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Box(
                     modifier = Modifier
-                        .size(72.dp)
+                        .size(84.dp)
                         .clip(CircleShape)
                         .background(
                             Brush.radialGradient(
                                 colors = listOf(
                                     NeonCyan.copy(alpha = 0.25f),
-                                    PlasmaViolet.copy(alpha = 0.15f),
+                                    PlasmaViolet.copy(alpha = 0.16f),
                                     Color.Transparent,
                                 ),
                             ),
@@ -429,64 +490,33 @@ private fun VaultLockedGate(
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        imageVector = if (uiState.biometricVerified) Icons.Rounded.VerifiedUser else Icons.Outlined.Lock,
-                        contentDescription = "Encrypted Vault Lock",
-                        tint = if (uiState.biometricVerified) EmeraldPulse else NeonCyan,
-                        modifier = Modifier.size(34.dp),
+                        imageVector = Icons.Rounded.Fingerprint,
+                        contentDescription = "Biometric Vault Lock",
+                        tint = NeonCyan,
+                        modifier = Modifier.size(44.dp),
                     )
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(18.dp))
 
                 Text(
-                    text = "ULTRA ENCRYPTED VAULT",
+                    text = "BIOMETRIC VAULT",
                     style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
                     color = ChromeSilver,
                     textAlign = TextAlign.Center,
                 )
 
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "AES-256-GCM (1MB AAD Chunks) · PBKDF2-210K\nSAF Persistence Across Reinstalls",
+                    text = "AES-256-GCM Chunked Vault · Hardware Keystore\nVerify fingerprint to enter",
                     style = MaterialTheme.typography.bodySmall,
                     color = MutedSlate,
                     textAlign = TextAlign.Center,
                 )
 
-                Spacer(modifier = Modifier.height(18.dp))
-
-                OutlinedButton(
-                    onClick = onTriggerBiometric,
-                    shape = RoundedCornerShape(16.dp),
-                    border = BorderStroke(
-                        1.dp,
-                        if (uiState.biometricVerified) EmeraldPulse else NeonCyan.copy(alpha = 0.6f),
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .testTag("vault_biometric_button"),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Fingerprint,
-                        contentDescription = "Verify biometric or device PIN",
-                        tint = if (uiState.biometricVerified) EmeraldPulse else NeonCyan,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = if (uiState.biometricVerified) {
-                            "DEVICE BIOMETRIC VERIFIED"
-                        } else {
-                            "VERIFY BIOMETRIC / DEVICE PIN"
-                        },
-                        color = if (uiState.biometricVerified) EmeraldPulse else ChromeSilver,
-                        style = MaterialTheme.typography.labelLarge,
-                    )
-                }
-
                 if (!biometricMessage.isNullOrBlank()) {
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
                     Text(
                         text = biometricMessage,
                         style = MaterialTheme.typography.labelSmall,
@@ -495,60 +525,10 @@ private fun VaultLockedGate(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
-
-                OutlinedTextField(
-                    value = passwordInput,
-                    onValueChange = { passwordInput = it },
-                    label = { Text("Master Encryption Password") },
-                    singleLine = true,
-                    visualTransformation = if (showPassword) {
-                        VisualTransformation.None
-                    } else {
-                        PasswordVisualTransformation()
-                    },
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Password,
-                        imeAction = ImeAction.Done,
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onDone = {
-                            val submit = passwordInput
-                            passwordInput = ""
-                            onUnlockWithPassword(submit)
-                        },
-                    ),
-                    trailingIcon = {
-                        IconButton(onClick = { showPassword = !showPassword }) {
-                            Icon(
-                                imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                                contentDescription = if (showPassword) "Hide password" else "Show password",
-                                tint = MutedSlate,
-                            )
-                        }
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = ChromeSilver,
-                        unfocusedTextColor = ChromeSilver,
-                        focusedBorderColor = NeonCyan,
-                        unfocusedBorderColor = GlassStrokeBright.copy(alpha = 0.38f),
-                        focusedLabelColor = NeonCyan,
-                        unfocusedLabelColor = MutedSlate,
-                        cursorColor = NeonCyan,
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("vault_password_input"),
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(22.dp))
 
                 Button(
-                    onClick = {
-                        val submit = passwordInput
-                        passwordInput = ""
-                        onUnlockWithPassword(submit)
-                    },
+                    onClick = onTriggerBiometric,
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = NeonCyan,
@@ -556,16 +536,16 @@ private fun VaultLockedGate(
                     ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(52.dp)
-                        .testTag("vault_unlock_button"),
+                        .height(54.dp)
+                        .testTag("vault_biometric_button"),
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.LockOpen,
-                        contentDescription = null,
+                        imageVector = Icons.Rounded.Fingerprint,
+                        contentDescription = "Unlock with biometric",
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "UNLOCK VAULT",
+                        text = "UNLOCK WITH BIOMETRIC",
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
                     )
                 }
@@ -715,9 +695,9 @@ private fun VaultUnlockedDashboard(
                         )
                         Text(
                             text = if (uiState.isExternalSafActive) {
-                                "External SAF folder keeps .bhv files after uninstall."
+                                "External SAF folder keeps .bhv files intact."
                             } else {
-                                "Pick an external SAF folder so vault survives uninstall."
+                                "Pick an external SAF folder or use private storage."
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MutedSlate,
@@ -771,7 +751,7 @@ private fun VaultUnlockedDashboard(
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         val actionTitle = when {
-                            transfer.stage == VaultOperationStage.DERIVING_KEY -> "Deriving PBKDF2-210K AES key..."
+                            transfer.stage == VaultOperationStage.DERIVING_KEY -> "Preparing AES-256-GCM key..."
                             transfer.isEncrypting -> "Encrypting: ${transfer.label}"
                             else -> "Decrypting & Verifying AAD: ${transfer.label}"
                         }
@@ -1035,7 +1015,6 @@ private fun VaultZeroFootprintPlayer(
     DisposableEffect(player) {
         onDispose {
             player.release()
-            onCloseAndWipe()
         }
     }
 
