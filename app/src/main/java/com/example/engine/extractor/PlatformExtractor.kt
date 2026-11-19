@@ -12,6 +12,7 @@ import com.example.engine.model.VideoQualityOption
 import com.example.engine.network.ClientSpoofer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.CookieJar
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -45,8 +46,12 @@ interface PlatformExtractor {
  * connection pooling, redirects, timeouts, and Session Vault cookies cleanly.
  */
 class OkHttpNewPipeDownloader(
-    private val okHttpClient: OkHttpClient,
+    baseOkHttpClient: OkHttpClient,
 ) : Downloader() {
+
+    private val okHttpClient: OkHttpClient = baseOkHttpClient.newBuilder()
+        .cookieJar(CookieJar.NO_COOKIES)
+        .build()
 
     @Throws(IOException::class)
     override fun execute(request: NewPipeRequest): NewPipeResponse {
@@ -64,6 +69,14 @@ class OkHttpNewPipeDownloader(
         }
         if (!headerMap.containsKey("Accept-Language")) {
             headerMap["Accept-Language"] = "en-US,en;q=0.9"
+        }
+        val reqUrlLower = request.url().lowercase()
+        if (request.httpMethod().equals("GET", ignoreCase = true) &&
+            (reqUrlLower.contains("youtube.com/") || reqUrlLower.contains("youtu.be/")) &&
+            !reqUrlLower.contains("/youtubei/") &&
+            !headerMap.containsKey("Cookie")
+        ) {
+            headerMap["Cookie"] = "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; PREF=f6=40000000&hl=en&gl=US"
         }
 
         val okRequest = okhttp3.Request.Builder()

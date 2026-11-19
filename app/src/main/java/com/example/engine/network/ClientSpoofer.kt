@@ -149,11 +149,17 @@ object ClientSpoofer {
         streamUrl: String,
         streamHeaders: Map<String, String>,
     ): Map<String, String> {
-        if (streamHeaders.containsKey("User-Agent")) {
+        val ua = streamHeaders["User-Agent"].orEmpty()
+        if (ua.isNotBlank()) {
             val out = LinkedHashMap<String, String>(streamHeaders)
             out.putIfAbsent("Accept", "*/*")
             out.putIfAbsent("Accept-Language", "en-US,en;q=0.9")
-            out.putIfAbsent("Referer", refererForUrl(streamUrl))
+            val isNativeYoutubeClientUa = ua.startsWith("com.google.ios.youtube", ignoreCase = true) ||
+                ua.startsWith("com.google.android.apps.youtube", ignoreCase = true) ||
+                ua.startsWith("com.google.android.youtube", ignoreCase = true)
+            if (!isNativeYoutubeClientUa) {
+                out.putIfAbsent("Referer", refererForUrl(streamUrl))
+            }
             return out
         }
         return buildHeadersForUrl(streamUrl, profiles.first()) + streamHeaders

@@ -4,12 +4,18 @@ import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.ExtractedStream
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
+import okhttp3.CookieJar
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.schabi.newpipe.extractor.MediaFormat
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.StreamInfo
+import org.schabi.newpipe.extractor.stream.VideoStream
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
@@ -22,16 +28,23 @@ internal data class YoutubeExtractionOutcome(
 
 /**
  * Multi-tier YouTube extraction engine combining:
- * 1. Live watch-page Innertube API key, Visitor ID, and base.js signature deciphering
- * 2. Cookie + SAPISIDHASH authenticated Innertube client rotation (IOS, ANDROID_VR, TVHTML5, EMBEDDED, ANDROID, MWEB)
- * 3. Watch-HTML ytInitialPlayerResponse parsing with balanced-brace JSON extraction
- * 4. Public Invidious / Piped API mirror fallback when device IP hits bot/poToken gates
- * 5. Mandatory HTTP 200/206 reachability gate so 403 streams are skipped automatically
+ * 1. NewPipeExtractor v0.26.0 (full Rhino JS signature & n-param deobfuscation, cookieless + EU SOCS bypass)
+ * 2. Live watch & embed page context with EU consent (SOCS) bypass for Innertube API key + Visitor ID
+ * 3. Strictly isolated native (cookieless, zero Web Origin/Referer) & web/TV (SAPISIDHASH) Innertube cascade
+ * 4. Watch-HTML ytInitialPlayerResponse parsing with balanced-brace JSON extraction
+ * 5. Resilient Piped / Invidious public mirror fallback
+ * 6. Balanced per-tier reachability gate (progressive + adaptive + HLS) so high-res 403s never hide working streams
  */
 internal class YoutubePowerExtractor(
     private val client: OkHttpClient,
     private val cookieVault: CookieVaultManager?,
 ) {
+
+    private val cookielessClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .cookieJar(CookieJar.NO_COOKIES)
+            .build()
+    }
 
     private sealed interface CipherOp {
         data object Reverse : CipherOp
@@ -45,10 +58,18 @@ internal class YoutubePowerExtractor(
         val videoId = extractVideoId(url) ?: return YoutubeExtractionOutcome(emptyList(), false)
         var loginRequired = false
 
+        // Tier 1: NewPipeExtractor (cookieless + EU SOCS consent cookie)
+        val newPipeStreams = extractViaNewPipe(videoId)
+        val reachableNewPipe = filterReachableStreams(newPipeStreams)
+        if (reachableNewPipe.isNotEmpty()) {
+            return YoutubeExtractionOutcome(reachableNewPipe, false)
+        }
+
+        // Tier 2: Watch & Embed context (bypasses EU consent.youtube.com wall with SOCS cookie)
         val watchContext = fetchWatchPageContext(videoId)
         val cookieAuthHeader = buildSapisidAuthorizationHeader()
 
-        // 1. Check watch page embedded ytInitialPlayerResponse first (if present + decipherable)
+        // Tier 3: Watch page embedded ytInitialPlayerResponse (deciphered)
         if (watchContext.playerResponse != null) {
             val status = watchContext.playerResponse.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
             if (status.equals("LOGIN_REQUIRED", ignoreCase = true)) {
@@ -59,6 +80,7 @@ internal class YoutubePowerExtractor(
                     videoId = videoId,
                     userAgent = ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
                     jsUrl = watchContext.jsUrl,
+                    isWebOrigin = true,
                 )
                 val reachable = filterReachableStreams(decoded)
                 if (reachable.isNotEmpty()) {
@@ -67,13 +89,14 @@ internal class YoutubePowerExtractor(
             }
         }
 
-        // 2. Multi-client Innertube cascade
+        // Tier 4: Multi-client Innertube cascade with strict cookie & Origin/Referer isolation
         data class YtClientSpec(
             val clientName: String,
             val clientVersion: String,
             val clientId: String,
             val userAgent: String,
             val isEmbedded: Boolean = false,
+            val isWebOrigin: Boolean = false,
             val sendCookiesAndAuth: Boolean = false,
             val extraClientFields: Map<String, Any> = emptyMap(),
         )
@@ -81,28 +104,37 @@ internal class YoutubePowerExtractor(
         val clients = listOf(
             YtClientSpec(
                 clientName = "ANDROID_VR",
-                clientVersion = "1.60.19",
+                clientVersion = "1.61.48",
                 clientId = "28",
-                userAgent = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                userAgent = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; Quest 3 Build/UP1A.231005.007) gzip",
                 extraClientFields = mapOf(
                     "deviceMake" to "Oculus",
                     "deviceModel" to "Quest 3",
                     "osName" to "Android",
-                    "osVersion" to "12L",
-                    "androidSdkVersion" to 32,
+                    "osVersion" to "14",
+                    "androidSdkVersion" to 34,
                 ),
             ),
             YtClientSpec(
                 clientName = "IOS",
-                clientVersion = "19.45.4",
+                clientVersion = "20.10.4",
                 clientId = "5",
-                userAgent = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X)",
+                userAgent = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
                 extraClientFields = mapOf(
                     "deviceMake" to "Apple",
                     "deviceModel" to "iPhone16,2",
                     "osName" to "iPhone",
-                    "osVersion" to "18.2.1.22C161",
+                    "osVersion" to "18.3.2.22D82",
                 ),
+            ),
+            YtClientSpec(
+                clientName = "WEB_EMBEDDED_PLAYER",
+                clientVersion = "1.20250319.01.00",
+                clientId = "56",
+                userAgent = ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+                isEmbedded = true,
+                isWebOrigin = true,
+                sendCookiesAndAuth = true,
             ),
             YtClientSpec(
                 clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
@@ -110,6 +142,7 @@ internal class YoutubePowerExtractor(
                 clientId = "85",
                 userAgent = "Mozilla/5.0 (PlayStation; PlayStation 5/6.50) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15",
                 isEmbedded = true,
+                isWebOrigin = true,
                 sendCookiesAndAuth = true,
             ),
             YtClientSpec(
@@ -117,13 +150,25 @@ internal class YoutubePowerExtractor(
                 clientVersion = "7.20250319.10.00",
                 clientId = "7",
                 userAgent = "Mozilla/5.0 (SMART-TV; LINUX; Tizen 7.0) AppleWebKit/537.36 (KHTML, like Gecko) 94.0.4606.31/7.0 TV Safari/537.36",
+                isWebOrigin = true,
                 sendCookiesAndAuth = true,
             ),
             YtClientSpec(
+                clientName = "ANDROID_TESTSUITE",
+                clientVersion = "1.9",
+                clientId = "30",
+                userAgent = "com.google.android.youtube/1.9 (Linux; U; Android 14; Pixel 8) gzip",
+                extraClientFields = mapOf(
+                    "androidSdkVersion" to 34,
+                    "osName" to "Android",
+                    "osVersion" to "14",
+                ),
+            ),
+            YtClientSpec(
                 clientName = "ANDROID",
-                clientVersion = "19.44.38",
+                clientVersion = "20.10.38",
                 clientId = "3",
-                userAgent = "com.google.android.youtube/19.44.38 (Linux; U; Android 15; Pixel 9 Pro) gzip",
+                userAgent = "com.google.android.youtube/20.10.38 (Linux; U; Android 15; Pixel 9 Pro) gzip",
                 extraClientFields = mapOf(
                     "androidSdkVersion" to 35,
                     "osName" to "Android",
@@ -135,12 +180,16 @@ internal class YoutubePowerExtractor(
                 clientVersion = "2.20250319.01.00",
                 clientId = "2",
                 userAgent = ClientSpoofer.TIKTOK_IOS_USER_AGENT,
+                isWebOrigin = true,
                 sendCookiesAndAuth = true,
             ),
         )
 
         val apiKeyQuery = watchContext.apiKey?.let { "?key=$it&prettyPrint=false" } ?: "?prettyPrint=false"
         for (spec in clients) {
+            val useAuthSession = spec.sendCookiesAndAuth && !cookieAuthHeader.isNullOrBlank()
+            val callClient = if (useAuthSession) client else cookielessClient
+
             val payload = JSONObject().apply {
                 put("videoId", videoId)
                 put(
@@ -163,7 +212,7 @@ internal class YoutubePowerExtractor(
                             put(
                                 "thirdParty",
                                 JSONObject().apply {
-                                    put("embedUrl", "https://www.youtube.com/")
+                                    put("embedUrl", "https://www.youtube.com/watch?v=$videoId")
                                 },
                             )
                         }
@@ -193,19 +242,22 @@ internal class YoutubePowerExtractor(
                 .header("Content-Type", "application/json")
                 .header("X-YouTube-Client-Name", spec.clientId)
                 .header("X-YouTube-Client-Version", spec.clientVersion)
-                .header("Origin", "https://www.youtube.com")
-                .header("Referer", "https://www.youtube.com/watch?v=$videoId")
+
+            if (spec.isWebOrigin) {
+                reqBuilder.header("Origin", "https://www.youtube.com")
+                reqBuilder.header("Referer", "https://www.youtube.com/watch?v=$videoId")
+            }
 
             if (!watchContext.visitorData.isNullOrBlank()) {
                 reqBuilder.header("X-Goog-Visitor-Id", watchContext.visitorData)
             }
-            if (spec.sendCookiesAndAuth && !cookieAuthHeader.isNullOrBlank()) {
+            if (useAuthSession && !cookieAuthHeader.isNullOrBlank()) {
                 reqBuilder.header("Authorization", cookieAuthHeader)
                 reqBuilder.header("X-Origin", "https://www.youtube.com")
             }
 
             val parsedStreams = runCatching {
-                client.newCall(reqBuilder.build()).execute().use { response ->
+                callClient.newCall(reqBuilder.build()).execute().use { response ->
                     if (response.code == 401 || response.code == 403) {
                         loginRequired = true
                         return@use emptyList()
@@ -222,6 +274,7 @@ internal class YoutubePowerExtractor(
                         videoId = videoId,
                         userAgent = spec.userAgent,
                         jsUrl = watchContext.jsUrl,
+                        isWebOrigin = spec.isWebOrigin,
                     )
                 }
             }.getOrDefault(emptyList())
@@ -232,13 +285,148 @@ internal class YoutubePowerExtractor(
             }
         }
 
-        // 3. Fallback: Resilient public Invidious / Piped API mirrors when Innertube hits poToken/IP gates
+        // Tier 5: Public Invidious / Piped API mirrors when device IP hits bot/poToken gates
         val mirrorStreams = filterReachableStreams(fetchFromPublicMirrors(videoId))
         if (mirrorStreams.isNotEmpty()) {
             return YoutubeExtractionOutcome(mirrorStreams, loginRequired)
         }
 
         return YoutubeExtractionOutcome(emptyList(), loginRequired)
+    }
+
+    private fun extractViaNewPipe(videoId: String): List<ExtractedStream> {
+        return runCatching {
+            OkHttpNewPipeDownloader.ensureNewPipeInitialized(cookielessClient)
+            val canonicalUrl = "https://www.youtube.com/watch?v=$videoId"
+            val info = StreamInfo.getInfo(ServiceList.YouTube, canonicalUrl)
+            val title = info.name.orEmpty()
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+                .take(72)
+                .ifBlank { "YouTube_$videoId" }
+            val durationSec = info.duration.coerceAtLeast(0L)
+            val headers = mapOf("User-Agent" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
+            val out = mutableListOf<ExtractedStream>()
+
+            info.videoStreams
+                .filter { it.isUrl && it.content.isNotBlank() }
+                .forEach { stream ->
+                    val height = parseNewPipeResolution(stream)
+                    val mime = stream.format?.mimeType ?: "video/mp4"
+                    val estBytes = estimateStreamSize(
+                        contentLength = stream.itagItem?.contentLength ?: -1L,
+                        bitrate = stream.bitrate.toLong(),
+                        durationSec = durationSec,
+                    )
+                    out.add(
+                        ExtractedStream(
+                            streamUrl = stream.content,
+                            title = title,
+                            platform = PlatformBadge.YOUTUBE,
+                            qualityLabel = formatQualityLabel(height),
+                            resolutionHeight = height,
+                            mimeType = mime,
+                            estimatedBytes = estBytes,
+                            headers = headers,
+                            bitrateBps = stream.bitrate.toLong(),
+                        ),
+                    )
+                }
+
+            val bestAudio = selectBestNewPipeAudio(info.audioStreams)
+            val audioUrl = bestAudio?.takeIf { it.isUrl && it.content.isNotBlank() }?.content
+            val audioBytes = bestAudio?.let {
+                estimateStreamSize(
+                    contentLength = it.itagItem?.contentLength ?: -1L,
+                    bitrate = it.averageBitrate.toLong() * 1000L,
+                    durationSec = durationSec,
+                )
+            } ?: 0L
+
+            if (!audioUrl.isNullOrBlank()) {
+                info.videoOnlyStreams
+                    .filter { it.isUrl && it.content.isNotBlank() && isMp4CompatibleNewPipeVideo(it) }
+                    .forEach { vStream ->
+                        val height = parseNewPipeResolution(vStream)
+                        if (height >= 360) {
+                            val vBytes = estimateStreamSize(
+                                contentLength = vStream.itagItem?.contentLength ?: -1L,
+                                bitrate = vStream.bitrate.toLong(),
+                                durationSec = durationSec,
+                            )
+                            val totalBytes = when {
+                                vBytes > 0L && audioBytes > 0L -> vBytes + audioBytes
+                                vBytes > 0L -> vBytes
+                                else -> -1L
+                            }
+                            out.add(
+                                ExtractedStream(
+                                    streamUrl = vStream.content,
+                                    title = title,
+                                    platform = PlatformBadge.YOUTUBE,
+                                    qualityLabel = formatQualityLabel(height),
+                                    resolutionHeight = height,
+                                    mimeType = "video/mp4",
+                                    estimatedBytes = totalBytes,
+                                    headers = headers,
+                                    audioStreamUrl = audioUrl,
+                                    bitrateBps = vStream.bitrate.toLong(),
+                                ),
+                            )
+                        }
+                    }
+            }
+
+            val hlsUrl = runCatching { info.hlsUrl }.getOrNull()
+            if (!hlsUrl.isNullOrBlank() && hlsUrl.startsWith("http")) {
+                out.add(
+                    ExtractedStream(
+                        streamUrl = hlsUrl,
+                        title = title,
+                        platform = PlatformBadge.YOUTUBE,
+                        qualityLabel = "BEST HD",
+                        resolutionHeight = 1080,
+                        mimeType = "application/vnd.apple.mpegurl",
+                        estimatedBytes = -1L,
+                        headers = headers,
+                        isHls = true,
+                    ),
+                )
+            }
+
+            out
+        }.getOrDefault(emptyList())
+    }
+
+    private fun selectBestNewPipeAudio(streams: List<AudioStream>): AudioStream? {
+        return streams
+            .filter { it.isUrl && it.content.isNotBlank() }
+            .sortedWith(
+                compareByDescending<AudioStream> {
+                    it.format == MediaFormat.M4A || it.format?.mimeType?.contains("mp4", true) == true
+                }.thenByDescending { it.averageBitrate },
+            )
+            .firstOrNull()
+    }
+
+    private fun isMp4CompatibleNewPipeVideo(stream: VideoStream): Boolean {
+        val format = stream.format
+        val codec = stream.codec.orEmpty().lowercase()
+        val isMp4 = format == MediaFormat.MPEG_4 || format?.mimeType?.contains("mp4", true) == true
+        val isAvcOrHevc = codec.isBlank() || codec.contains("avc") || codec.contains("h264") || codec.contains("hev")
+        return isMp4 && isAvcOrHevc
+    }
+
+    private fun parseNewPipeResolution(stream: VideoStream): Int {
+        if (stream.height > 0) return stream.height
+        return Regex("""(\d{3,4})p""").find(stream.resolution.orEmpty())
+            ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 720
+    }
+
+    private fun estimateStreamSize(contentLength: Long, bitrate: Long, durationSec: Long): Long {
+        if (contentLength > 0L) return contentLength
+        if (bitrate > 0L && durationSec > 0L) return (bitrate * durationSec) / 8L
+        return -1L
     }
 
     fun extractVideoId(url: String): String? {
@@ -263,33 +451,112 @@ internal class YoutubePowerExtractor(
     )
 
     private fun fetchWatchPageContext(videoId: String): WatchPageContext {
-        val watchUrl = "https://www.youtube.com/watch?v=$videoId&bpctr=9999999999&has_verified=1"
-        val req = Request.Builder()
-            .url(watchUrl)
-            .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .build()
+        val candidatePages = listOf(
+            "https://www.youtube.com/watch?v=$videoId&bpctr=9999999999&has_verified=1" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+            "https://www.youtube.com/embed/$videoId" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+            "https://m.youtube.com/watch?v=$videoId" to ClientSpoofer.ANDROID_CHROME_USER_AGENT,
+        )
 
-        return runCatching {
-            client.newCall(req).execute().use { response ->
-                if (!response.isSuccessful) {
-                    return WatchPageContext(null, null, null, null, null)
+        var resolvedApiKey: String? = null
+        var resolvedVisitorData: String? = null
+        var resolvedSts: Int? = null
+        var resolvedJsUrl: String? = null
+        var resolvedPlayer: JSONObject? = null
+
+        val useAuthenticatedFirst = !buildSapisidAuthorizationHeader().isNullOrBlank()
+        val fetchClient = if (useAuthenticatedFirst) client else cookielessClient
+
+        for ((pageUrl, ua) in candidatePages) {
+            val req = Request.Builder()
+                .url(pageUrl)
+                .header("User-Agent", ua)
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Cookie", EU_SOCS_CONSENT_COOKIE)
+                .build()
+
+            runCatching {
+                fetchClient.newCall(req).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val html = response.body?.string().orEmpty()
+                    if (html.isBlank()) return@use
+
+                    if (resolvedApiKey.isNullOrBlank()) {
+                        resolvedApiKey = Regex(""""INNERTUBE_API_KEY"\s*:\s*"([^"]+)"""")
+                            .find(html)?.groupValues?.getOrNull(1)
+                    }
+                    if (resolvedVisitorData.isNullOrBlank()) {
+                        resolvedVisitorData = Regex(""""VISITOR_DATA"\s*:\s*"([^"]+)"""")
+                            .find(html)?.groupValues?.getOrNull(1)
+                    }
+                    if (resolvedSts == null) {
+                        resolvedSts = Regex(""""STS"\s*:\s*(\d+)""")
+                            .find(html)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    }
+                    if (resolvedJsUrl.isNullOrBlank()) {
+                        resolvedJsUrl = Regex(""""jsUrl"\s*:\s*"([^"]+)"""")
+                            .find(html)?.groupValues?.getOrNull(1)
+                    }
+                    if (resolvedPlayer == null) {
+                        val playerJsonStr = extractJsonObjectAfterMarker(html, "ytInitialPlayerResponse")
+                        resolvedPlayer = playerJsonStr?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    }
                 }
-                val html = response.body?.string().orEmpty()
-                val apiKey = Regex(""""INNERTUBE_API_KEY"\s*:\s*"([^"]+)"""")
-                    .find(html)?.groupValues?.getOrNull(1)
-                val visitorData = Regex(""""VISITOR_DATA"\s*:\s*"([^"]+)"""")
-                    .find(html)?.groupValues?.getOrNull(1)
-                val sts = Regex(""""STS"\s*:\s*(\d+)""")
-                    .find(html)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                val jsUrl = Regex(""""jsUrl"\s*:\s*"([^"]+)"""")
-                    .find(html)?.groupValues?.getOrNull(1)
-                val playerJsonStr = extractJsonObjectAfterMarker(html, "ytInitialPlayerResponse")
-                val playerJson = playerJsonStr?.let { runCatching { JSONObject(it) }.getOrNull() }
-                WatchPageContext(apiKey, visitorData, sts, jsUrl, playerJson)
             }
-        }.getOrDefault(WatchPageContext(null, null, null, null, null))
+
+            if (!resolvedApiKey.isNullOrBlank() &&
+                !resolvedVisitorData.isNullOrBlank() &&
+                resolvedPlayer != null
+            ) {
+                break
+            }
+        }
+
+        // If visitorData is still missing despite obtaining apiKey, fetch a fresh visitorData via visitor_id endpoint
+        if (resolvedVisitorData.isNullOrBlank() && !resolvedApiKey.isNullOrBlank()) {
+            resolvedVisitorData = fetchVisitorData(resolvedApiKey!!)
+        }
+
+        return WatchPageContext(
+            apiKey = resolvedApiKey,
+            visitorData = resolvedVisitorData,
+            sts = resolvedSts,
+            jsUrl = resolvedJsUrl,
+            playerResponse = resolvedPlayer,
+        )
+    }
+
+    private fun fetchVisitorData(apiKey: String): String? {
+        return runCatching {
+            val payload = JSONObject().apply {
+                put(
+                    "context",
+                    JSONObject().apply {
+                        put(
+                            "client",
+                            JSONObject().apply {
+                                put("clientName", "WEB")
+                                put("clientVersion", "2.20250319.01.00")
+                                put("hl", "en")
+                                put("gl", "US")
+                            },
+                        )
+                    },
+                )
+            }
+            val req = Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/visitor_id?key=$apiKey&prettyPrint=false")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
+                .header("Content-Type", "application/json")
+                .build()
+            cookielessClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val json = JSONObject(resp.body?.string().orEmpty())
+                json.optJSONObject("responseContext")?.optString("visitorData")
+                    ?.takeIf { it.isNotBlank() }
+            }
+        }.getOrNull()
     }
 
     private fun parsePlayerJson(
@@ -297,6 +564,7 @@ internal class YoutubePowerExtractor(
         videoId: String,
         userAgent: String,
         jsUrl: String?,
+        isWebOrigin: Boolean,
     ): List<ExtractedStream> {
         val details = json.optJSONObject("videoDetails")
         val title = details?.optString("title")
@@ -307,14 +575,17 @@ internal class YoutubePowerExtractor(
             ?: "YouTube_$videoId"
 
         val streamingData = json.optJSONObject("streamingData") ?: return emptyList()
-        val streamHeaders = mapOf(
-            "User-Agent" to userAgent,
-            "Referer" to "https://www.youtube.com/",
-            "Origin" to "https://www.youtube.com",
-        )
+        val streamHeaders = if (isWebOrigin) {
+            mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to "https://www.youtube.com/",
+                "Origin" to "https://www.youtube.com",
+            )
+        } else {
+            mapOf("User-Agent" to userAgent)
+        }
         val found = mutableListOf<ExtractedStream>()
 
-        // Decipher any direct or signatureCipher format URL cleanly
         fun resolveFormatUrl(fmt: JSONObject): String? {
             val direct = fmt.optString("url")
             if (direct.startsWith("http")) return direct
@@ -431,6 +702,7 @@ internal class YoutubePowerExtractor(
             "https://pipedapi.kavin.rocks",
             "https://api.piped.private.coffee",
             "https://pipedapi.adminforge.de",
+            "https://pipedapi.leptons.xyz",
         )
         for (base in pipedInstances) {
             val req = Request.Builder()
@@ -440,7 +712,7 @@ internal class YoutubePowerExtractor(
                 .build()
 
             val pipedStreams = runCatching {
-                client.newCall(req).execute().use { resp ->
+                cookielessClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList<ExtractedStream>()
                     val root = JSONObject(resp.body?.string().orEmpty())
                     val title = root.optString("title").ifBlank { titleFallback }.take(72)
@@ -521,6 +793,7 @@ internal class YoutubePowerExtractor(
             "https://inv.nadeko.net",
             "https://invidious.nerdvpn.de",
             "https://yewtu.be",
+            "https://inv.tux.pizza",
         )
         for (base in invidiousInstances) {
             val req = Request.Builder()
@@ -530,7 +803,7 @@ internal class YoutubePowerExtractor(
                 .build()
 
             val invStreams = runCatching {
-                client.newCall(req).execute().use { resp ->
+                cookielessClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use emptyList<ExtractedStream>()
                     val root = JSONObject(resp.body?.string().orEmpty())
                     val title = root.optString("title").ifBlank { titleFallback }.take(72)
@@ -607,43 +880,64 @@ internal class YoutubePowerExtractor(
         return emptyList()
     }
 
+    /**
+     * Probing budget covers ALL 3 tiers (adaptive video+audio, progressive muxed MP4, AND HLS)
+     * so high-res 403s never starve progressive or HLS streams.
+     */
     private fun filterReachableStreams(candidates: List<ExtractedStream>): List<ExtractedStream> {
         if (candidates.isEmpty()) return emptyList()
-        val sorted = candidates.sortedWith(
+
+        val adaptive = candidates.filter { !it.isHls && !it.audioStreamUrl.isNullOrBlank() }
+            .sortedWith(compareByDescending<ExtractedStream> { it.resolutionHeight }.thenByDescending { it.bitrateBps })
+            .distinctBy { it.resolutionHeight }
+            .take(4)
+        val progressive = candidates.filter { !it.isHls && it.audioStreamUrl.isNullOrBlank() }
+            .sortedWith(compareByDescending<ExtractedStream> { it.resolutionHeight }.thenByDescending { it.bitrateBps })
+            .distinctBy { it.resolutionHeight }
+            .take(2)
+        val hls = candidates.filter { it.isHls }.take(2)
+
+        val probePool = (adaptive + progressive + hls).distinctBy { it.streamUrl }
+        val verified = mutableListOf<ExtractedStream>()
+        for (stream in probePool) {
+            if (isStreamUrlReachable(stream)) {
+                verified.add(stream)
+            }
+        }
+        return verified.sortedWith(
             compareByDescending<ExtractedStream> { !it.isHls }
                 .thenByDescending { it.resolutionHeight }
                 .thenByDescending { it.bitrateBps }
                 .thenByDescending { it.estimatedBytes },
         )
-        // Probe up to top 4 candidates to filter out HTTP 403 / dead URLs quickly
-        val verified = mutableListOf<ExtractedStream>()
-        for (stream in sorted.take(6)) {
-            if (isStreamUrlReachable(stream)) {
-                verified.add(stream)
-            }
-        }
-        return verified
     }
 
     private fun isStreamUrlReachable(stream: ExtractedStream): Boolean {
+        val probeClient = if (stream.headers.containsKey("Origin")) client else cookielessClient
         val reqBuilder = Request.Builder().url(stream.streamUrl)
         if (!stream.isHls) {
-            reqBuilder.header("Range", "bytes=0-0")
+            reqBuilder.header("Range", "bytes=0-1023")
         }
         stream.headers.forEach { (k, v) -> reqBuilder.header(k, v) }
         val mainOk = runCatching {
-            client.newCall(reqBuilder.build()).execute().use { resp ->
-                resp.isSuccessful || resp.code == 206
+            probeClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful && resp.code != 206) return@use false
+                if (stream.isHls) {
+                    val body = resp.body?.string().orEmpty()
+                    body.contains("#EXTM3U")
+                } else {
+                    true
+                }
             }
         }.getOrDefault(false)
         if (!mainOk) return false
 
         val audioUrl = stream.audioStreamUrl
         if (!audioUrl.isNullOrBlank()) {
-            val audioReq = Request.Builder().url(audioUrl).header("Range", "bytes=0-0")
+            val audioReq = Request.Builder().url(audioUrl).header("Range", "bytes=0-1023")
             stream.headers.forEach { (k, v) -> audioReq.header(k, v) }
             val audioOk = runCatching {
-                client.newCall(audioReq.build()).execute().use { resp ->
+                probeClient.newCall(audioReq.build()).execute().use { resp ->
                     resp.isSuccessful || resp.code == 206
                 }
             }.getOrDefault(false)
@@ -673,7 +967,7 @@ internal class YoutubePowerExtractor(
             .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
             .build()
         val jsCode = runCatching {
-            client.newCall(req).execute().use { resp ->
+            cookielessClient.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) resp.body?.string() else null
             }
         }.getOrNull() ?: return emptyList()
@@ -686,17 +980,18 @@ internal class YoutubePowerExtractor(
     }
 
     private fun parseCipherOpsFromPlayerJs(js: String): List<CipherOp> {
-        val fnPattern = Regex("""function\(([a-zA-Z0-9_$]+)\)\{\1=\1\.split\(""\);([\s\S]{10,450}?);return \1\.join\(""\)\}""")
-        val fnMatch = fnPattern.find(js) ?: return emptyList()
-        val body = fnMatch.groupValues[2]
+        val fnPattern = Regex("""(?:function\(([a-zA-Z0-9_$]+)\)|=\s*function\(([a-zA-Z0-9_$]+)\))\{\1?([a-zA-Z0-9_$]+)=[a-zA-Z0-9_$]+\.split\(""\);([\s\S]{10,550}?);return [a-zA-Z0-9_$]+\.join\(""\)\}""")
+        val altPattern = Regex("""function\(([a-zA-Z0-9_$]+)\)\{\1=\1\.split\(""\);([\s\S]{10,450}?);return \1\.join\(""\)\}""")
+        val altMatch = altPattern.find(js)
+        val body = altMatch?.groupValues?.getOrNull(2) ?: fnPattern.find(js)?.groupValues?.getOrNull(4) ?: return emptyList()
 
-        val helperCall = Regex("""([a-zA-Z0-9_$]+)\[?['"]?([a-zA-Z0-9_$]+)['"]?\]?\([a-zA-Z0-9_$]+,(\d+)\)""")
+        val helperCall = Regex("""([a-zA-Z0-9_$]+)(?:\[['"]([a-zA-Z0-9_$]+)['"]\]|\.([a-zA-Z0-9_$]+))\([a-zA-Z0-9_$]+,(\d+)\)""")
             .findAll(body)
             .toList()
         if (helperCall.isEmpty()) return emptyList()
 
         val helperName = Regex.escape(helperCall.first().groupValues[1])
-        val objPattern = Regex("""var $helperName=\{([\s\S]{10,500}?)\};""")
+        val objPattern = Regex("""(?:var|let|const)\s+$helperName=\{([\s\S]{10,600}?)\};""")
         val objBody = objPattern.find(js)?.groupValues?.getOrNull(1) ?: return emptyList()
 
         val opMap = mutableMapOf<String, String>()
@@ -712,8 +1007,8 @@ internal class YoutubePowerExtractor(
 
         val ops = mutableListOf<CipherOp>()
         for (call in helperCall) {
-            val method = call.groupValues[2]
-            val arg = call.groupValues[3].toIntOrNull() ?: 0
+            val method = call.groupValues[2].ifBlank { call.groupValues[3] }
+            val arg = call.groupValues[4].toIntOrNull() ?: 0
             when (opMap[method]) {
                 "reverse" -> ops.add(CipherOp.Reverse)
                 "splice" -> ops.add(CipherOp.Splice(arg))
@@ -816,5 +1111,9 @@ internal class YoutubePowerExtractor(
         height >= 720 -> "720P HD"
         height > 0 -> "${height}P"
         else -> "BEST HD"
+    }
+
+    companion object {
+        private const val EU_SOCS_CONSENT_COOKIE = "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; PREF=f6=40000000&hl=en&gl=US"
     }
 }

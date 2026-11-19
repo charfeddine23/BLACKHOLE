@@ -6,6 +6,7 @@ import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
+import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -135,7 +136,7 @@ private val StartPageSpeedDials = listOf(
     SpeedDialShortcut("YouTube", "▶", "https://m.youtube.com/", listOf(Color(0xFFFF0033), Color(0xFFD50026)), isPlayIcon = true),
     SpeedDialShortcut("Instagram", "IG", "https://www.instagram.com/", listOf(Color(0xFFF58529), Color(0xFFDD2A7B), Color(0xFF8134AF))),
     SpeedDialShortcut("TikTok", "♪", "https://www.tiktok.com/", listOf(Color(0xFF14161A), Color(0xFF08090B))),
-    SpeedDialShortcut("YT Sign-In", "G", "https://accounts.google.com/ServiceLogin?service=youtube", listOf(Color(0xFF4285F4), Color(0xFF2B6DE0))),
+    SpeedDialShortcut("YT Sign-In", "G", "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fm.youtube.com%2F", listOf(Color(0xFF4285F4), Color(0xFF2B6DE0))),
     SpeedDialShortcut("IG Login", "IG+", "https://www.instagram.com/accounts/login/", listOf(Color(0xFFC13584), Color(0xFF833AB4))),
     SpeedDialShortcut("FB Login", "FB+", "https://m.facebook.com/login/", listOf(Color(0xFF2563EB), Color(0xFF1D4ED8))),
     SpeedDialShortcut("Vimeo", "v", "https://vimeo.com/", listOf(Color(0xFF1AB7EA), Color(0xFF0F94C2))),
@@ -799,35 +800,23 @@ fun DownloadedVideosBrowserPanel(
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
                                         val cm = CookieManager.getInstance()
+                                        cm.setAcceptCookie(true)
+                                        view?.let { cm.setAcceptThirdPartyCookies(it, true) }
                                         cm.flush()
                                         val loaded = url.orEmpty()
                                         if (loaded.contains("CookieMismatch", ignoreCase = true)) {
-                                            val staleNames = listOf(
-                                                "__Host-GAPS", "GAPS", "LSID", "__Host-1PLSID", "__Host-3PLSID",
-                                                "ACCOUNT_CHOOSER", "SMSV", "OSID", "OTZ", "NID", "AEC", "SOCS", "CONSENT",
-                                            )
-                                            val hostPairs = listOf(
-                                                "https://accounts.google.com/" to null,
-                                                "https://accounts.youtube.com/" to null,
-                                                "https://google.com/" to ".google.com",
-                                                "https://www.google.com/" to ".google.com",
-                                                "https://google.fr/" to ".google.fr",
-                                                "https://www.google.fr/" to ".google.fr",
-                                            )
-                                            hostPairs.forEach { (target, domain) ->
-                                                staleNames.forEach { n ->
-                                                    cm.setCookie(target, "$n=; Path=/; Max-Age=0; Secure")
-                                                    if (domain != null && !n.startsWith("__Host-", true)) {
-                                                        cm.setCookie(target, "$n=; Domain=$domain; Path=/; Max-Age=0; Secure")
-                                                    }
-                                                }
-                                            }
-                                            cm.flush()
                                             if (!retriedGoogleMismatch) {
                                                 retriedGoogleMismatch = true
-                                                view?.clearCache(false)
-                                                view?.post {
-                                                    view.loadUrl("https://accounts.google.com/ServiceLogin?service=youtube")
+                                                cm.removeAllCookies {
+                                                    runCatching { WebStorage.getInstance().deleteAllData() }
+                                                    cm.setAcceptCookie(true)
+                                                    view?.let { cm.setAcceptThirdPartyCookies(it, true) }
+                                                    cm.flush()
+                                                    onRestoreCookiesToBrowser()
+                                                    view?.clearCache(true)
+                                                    view?.postDelayed({
+                                                        view.loadUrl("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fm.youtube.com%2F")
+                                                    }, 280L)
                                                 }
                                             }
                                             return
@@ -846,7 +835,14 @@ fun DownloadedVideosBrowserPanel(
                                             if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
                                                 addressText = loaded
                                             }
-                                            onAutoSyncCookies(loaded)
+                                            val lowerLoaded = loaded.lowercase()
+                                            val midGoogleAuth = lowerLoaded.contains("accounts.google.") ||
+                                                lowerLoaded.contains("accounts.youtube.") ||
+                                                lowerLoaded.contains("consent.google.") ||
+                                                lowerLoaded.contains("consent.youtube.")
+                                            if (!midGoogleAuth) {
+                                                onAutoSyncCookies(loaded)
+                                            }
                                         }
                                         view?.evaluateJavascript(
                                             if (isDesktopMode) DESKTOP_VIEWPORT_JS else UNLOCK_VIEWPORT_JS,

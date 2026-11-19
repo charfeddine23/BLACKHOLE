@@ -118,9 +118,14 @@ class VideoStreamExtractor(
                 if (sniffed.capturedUrls.isNotEmpty()) {
                     val sniffedStreams = mutableListOf<ExtractedStream>()
                     val fallbackAudio = sniffed.audioCandidateUrls.firstOrNull()
+                    val snifferProfile = if (platform == PlatformBadge.YOUTUBE) {
+                        ClientSpoofer.profiles.getOrNull(1) ?: ClientSpoofer.profiles.first()
+                    } else {
+                        ClientSpoofer.profiles.first()
+                    }
                     val defaultHeaders = ClientSpoofer.buildHeadersForUrl(
                         cleanUrl,
-                        ClientSpoofer.profiles.first(),
+                        snifferProfile,
                         refererOverride = cleanUrl,
                     )
                     for (capturedUrl in sniffed.capturedUrls) {
@@ -183,7 +188,7 @@ class VideoStreamExtractor(
 
             if (sawAuthChallenge) {
                 val authTargetUrl = when (platform) {
-                    PlatformBadge.YOUTUBE -> "https://accounts.google.com/ServiceLogin?service=youtube"
+                    PlatformBadge.YOUTUBE -> "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fm.youtube.com%2F"
                     PlatformBadge.INSTAGRAM -> "https://www.instagram.com/accounts/login/"
                     PlatformBadge.FACEBOOK -> "https://m.facebook.com/login/"
                     else -> cleanUrl

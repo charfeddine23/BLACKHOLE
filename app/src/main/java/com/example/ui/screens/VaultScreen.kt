@@ -6,6 +6,8 @@ import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.storage.StorageManager
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -222,6 +224,20 @@ fun VaultScreen(
         }
     }
 
+    val safTreeIntentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        vaultViewModel.endExternalSystemFlow()
+        val treeUri = if (result.resultCode == Activity.RESULT_OK) {
+            result.data?.data
+        } else {
+            null
+        }
+        if (treeUri != null) {
+            vaultViewModel.onSafDirectorySelected(treeUri)
+        }
+    }
+
     val launchVideoSelection: () -> Unit = {
         val pm = context.packageManager
         vaultViewModel.beginExternalSystemFlow()
@@ -287,19 +303,69 @@ fun VaultScreen(
     }
 
     val launchSafFolderSelection: () -> Unit = {
-        val pm = context.packageManager
-        val treeIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-        val resolvable = runCatching { treeIntent.resolveActivity(pm) != null }.getOrDefault(false)
         vaultViewModel.beginExternalSystemFlow()
-        val ok = if (resolvable) {
-            runCatching { safFolderLauncher.launch(null) }.isSuccess
-        } else {
-            false
+
+        val initialTreeHint = runCatching {
+            DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents",
+                "primary:Documents",
+            )
+        }.getOrNull()
+
+        val treeIntentFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+
+        fun buildBaseTreeIntent(): Intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(treeIntentFlags)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && initialTreeHint != null) {
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialTreeHint)
+            }
         }
-        if (!ok) {
+
+        val launched = when {
+            // 1. Standard ActivityResultContracts.OpenDocumentTree (never pre-blocked by resolveActivity)
+            runCatching { safFolderLauncher.launch(initialTreeHint) }.isSuccess -> true
+            runCatching { safFolderLauncher.launch(null) }.isSuccess -> true
+
+            // 2. Android 10+ StorageManager primary volume open-document-tree intent
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && runCatching {
+                val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
+                val smIntent = storageManager?.primaryStorageVolume?.createOpenDocumentTreeIntent()?.apply {
+                    addFlags(treeIntentFlags)
+                } ?: return@runCatching false
+                safTreeIntentLauncher.launch(smIntent)
+                true
+            }.getOrDefault(false) -> true
+
+            // 3. Explicit Google / AOSP DocumentsUI packages
+            runCatching {
+                safTreeIntentLauncher.launch(
+                    buildBaseTreeIntent().setPackage("com.google.android.documentsui"),
+                )
+            }.isSuccess -> true
+
+            runCatching {
+                safTreeIntentLauncher.launch(
+                    buildBaseTreeIntent().setPackage("com.android.documentsui"),
+                )
+            }.isSuccess -> true
+
+            // 4. Raw ACTION_OPEN_DOCUMENT_TREE chooser fallback
+            runCatching {
+                safTreeIntentLauncher.launch(
+                    Intent.createChooser(buildBaseTreeIntent(), "Select External Vault Folder"),
+                )
+            }.isSuccess -> true
+
+            else -> false
+        }
+
+        if (!launched) {
             vaultViewModel.endExternalSystemFlow()
             vaultViewModel.reportStatusError(
-                "External SAF folder picker is not available on this device — Private Internal Vault remains active.",
+                "No system Files/Documents app found to pick an external folder — Private Internal Vault remains active.",
             )
         }
     }

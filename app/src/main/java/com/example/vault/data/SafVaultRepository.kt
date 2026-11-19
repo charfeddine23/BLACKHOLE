@@ -113,10 +113,10 @@ class SafVaultRepository(context: Context) {
         }.getOrDefault(false)
         val doc = runCatching { DocumentFile.fromTreeUri(appContext, uri) }.getOrNull()
         val writable = runCatching { doc != null && doc.exists() && doc.canWrite() }.getOrDefault(false)
-        if (!hasPersistedPerm || !writable) {
+        if (!writable && !hasPersistedPerm) {
             return null
         }
-        return uri
+        return if (writable) uri else null
     }
 
     suspend fun isExternalSafActive(): Boolean = getSafTreeUri() != null
@@ -134,9 +134,23 @@ class SafVaultRepository(context: Context) {
     }
 
     suspend fun persistSafTreeUri(treeUri: Uri): Boolean = withContext(Dispatchers.IO) {
-        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-        runCatching {
-            appContext.contentResolver.takePersistableUriPermission(treeUri, flags)
+        val bothFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val tookBoth = runCatching {
+            appContext.contentResolver.takePersistableUriPermission(treeUri, bothFlags)
+        }.isSuccess
+        if (!tookBoth) {
+            runCatching {
+                appContext.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+            runCatching {
+                appContext.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
         }
         val doc = runCatching { DocumentFile.fromTreeUri(appContext, treeUri) }.getOrNull()
         val writable = runCatching { doc != null && doc.exists() && doc.canWrite() }.getOrDefault(false)

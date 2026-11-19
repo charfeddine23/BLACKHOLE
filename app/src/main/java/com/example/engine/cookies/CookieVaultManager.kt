@@ -2,6 +2,7 @@ package com.example.engine.cookies
 
 import android.content.Context
 import android.webkit.CookieManager
+import android.webkit.WebStorage
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
 import com.pulse.blackhole.data.vault.SessionVaultManager
@@ -14,6 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -23,6 +25,7 @@ import okhttp3.HttpUrl
 import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.resume
 
 data class StoredCookieEntry(
     val domain: String,
@@ -218,36 +221,61 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         parsed.size
     }
 
+    private val googleResetMutex = Mutex()
+
+    private fun isGoogleOrYoutubeDomain(domain: String): Boolean {
+        val d = domain.lowercase().trimStart('.')
+        return d == "google.com" || d.endsWith(".google.com") ||
+            d == "google.fr" || d.endsWith(".google.fr") ||
+            d.contains(".google.") || d.startsWith("google.") ||
+            d == "youtube.com" || d.endsWith(".youtube.com") ||
+            d == "youtu.be" || d.endsWith(".youtu.be") ||
+            d == "googleusercontent.com" || d.endsWith(".googleusercontent.com")
+    }
+
     /**
      * Pushes missing permanently saved AES-256 cookies back into Android WebView's CookieManager
-     * without overwriting live Chromium cookies or touching Google's native Sign-In handshake cookies.
+     * without overwriting live Chromium cookies or touching Google/YouTube native Chromium cookies.
      */
     suspend fun restoreVaultCookiesToWebView(): Int {
-        val needsResetV3 = !sessionVault.hasCompletedGoogleCookieResetV3()
-        var cacheCleaned = false
+        googleResetMutex.withLock {
+            val needsResetV4 = !sessionVault.hasCompletedGoogleCookieResetV4()
+            var cacheCleaned = false
 
-        listOf("google.com", "google.fr", "youtube.com", "accounts.google.com", "accounts.youtube.com").forEach { key ->
-            cookieCache[key]?.let { list ->
-                synchronized(list) {
-                    val removed = list.removeAll { entry ->
-                        isTransientGoogleHandshakeCookie(entry.name) ||
-                            entry.name.startsWith("__Host-", ignoreCase = true) ||
-                            isGoogleAccountsHostOnlyCookie(entry.name)
+            if (needsResetV4) {
+                val keysToPurge = cookieCache.keys.filter { isGoogleOrYoutubeDomain(it) }
+                keysToPurge.forEach { key ->
+                    if (cookieCache.remove(key) != null) cacheCleaned = true
+                }
+                if (cacheCleaned) {
+                    refreshFlowCounters()
+                    withContext(Dispatchers.IO) {
+                        mutex.withLock { persistToDisk() }
                     }
-                    if (removed) cacheCleaned = true
+                }
+                resetGoogleWebViewCookies()
+                sessionVault.markGoogleCookieResetV3Done()
+                sessionVault.markGoogleCookieResetV4Done()
+            } else {
+                listOf("google.com", "google.fr", "youtube.com", "accounts.google.com", "accounts.youtube.com").forEach { key ->
+                    cookieCache[key]?.let { list ->
+                        synchronized(list) {
+                            val removed = list.removeAll { entry ->
+                                isTransientGoogleHandshakeCookie(entry.name) ||
+                                    entry.name.startsWith("__Host-", ignoreCase = true) ||
+                                    isGoogleAccountsHostOnlyCookie(entry.name)
+                            }
+                            if (removed) cacheCleaned = true
+                        }
+                    }
+                }
+                if (cacheCleaned) {
+                    refreshFlowCounters()
+                    vaultScope.launch {
+                        mutex.withLock { persistToDisk() }
+                    }
                 }
             }
-        }
-        if (cacheCleaned) {
-            refreshFlowCounters()
-            vaultScope.launch {
-                mutex.withLock { persistToDisk() }
-            }
-        }
-
-        if (needsResetV3) {
-            resetGoogleWebViewCookies()
-            sessionVault.markGoogleCookieResetV3Done()
         }
 
         val snapshot = cookieCache.values.flatten()
@@ -255,14 +283,12 @@ class CookieVaultManager private constructor(private val appContext: Context) {
 
         val permanentMode = _keepForeverEnabled.value
         val respectExpiry = !permanentMode
-        // Never re-inject Google/accounts handshake cookies into WebView; let Chromium manage Google auth natively.
+        // Never inject Google or YouTube cookies into WebView; Chromium manages Google/YouTube auth natively.
         val validEntries = snapshot.filter { entry ->
             !entry.isExpired(respectExpiry = respectExpiry) &&
                 entry.value.isNotBlank() &&
                 !isTransientGoogleHandshakeCookie(entry.name) &&
-                !entry.domain.startsWith("accounts.", ignoreCase = true) &&
-                !entry.domain.equals("google.com", ignoreCase = true) &&
-                !entry.domain.equals("google.fr", ignoreCase = true)
+                !isGoogleOrYoutubeDomain(entry.domain)
         }
         if (validEntries.isEmpty()) return 0
 
@@ -328,33 +354,21 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         }
     }
 
+    /**
+     * Performs a complete Chromium cookie & WebStorage wipe so stale/subpath/HttpOnly Google cookies
+     * causing CookieMismatch (e.g., on www.google.fr) are completely eliminated.
+     */
     suspend fun resetGoogleWebViewCookies() = withContext(Dispatchers.Main) {
         runCatching {
             val cm = CookieManager.getInstance()
             cm.setAcceptCookie(true)
-            val staleNames = listOf(
-                "__Host-GAPS", "GAPS", "LSID", "__Host-1PLSID", "__Host-3PLSID",
-                "ACCOUNT_CHOOSER", "SMSV", "OSID", "OTZ", "NID", "AEC", "SOCS",
-                "CONSENT", "1P_JAR", "__Secure-ENID", "DV", "UULE",
-            )
-            val targetHosts = listOf(
-                "https://accounts.google.com/" to null,
-                "https://accounts.youtube.com/" to null,
-                "https://google.com/" to ".google.com",
-                "https://www.google.com/" to ".google.com",
-                "https://google.fr/" to ".google.fr",
-                "https://www.google.fr/" to ".google.fr",
-                "https://youtube.com/" to ".youtube.com",
-                "https://m.youtube.com/" to ".youtube.com",
-            )
-            targetHosts.forEach { (url, domain) ->
-                staleNames.forEach { name ->
-                    cm.setCookie(url, "$name=; Path=/; Max-Age=0; Secure")
-                    if (domain != null && !name.startsWith("__Host-", true)) {
-                        cm.setCookie(url, "$name=; Domain=$domain; Path=/; Max-Age=0; Secure")
-                    }
+            suspendCancellableCoroutine<Unit> { cont ->
+                cm.removeAllCookies {
+                    cm.flush()
+                    if (cont.isActive) cont.resume(Unit)
                 }
             }
+            runCatching { WebStorage.getInstance().deleteAllData() }
             cm.flush()
         }
     }
@@ -363,9 +377,21 @@ class CookieVaultManager private constructor(private val appContext: Context) {
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
 
+        val lowerUrl = url.lowercase()
+        val isAuthHandshakeUrl = lowerUrl.contains("accounts.google.") ||
+            lowerUrl.contains("accounts.youtube.") ||
+            lowerUrl.contains("cookiemismatch") ||
+            lowerUrl.contains("consent.google.") ||
+            lowerUrl.contains("consent.youtube.")
+
         val candidateUrls = linkedSetOf<String>()
-        if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
-            candidateUrls.add(url)
+        if (!isAuthHandshakeUrl &&
+            (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true))
+        ) {
+            val urlHost = runCatching { java.net.URI(url).host.orEmpty().lowercase() }.getOrDefault("")
+            if (!urlHost.contains("google.")) {
+                candidateUrls.add(url)
+            }
         }
         candidateUrls.addAll(KNOWN_PLATFORM_COOKIE_URLS)
 
@@ -381,7 +407,7 @@ class CookieVaultManager private constructor(private val appContext: Context) {
             val rawHeader = runCatching { cookieManager.getCookie(target) }.getOrNull().orEmpty()
             if (rawHeader.isBlank()) return@forEach
             val host = runCatching { java.net.URI(target).host.orEmpty().lowercase() }.getOrDefault("")
-            if (host.isBlank()) return@forEach
+            if (host.isBlank() || host.contains("google.")) return@forEach
 
             rawHeader.split(";").forEach { segment ->
                 val idx = segment.indexOf('=')
@@ -814,7 +840,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
             "https://facebook.com/",
             "https://www.youtube.com/",
             "https://m.youtube.com/",
-            "https://www.google.com/",
             "https://www.tiktok.com/",
             "https://m.tiktok.com/",
             "https://x.com/",

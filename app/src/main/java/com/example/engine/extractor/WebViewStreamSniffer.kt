@@ -53,7 +53,17 @@ class WebViewStreamSniffer(
                 // (prevents corrupting Google/YouTube SameSite/HttpOnly/__Host- cookies)
                 val existingLive = cookieManager.getCookie(targetUrl)
                 val isGoogleFamily = targetUrl.contains("google.", ignoreCase = true) ||
-                    targetUrl.contains("youtube.com", ignoreCase = true)
+                    targetUrl.contains("youtube.com", ignoreCase = true) ||
+                    targetUrl.contains("youtu.be", ignoreCase = true)
+                if ((targetUrl.contains("youtube.com", ignoreCase = true) || targetUrl.contains("youtu.be", ignoreCase = true)) &&
+                    (existingLive.isNullOrBlank() || !existingLive.contains("SOCS=", ignoreCase = true))
+                ) {
+                    cookieManager.setCookie(
+                        "https://www.youtube.com/",
+                        "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; Domain=.youtube.com; Path=/; Secure; SameSite=None",
+                    )
+                    cookieManager.flush()
+                }
                 if (existingLive.isNullOrBlank() && !isGoogleFamily) {
                     val storedHeader = cookieVault.getCookieHeaderForUrl(targetUrl)
                     if (storedHeader.isNotBlank()) {
@@ -145,6 +155,10 @@ class WebViewStreamSniffer(
                                   if (el.currentSrc && el.currentSrc.startsWith('http')) out.videos.push(el.currentSrc);
                                   if (el.src && el.src.startsWith('http')) out.videos.push(el.src);
                                 });
+                                try {
+                                  var consentBtn = document.querySelector('form[action*="consent"] button, button[aria-label*="Accept"], button[aria-label*="Accepter"]');
+                                  if (consentBtn && !window.ytInitialPlayerResponse) { consentBtn.click(); }
+                                } catch (e2) {}
                                 if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData) {
                                   var sd = window.ytInitialPlayerResponse.streamingData;
                                   if (sd.hlsManifestUrl) out.videos.push(sd.hlsManifestUrl);
