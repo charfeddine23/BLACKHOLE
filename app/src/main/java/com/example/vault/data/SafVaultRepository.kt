@@ -38,6 +38,12 @@ enum class VaultStorageMode {
     SAF_EXTERNAL,
 }
 
+enum class VaultCategory {
+    PHOTOS,
+    VIDEOS,
+    FILES,
+}
+
 data class VaultFileEntry(
     val id: String,
     val fileName: String,
@@ -46,6 +52,8 @@ data class VaultFileEntry(
     val lastModifiedMs: Long,
     val uriString: String,
     val isSafExternal: Boolean,
+    val mimeType: String = "video/mp4",
+    val category: VaultCategory = VaultCategory.VIDEOS,
 )
 
 class SafVaultRepository(context: Context) {
@@ -269,15 +277,13 @@ class SafVaultRepository(context: Context) {
                             .filter { it.isFile && it.name?.endsWith(VAULT_EXT, ignoreCase = true) == true }
                             .map { doc ->
                                 val name = doc.name ?: "vault_item$VAULT_EXT"
-                                val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX$name", null)
-                                VaultFileEntry(
-                                    id = name.removeSuffix(VAULT_EXT),
+                                buildVaultEntry(
+                                    prefs = prefs,
                                     fileName = name,
-                                    displayTitle = cachedTitle ?: "Encrypted Media (${name.take(12)})",
                                     sizeBytes = doc.length(),
                                     lastModifiedMs = doc.lastModified(),
                                     uriString = doc.uri.toString(),
-                                    isSafExternal = true,
+                                    isExternalFlag = true,
                                 )
                             }
                             .sortedByDescending { it.lastModifiedMs }
@@ -314,15 +320,13 @@ class SafVaultRepository(context: Context) {
         return (dir.listFiles()?.toList() ?: emptyList())
             .filter { it.isFile && it.name.endsWith(VAULT_EXT, ignoreCase = true) }
             .map { file ->
-                val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX${file.name}", null)
-                VaultFileEntry(
-                    id = file.name.removeSuffix(VAULT_EXT),
+                buildVaultEntry(
+                    prefs = prefs,
                     fileName = file.name,
-                    displayTitle = cachedTitle ?: "Encrypted Media (${file.name.take(12)})",
                     sizeBytes = file.length(),
                     lastModifiedMs = file.lastModified(),
                     uriString = Uri.fromFile(file).toString(),
-                    isSafExternal = isExternalFlag,
+                    isExternalFlag = isExternalFlag,
                 )
             }
             .sortedByDescending { it.lastModifiedMs }
@@ -365,17 +369,14 @@ class SafVaultRepository(context: Context) {
                     if (!name.contains(VAULT_EXT, ignoreCase = true)) continue
                     val size = cursor.getLong(sizeIdx)
                     val modifiedMs = cursor.getLong(dateIdx) * 1000L
-                    val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX$name", null)
-                        ?: prefs.getString("$KEY_TITLE_PREFIX${name.substringBefore(".bin")}", null)
                     results.add(
-                        VaultFileEntry(
-                            id = name.substringBefore(VAULT_EXT),
+                        buildVaultEntry(
+                            prefs = prefs,
                             fileName = name,
-                            displayTitle = cachedTitle ?: "Encrypted Media (${name.take(12)})",
                             sizeBytes = size,
                             lastModifiedMs = modifiedMs,
                             uriString = rowUri.toString(),
-                            isSafExternal = true,
+                            isExternalFlag = true,
                         ),
                     )
                 }
@@ -387,8 +388,9 @@ class SafVaultRepository(context: Context) {
     fun encryptMediaFromUri(
         sourceUri: Uri,
         password: CharArray,
+        fallbackCategory: VaultCategory = VaultCategory.VIDEOS,
     ): Flow<VaultOperationProgress> = flow {
-        val meta = resolveSourceMetadata(sourceUri)
+        val meta = resolveSourceMetadata(sourceUri, fallbackCategory)
         val inputStream = if (sourceUri.scheme.equals("file", ignoreCase = true)) {
             val filePath = sourceUri.path ?: throw IllegalStateException("Invalid selected file path.")
             File(filePath).inputStream()
@@ -445,7 +447,7 @@ class SafVaultRepository(context: Context) {
                             }
                             runCatching { stagingDoc.delete() }
                         }
-                        cacheEncryptedDisplayTitle(finalName, meta.originalName)
+                        cacheEncryptedMetadata(finalName, meta.originalName, meta.mimeType)
                     },
                     onCleanupFailed = {
                         runCatching { outStream.close() }
@@ -491,8 +493,8 @@ class SafVaultRepository(context: Context) {
                             }
                             resolver.update(pendingUri, commitValues, null, null)
                             val committedName = queryDisplayNameForUri(pendingUri) ?: finalName
-                            cacheEncryptedDisplayTitle(committedName, meta.originalName)
-                            cacheEncryptedDisplayTitle(finalName, meta.originalName)
+                            cacheEncryptedMetadata(committedName, meta.originalName, meta.mimeType)
+                            cacheEncryptedMetadata(finalName, meta.originalName, meta.mimeType)
                         },
                         onCleanupFailed = {
                             runCatching { outStream.close() }
@@ -544,7 +546,7 @@ class SafVaultRepository(context: Context) {
                     stagingFile.copyTo(finalFile, overwrite = true)
                     UltraVaultEngine.secureDeleteFile(stagingFile)
                 }
-                cacheEncryptedDisplayTitle(finalName, meta.originalName)
+                cacheEncryptedMetadata(finalName, meta.originalName, meta.mimeType)
             },
             onCleanupFailed = {
                 runCatching { outStream.close() }
@@ -595,7 +597,10 @@ class SafVaultRepository(context: Context) {
             }.getOrDefault(false)
         }
         if (deleted) {
-            getSecurePrefs().edit().remove("$KEY_TITLE_PREFIX${entry.fileName}").commit()
+            getSecurePrefs().edit()
+                .remove("$KEY_TITLE_PREFIX${entry.fileName}")
+                .remove("$KEY_MIME_PREFIX${entry.fileName}")
+                .commit()
         }
         deleted
     }
@@ -604,6 +609,17 @@ class SafVaultRepository(context: Context) {
         withContext(Dispatchers.IO) {
             getSecurePrefs().edit().putString("$KEY_TITLE_PREFIX$fileName", originalTitle).commit()
         }
+
+    suspend fun cacheEncryptedMetadata(
+        fileName: String,
+        originalTitle: String,
+        mimeType: String,
+    ) = withContext(Dispatchers.IO) {
+        getSecurePrefs().edit()
+            .putString("$KEY_TITLE_PREFIX$fileName", originalTitle)
+            .putString("$KEY_MIME_PREFIX$fileName", mimeType)
+            .commit()
+    }
 
     suspend fun listBlackholeDownloadedVideos(): List<File> = withContext(Dispatchers.IO) {
         val downloadsDir = File(appContext.filesDir, "blackhole_videos")
@@ -645,19 +661,39 @@ class SafVaultRepository(context: Context) {
         }.getOrNull()
     }
 
-    private fun resolveSourceMetadata(uri: Uri): VaultMediaMetadata {
+    private fun resolveSourceMetadata(
+        uri: Uri,
+        fallbackCategory: VaultCategory,
+    ): VaultMediaMetadata {
+        val defaultExt = when (fallbackCategory) {
+            VaultCategory.PHOTOS -> "jpg"
+            VaultCategory.VIDEOS -> "mp4"
+            VaultCategory.FILES -> "bin"
+        }
+        val defaultMime = when (fallbackCategory) {
+            VaultCategory.PHOTOS -> "image/jpeg"
+            VaultCategory.VIDEOS -> "video/mp4"
+            VaultCategory.FILES -> "application/octet-stream"
+        }
+        val defaultPrefix = when (fallbackCategory) {
+            VaultCategory.PHOTOS -> "vault_photo"
+            VaultCategory.VIDEOS -> "vault_video"
+            VaultCategory.FILES -> "vault_file"
+        }
+
         if (uri.scheme.equals("file", ignoreCase = true)) {
             val file = uri.path?.let(::File)
             val name = file?.name?.takeIf { it.isNotBlank() }
-                ?: "vault_video_${System.currentTimeMillis()}.mp4"
+                ?: "${defaultPrefix}_${System.currentTimeMillis()}.$defaultExt"
             val size = file?.takeIf { it.exists() }?.length() ?: 0L
+            val mime = inferMimeFromFileName(name) ?: defaultMime
             return VaultMediaMetadata(
                 originalName = name,
-                mimeType = "video/mp4",
+                mimeType = mime,
                 originalSizeBytes = size,
             )
         }
-        var displayName = "vault_video_${System.currentTimeMillis()}.mp4"
+        var displayName = "${defaultPrefix}_${System.currentTimeMillis()}.$defaultExt"
         var sizeBytes = 0L
         runCatching {
             appContext.contentResolver.query(
@@ -686,13 +722,50 @@ class SafVaultRepository(context: Context) {
                 }
             }
         }
-        val mime = runCatching { appContext.contentResolver.getType(uri) }
+        val resolvedMime = runCatching { appContext.contentResolver.getType(uri) }
             .getOrNull()
-            ?.takeIf { it.isNotBlank() } ?: "video/mp4"
+            ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
+            ?: inferMimeFromFileName(displayName)
+            ?: defaultMime
         return VaultMediaMetadata(
             originalName = displayName,
-            mimeType = mime,
+            mimeType = resolvedMime,
             originalSizeBytes = sizeBytes,
+        )
+    }
+
+    private fun buildVaultEntry(
+        prefs: SharedPreferences,
+        fileName: String,
+        sizeBytes: Long,
+        lastModifiedMs: Long,
+        uriString: String,
+        isExternalFlag: Boolean,
+    ): VaultFileEntry {
+        val normalizedKey = fileName.substringBefore(".bin")
+        val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX$fileName", null)
+            ?: prefs.getString("$KEY_TITLE_PREFIX$normalizedKey", null)
+        val cachedMime = prefs.getString("$KEY_MIME_PREFIX$fileName", null)
+            ?: prefs.getString("$KEY_MIME_PREFIX$normalizedKey", null)
+        val displayTitle = cachedTitle ?: "Encrypted Item (${fileName.take(10)})"
+        val effectiveMime = cachedMime
+            ?: inferMimeFromFileName(cachedTitle.orEmpty())
+            ?: if (cachedTitle == null || cachedTitle.startsWith("vault_video", ignoreCase = true)) {
+                "video/mp4"
+            } else {
+                "application/octet-stream"
+            }
+        val category = classifyCategory(displayTitle, effectiveMime)
+        return VaultFileEntry(
+            id = fileName.substringBefore(VAULT_EXT),
+            fileName = fileName,
+            displayTitle = displayTitle,
+            sizeBytes = sizeBytes,
+            lastModifiedMs = lastModifiedMs,
+            uriString = uriString,
+            isSafExternal = isExternalFlag,
+            mimeType = effectiveMime,
+            category = category,
         )
     }
 
@@ -703,9 +776,57 @@ class SafVaultRepository(context: Context) {
         private const val KEY_STORAGE_MODE = "KEY_STORAGE_MODE"
         private const val KEY_BIOMETRIC_MASTER_SECRET = "KEY_BIOMETRIC_MASTER_SECRET"
         private const val KEY_TITLE_PREFIX = "TITLE_"
+        private const val KEY_MIME_PREFIX = "MIME_"
         private const val INTERNAL_VAULT_FOLDER = "blackhole_vault"
         private const val PUBLIC_VAULT_FOLDER = "BlackholeVault"
         private const val VAULT_EXT = ".bhv"
         private const val STAGING_SUFFIX = ".tmp"
+
+        private val PHOTO_EXTENSIONS = setOf(
+            "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "bmp", "avif",
+        )
+        private val VIDEO_EXTENSIONS = setOf(
+            "mp4", "mkv", "webm", "mov", "m4v", "3gp", "avi", "ts", "flv",
+        )
+
+        fun inferMimeFromFileName(fileName: String): String? {
+            return when (fileName.substringAfterLast('.', "").lowercase()) {
+                "jpg", "jpeg" -> "image/jpeg"
+                "png" -> "image/png"
+                "webp" -> "image/webp"
+                "gif" -> "image/gif"
+                "heic" -> "image/heic"
+                "heif" -> "image/heif"
+                "bmp" -> "image/bmp"
+                "avif" -> "image/avif"
+                "mp4", "m4v" -> "video/mp4"
+                "mkv" -> "video/x-matroska"
+                "webm" -> "video/webm"
+                "mov" -> "video/quicktime"
+                "3gp" -> "video/3gpp"
+                "avi" -> "video/x-msvideo"
+                "pdf" -> "application/pdf"
+                "zip" -> "application/zip"
+                "txt", "log", "md" -> "text/plain"
+                "json" -> "application/json"
+                "csv" -> "text/csv"
+                "mp3" -> "audio/mpeg"
+                "m4a" -> "audio/mp4"
+                "wav" -> "audio/wav"
+                "doc" -> "application/msword"
+                "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                else -> null
+            }
+        }
+
+        fun classifyCategory(title: String, mimeType: String): VaultCategory {
+            val lowerMime = mimeType.lowercase()
+            val ext = title.substringAfterLast('.', "").lowercase()
+            return when {
+                lowerMime.startsWith("image/") || ext in PHOTO_EXTENSIONS -> VaultCategory.PHOTOS
+                lowerMime.startsWith("video/") || ext in VIDEO_EXTENSIONS -> VaultCategory.VIDEOS
+                else -> VaultCategory.FILES
+            }
+        }
     }
 }

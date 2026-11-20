@@ -3,4 +3,5 @@
     <files-path name="blackhole_videos" path="blackhole_videos/" />
     <files-path name="blackhole_thumbs" path="blackhole_thumbs/" />
     <external-files-path name="external_movies" path="Movies/" />
+    <cache-path name="vault_stream_tmp" path="vault_stream_tmp/" />
 </paths>

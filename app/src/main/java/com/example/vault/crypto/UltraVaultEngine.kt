@@ -523,13 +523,29 @@ object UltraVaultEngine {
 
     private fun sanitizeExtension(name: String, mime: String): String {
         val fromName = name.substringAfterLast('.', "").lowercase().filter { it.isLetterOrDigit() }
-        if (fromName in setOf("mp4", "mkv", "webm", "mov", "m4v", "3gp", "avi")) {
+        if (fromName.length in 1..10 && fromName != "bhv" && fromName != "tmp") {
             return fromName
         }
+        val lowerMime = mime.lowercase()
         return when {
-            mime.contains("webm", ignoreCase = true) -> "webm"
-            mime.contains("matroska", ignoreCase = true) -> "mkv"
-            else -> "mp4"
+            lowerMime.contains("jpeg") || lowerMime.contains("jpg") -> "jpg"
+            lowerMime.contains("png") -> "png"
+            lowerMime.contains("webp") -> "webp"
+            lowerMime.contains("gif") -> "gif"
+            lowerMime.contains("heic") -> "heic"
+            lowerMime.contains("heif") -> "heif"
+            lowerMime.contains("bmp") -> "bmp"
+            lowerMime.startsWith("image/") -> "jpg"
+            lowerMime.contains("webm") -> "webm"
+            lowerMime.contains("matroska") -> "mkv"
+            lowerMime.startsWith("video/") -> "mp4"
+            lowerMime.contains("pdf") -> "pdf"
+            lowerMime.contains("zip") -> "zip"
+            lowerMime.contains("json") -> "json"
+            lowerMime.contains("text/plain") -> "txt"
+            lowerMime.contains("mpeg") || lowerMime.contains("mp3") -> "mp3"
+            lowerMime.startsWith("audio/") -> "m4a"
+            else -> "bin"
         }
     }
 }

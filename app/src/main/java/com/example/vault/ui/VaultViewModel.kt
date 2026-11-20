@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.vault.crypto.UltraVaultEngine
 import com.example.vault.crypto.VaultOperationStage
 import com.example.vault.data.SafVaultRepository
+import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultFileEntry
 import com.example.vault.data.VaultStorageMode
 import kotlinx.coroutines.CancellationException
@@ -37,11 +38,13 @@ data class VaultPlaybackSession(
     val tempFile: File,
     val displayTitle: String,
     val mimeType: String,
+    val category: VaultCategory,
 )
 
 data class VaultUiState(
     val isLocked: Boolean = true,
     val biometricVerified: Boolean = false,
+    val selectedCategory: VaultCategory? = null,
     val isExternalSafActive: Boolean = false,
     val storageMode: VaultStorageMode = VaultStorageMode.INTERNAL,
     val storageLabel: String = "Private Internal Vault (App Storage)",
@@ -127,6 +130,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun selectCategory(category: VaultCategory?) {
+        _uiState.update { it.copy(selectedCategory = category, statusMessage = null) }
+    }
+
     fun lockVaultAndWipe() {
         awaitingExternalSystemFlow = false
         activeTransferJob?.cancel()
@@ -137,6 +144,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 isLocked = true,
                 biometricVerified = false,
+                selectedCategory = null,
                 entries = emptyList(),
                 activePlayback = null,
                 transferState = VaultTransferUiState.Idle,
@@ -237,10 +245,13 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             reportStatusError("Downloaded video file no longer exists.")
             return
         }
-        encryptVideoFromPicker(Uri.fromFile(file))
+        encryptVideoFromPicker(Uri.fromFile(file), VaultCategory.VIDEOS)
     }
 
-    fun encryptVideoFromPicker(sourceUri: Uri) {
+    fun encryptVideoFromPicker(
+        sourceUri: Uri,
+        fallbackCategory: VaultCategory = _uiState.value.selectedCategory ?: VaultCategory.VIDEOS,
+    ) {
         if (activeTransferJob?.isActive == true) return
         activeTransferJob = viewModelScope.launch {
             val pwd = sessionPasswordChars ?: runCatching {
@@ -262,14 +273,18 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
             val pwdCopy = pwd.copyOf()
             try {
-                repository.encryptMediaFromUri(sourceUri, pwdCopy).collect { progress ->
-                    val label = progress.metadata?.originalName ?: "Encrypting video"
+                repository.encryptMediaFromUri(sourceUri, pwdCopy, fallbackCategory).collect { progress ->
+                    val label = progress.metadata?.originalName ?: "Encrypting item"
                     when (progress.stage) {
                         VaultOperationStage.COMPLETED -> {
+                            val resolvedCategory = progress.metadata?.let {
+                                SafVaultRepository.classifyCategory(it.originalName, it.mimeType)
+                            } ?: fallbackCategory
                             _uiState.update {
                                 it.copy(
                                     transferState = VaultTransferUiState.Idle,
-                                    statusMessage = "Encrypted '$label' with AES-256-GCM.",
+                                    selectedCategory = it.selectedCategory ?: resolvedCategory,
+                                    statusMessage = "تم تشفير '$label' بنجاح وحفظه في الخزنة.",
                                     isErrorStatus = false,
                                 )
                             }
@@ -296,7 +311,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update {
                     it.copy(
                         transferState = VaultTransferUiState.Idle,
-                        statusMessage = "Encryption cancelled — temporary staging files wiped.",
+                        statusMessage = "تم إلغاء التشفير ومسح الملفات المؤقتة.",
                         isErrorStatus = false,
                     )
                 }
@@ -304,7 +319,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update {
                     it.copy(
                         transferState = VaultTransferUiState.Idle,
-                        statusMessage = t.message ?: "Encryption failed cleanly without corrupting vault.",
+                        statusMessage = t.message ?: "تعذر تشفير الملف المختار.",
                         isErrorStatus = true,
                     )
                 }
@@ -338,7 +353,15 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                             val decryptedFile = progress.outputFile
                             val meta = progress.metadata
                             if (decryptedFile != null && decryptedFile.exists() && meta != null) {
-                                repository.cacheEncryptedDisplayTitle(entry.fileName, meta.originalName)
+                                repository.cacheEncryptedMetadata(
+                                    entry.fileName,
+                                    meta.originalName,
+                                    meta.mimeType,
+                                )
+                                val sessionCategory = SafVaultRepository.classifyCategory(
+                                    meta.originalName,
+                                    meta.mimeType,
+                                )
                                 _uiState.update {
                                     it.copy(
                                         transferState = VaultTransferUiState.Idle,
@@ -346,6 +369,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                             tempFile = decryptedFile,
                                             displayTitle = meta.originalName,
                                             mimeType = meta.mimeType,
+                                            category = sessionCategory,
                                         ),
                                         statusMessage = null,
                                     )
