@@ -1,7 +1,12 @@
 package com.example.ui.screens
 
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,11 +34,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.DriveFileMove
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material.icons.rounded.AddPhotoAlternate
 import androidx.compose.material.icons.rounded.Close
@@ -41,6 +49,7 @@ import androidx.compose.material.icons.rounded.FolderCopy
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -54,6 +63,7 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -63,7 +73,11 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -78,15 +92,17 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
-import com.example.vault.crypto.VaultOperationStage
+import com.example.util.formatByteSize
+import com.example.util.formatShortDate
 import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultFileEntry
 import com.example.vault.data.VaultStorageMode
+import com.example.vault.data.VaultTransferStage
 import com.example.vault.ui.VaultTransferUiState
 import com.example.vault.ui.VaultUiState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 
 @Composable
@@ -95,6 +111,7 @@ fun VaultHomeCategoriesDashboard(
     onBack: () -> Unit,
     onLockNow: () -> Unit,
     onOpenCategory: (VaultCategory) -> Unit,
+    onRequestAllFilesAccess: () -> Unit,
     onSelectPhoneDownloads: () -> Unit,
     onSelectSafFolder: () -> Unit,
     onRevertInternalStorage: () -> Unit,
@@ -120,14 +137,21 @@ fun VaultHomeCategoriesDashboard(
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
     ) {
-        // Header Row
         VaultTopHeaderBar(
             title = "BLACKHOLE VAULT",
-            subtitle = "BHVAULT2 · AES-256-GCM · ${uiState.entries.size} ENCRYPTED",
+            subtitle = "حماية بالبصمة · .nomedia · ${uiState.entries.size} عنصر محفوظ",
             subtitleColor = NeonCyan,
             onBack = onBack,
             onLockNow = onLockNow,
         )
+
+        // Device Files Access Permission Card
+        VaultFilesPermissionCard(
+            hasAllFilesAccess = uiState.hasAllFilesAccess,
+            onGrantPermission = onRequestAllFilesAccess,
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Storage Location Switcher Card
         VaultStorageModeCard(
@@ -147,7 +171,7 @@ fun VaultHomeCategoriesDashboard(
         Spacer(modifier = Modifier.height(16.dp))
 
         Text(
-            text = "الأقسام المشفرة",
+            text = "الأقسام المحمية",
             style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
             color = ChromeSilver,
             modifier = Modifier.padding(horizontal = 18.dp),
@@ -213,6 +237,96 @@ fun VaultHomeCategoriesDashboard(
 }
 
 @Composable
+private fun VaultFilesPermissionCard(
+    hasAllFilesAccess: Boolean,
+    onGrantPermission: () -> Unit,
+) {
+    val accent = if (hasAllFilesAccess) EmeraldPulse else NeonCyan
+    Surface(
+        color = Color(0xFF0E1522),
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(0.85.dp, accent.copy(alpha = if (hasAllFilesAccess) 0.48f else 0.55f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Surface(
+                    color = accent.copy(alpha = 0.16f),
+                    shape = CircleShape,
+                    modifier = Modifier.size(38.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = if (hasAllFilesAccess) Icons.Outlined.VerifiedUser else Icons.Outlined.Shield,
+                            contentDescription = "صلاحية الوصول إلى ملفات الجهاز",
+                            tint = accent,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (hasAllFilesAccess) {
+                            "صلاحية الوصول لملفات الجهاز مفعّلة"
+                        } else {
+                            "صلاحية الوصول إلى ملفات الجهاز"
+                        },
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        color = if (hasAllFilesAccess) EmeraldPulse else ChromeSilver,
+                    )
+                    Text(
+                        text = if (hasAllFilesAccess) {
+                            "يمكن نقل وإخفاء الصور والفيديوهات داخل الخزنة مع حذف الأصل تلقائياً."
+                        } else {
+                            "امنح الصلاحية لنقل الملفات مباشرة وإخفائها من المعرض وحذف النسخة الأصلية."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MutedSlate,
+                    )
+                }
+            }
+
+            if (!hasAllFilesAccess) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = onGrantPermission,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NeonCyan,
+                        contentColor = ObsidianVoid,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("vault_grant_files_permission_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Shield,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "منح صلاحية الوصول للملفات",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun VaultCategoryDetailScreen(
     category: VaultCategory,
     uiState: VaultUiState,
@@ -220,9 +334,10 @@ fun VaultCategoryDetailScreen(
     onLockNow: () -> Unit,
     onPickFromGallery: () -> Unit,
     onPickFromPhoneFiles: () -> Unit,
-    onEncryptDownloadedVideo: (File) -> Unit,
+    onMoveDownloadedVideo: (File) -> Unit,
     onCancelTransfer: () -> Unit,
-    onPlayEntry: (VaultFileEntry) -> Unit,
+    onOpenEntry: (VaultFileEntry) -> Unit,
+    onRestoreEntry: (VaultFileEntry) -> Unit,
     onDeleteEntry: (VaultFileEntry) -> Unit,
     onDismissStatus: () -> Unit,
 ) {
@@ -249,13 +364,12 @@ fun VaultCategoryDetailScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         VaultTopHeaderBar(
             title = categoryTitle,
-            subtitle = "${categoryEntries.size} عنصر مشفر · ${uiState.storageLabel}",
+            subtitle = "${categoryEntries.size} عنصر محمي · ${uiState.storageLabel}",
             subtitleColor = categoryAccent,
             onBack = onBackToCategories,
             onLockNow = onLockNow,
         )
 
-        // Direct Action Bar inside Category: Add from Gallery / Add from Phone Files
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -301,7 +415,7 @@ fun VaultCategoryDetailScreen(
             ) {
                 Icon(
                     imageVector = Icons.Outlined.FolderOpen,
-                    contentDescription = "Browse phone files",
+                    contentDescription = "تصفح ملفات الهاتف",
                     tint = categoryAccent,
                     modifier = Modifier.size(18.dp),
                 )
@@ -321,7 +435,6 @@ fun VaultCategoryDetailScreen(
             onDismissStatus = onDismissStatus,
         )
 
-        // Optional quick import strip inside VIDEOS for in-app downloaded videos
         if (category == VaultCategory.VIDEOS &&
             uiState.availableDownloadedVideos.isNotEmpty() &&
             uiState.transferState is VaultTransferUiState.Idle
@@ -329,7 +442,7 @@ fun VaultCategoryDetailScreen(
             Spacer(modifier = Modifier.height(8.dp))
             Column(modifier = Modifier.fillMaxWidth()) {
                 Text(
-                    text = "استيراد من فيديوهات التطبيق (${uiState.availableDownloadedVideos.size})",
+                    text = "نقل من فيديوهات التطبيق (${uiState.availableDownloadedVideos.size})",
                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
                     color = NeonCyan,
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp),
@@ -345,7 +458,7 @@ fun VaultCategoryDetailScreen(
                             border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.45f)),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(14.dp))
-                                .clickable { onEncryptDownloadedVideo(file) }
+                                .clickable { onMoveDownloadedVideo(file) }
                                 .minimumInteractiveComponentSize()
                                 .testTag("vault_import_download_${file.name}"),
                         ) {
@@ -354,10 +467,10 @@ fun VaultCategoryDetailScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Icon(
-                                    imageVector = Icons.Rounded.Lock,
-                                    contentDescription = "Encrypt ${file.name}",
+                                    imageVector = Icons.AutoMirrored.Rounded.DriveFileMove,
+                                    contentDescription = "نقل ${file.name} إلى الخزنة",
                                     tint = NeonCyan,
-                                    modifier = Modifier.size(14.dp),
+                                    modifier = Modifier.size(15.dp),
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
@@ -375,7 +488,6 @@ fun VaultCategoryDetailScreen(
             }
         }
 
-        // Stored Items inside the selected Category
         if (categoryEntries.isEmpty()) {
             Box(
                 modifier = Modifier
@@ -412,7 +524,7 @@ fun VaultCategoryDetailScreen(
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "اضغط على زر \"إضافة من المعرض\" لاختيار ونقل أي عنصر من هاتفك وتشفيره بأمان.",
+                        text = "اضغط على زر \"إضافة من المعرض\" لاختيار ونقل أي عنصر من هاتفك إلى الخزنة المحمية وإخفائه من المعرض.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MutedSlate,
                         textAlign = TextAlign.Center,
@@ -454,7 +566,8 @@ fun VaultCategoryDetailScreen(
                 items(categoryEntries, key = { it.uriString }) { item ->
                     VaultPhotoGridCard(
                         entry = item,
-                        onOpen = { onPlayEntry(item) },
+                        onOpen = { onOpenEntry(item) },
+                        onRestore = { onRestoreEntry(item) },
                         onDelete = { onDeleteEntry(item) },
                     )
                 }
@@ -468,10 +581,11 @@ fun VaultCategoryDetailScreen(
                     .fillMaxWidth(),
             ) {
                 items(categoryEntries, key = { it.uriString }) { item ->
-                    EncryptedVaultFileCard(
+                    VaultProtectedFileCard(
                         entry = item,
                         accent = categoryAccent,
-                        onPlay = { onPlayEntry(item) },
+                        onOpen = { onOpenEntry(item) },
+                        onRestore = { onRestoreEntry(item) },
                         onDelete = { onDeleteEntry(item) },
                     )
                 }
@@ -537,13 +651,13 @@ private fun VaultTopHeaderBar(
         ) {
             Icon(
                 imageVector = Icons.Rounded.Lock,
-                contentDescription = "Lock vault",
+                contentDescription = "قفل الخزنة",
                 tint = PlasmaViolet,
                 modifier = Modifier.size(15.dp),
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-                text = "LOCK",
+                text = "قفل",
                 style = MaterialTheme.typography.labelSmall,
                 color = ChromeSilver,
             )
@@ -580,7 +694,7 @@ private fun VaultStorageModeCard(
             ) {
                 Icon(
                     imageVector = Icons.Outlined.FolderOpen,
-                    contentDescription = "Vault storage location",
+                    contentDescription = "موقع حفظ الخزنة",
                     tint = if (uiState.isExternalSafActive) EmeraldPulse else NeonCyan,
                     modifier = Modifier.size(22.dp),
                 )
@@ -596,11 +710,15 @@ private fun VaultStorageModeCard(
                     Text(
                         text = when (uiState.storageMode) {
                             VaultStorageMode.PHONE_DOWNLOADS ->
-                                "محفوظة في مجلد Download/BlackholeVault على الهاتف."
+                                if (uiState.hasAllFilesAccess) {
+                                    "محفوظة ومخفية داخل مجلد .BlackholeVault على الهاتف."
+                                } else {
+                                    "محفوظة في مجلد Download/BlackholeVault على الهاتف."
+                                }
                             VaultStorageMode.SAF_EXTERNAL ->
-                                "مجلد خارجي مختار — يبقى حتى بعد حذف التطبيق."
+                                "مجلد خارجي مختار (.nomedia) — يبقى حتى بعد حذف التطبيق."
                             VaultStorageMode.INTERNAL ->
-                                "التخزين الداخلي الخاص — يمكنك التبديل لمجلد الهاتف."
+                                "التخزين الداخلي المعزول للتطبيق — مخفي عن المعرض والملفات."
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
@@ -617,7 +735,7 @@ private fun VaultStorageModeCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 VaultStorageChip(
-                    label = "PHONE FOLDER",
+                    label = "مجلد الهاتف",
                     selected = uiState.storageMode == VaultStorageMode.PHONE_DOWNLOADS,
                     accent = EmeraldPulse,
                     onClick = onSelectPhoneDownloads,
@@ -626,7 +744,7 @@ private fun VaultStorageModeCard(
                         .testTag("vault_phone_folder_button"),
                 )
                 VaultStorageChip(
-                    label = "PICK SAF",
+                    label = "مجلد SAF",
                     selected = uiState.storageMode == VaultStorageMode.SAF_EXTERNAL,
                     accent = NeonCyan,
                     onClick = onSelectSafFolder,
@@ -635,7 +753,7 @@ private fun VaultStorageModeCard(
                         .testTag("vault_choose_saf_folder_button"),
                 )
                 VaultStorageChip(
-                    label = "INTERNAL",
+                    label = "داخلي معزول",
                     selected = uiState.storageMode == VaultStorageMode.INTERNAL,
                     accent = PlasmaViolet,
                     onClick = onRevertInternalStorage,
@@ -736,7 +854,7 @@ private fun VaultCategoryBentoTile(
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = if (count > 0) "$subtitle · ${formatVaultMb(totalSizeBytes)}" else subtitle,
+                        text = if (count > 0) "$subtitle · ${formatByteSize(totalSizeBytes)}" else subtitle,
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                         maxLines = 1,
@@ -820,7 +938,7 @@ private fun VaultWideCategoryTile(
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = if (count > 0) "$count محفوظ · ${formatVaultMb(totalSizeBytes)}" else subtitle,
+                        text = if (count > 0) "$count محفوظ · ${formatByteSize(totalSizeBytes)}" else subtitle,
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                         maxLines = 1,
@@ -856,9 +974,21 @@ private fun VaultWideCategoryTile(
 private fun VaultPhotoGridCard(
     entry: VaultFileEntry,
     onOpen: () -> Unit,
+    onRestore: () -> Unit,
     onDelete: () -> Unit,
 ) {
+    val context = LocalContext.current
     var confirmDelete by remember(entry.uriString) { mutableStateOf(false) }
+
+    val thumbnailBitmap by produceState<ImageBitmap?>(
+        initialValue = null,
+        entry.uriString,
+        entry.localFilePath,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            decodePhotoThumbnail(context, entry, maxDim = 420)
+        }
+    }
 
     Surface(
         color = Color(0xFF0E1420),
@@ -870,11 +1000,11 @@ private fun VaultPhotoGridCard(
             .clickable { onOpen() }
             .testTag("vault_entry_${entry.id}"),
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
+        Column(modifier = Modifier.padding(10.dp)) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(94.dp)
+                    .height(110.dp)
                     .clip(RoundedCornerShape(14.dp))
                     .background(
                         Brush.linearGradient(
@@ -883,12 +1013,21 @@ private fun VaultPhotoGridCard(
                     ),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.Image,
-                    contentDescription = "Encrypted photo ${entry.displayTitle}",
-                    tint = NeonCyan,
-                    modifier = Modifier.size(38.dp),
-                )
+                if (thumbnailBitmap != null) {
+                    Image(
+                        bitmap = thumbnailBitmap!!,
+                        contentDescription = entry.displayTitle,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Rounded.Image,
+                        contentDescription = "صورة محمية ${entry.displayTitle}",
+                        tint = NeonCyan,
+                        modifier = Modifier.size(38.dp),
+                    )
+                }
                 Surface(
                     color = ObsidianVoid.copy(alpha = 0.78f),
                     shape = RoundedCornerShape(50),
@@ -908,7 +1047,7 @@ private fun VaultPhotoGridCard(
                         )
                         Spacer(modifier = Modifier.width(3.dp))
                         Text(
-                            text = "AES",
+                            text = "محمي",
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                             color = EmeraldPulse,
                         )
@@ -916,7 +1055,7 @@ private fun VaultPhotoGridCard(
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             Text(
                 text = entry.displayTitle,
@@ -926,19 +1065,32 @@ private fun VaultPhotoGridCard(
                 overflow = TextOverflow.Ellipsis,
             )
             Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "${formatByteSize(entry.sizeBytes)} · ${formatShortDate(entry.lastModifiedMs)}",
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                color = MutedSlate,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = "${formatVaultMb(entry.sizeBytes)} · ${formatVaultDate(entry.lastModifiedMs)}",
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                    color = MutedSlate,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
+                IconButton(
+                    onClick = onRestore,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("vault_restore_${entry.id}"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Restore,
+                        contentDescription = "استعادة الصورة إلى الجهاز",
+                        tint = NeonCyan,
+                        modifier = Modifier.size(19.dp),
+                    )
+                }
 
                 if (confirmDelete) {
                     Surface(
@@ -949,25 +1101,28 @@ private fun VaultPhotoGridCard(
                             .clickable {
                                 confirmDelete = false
                                 onDelete()
-                            },
+                            }
+                            .minimumInteractiveComponentSize(),
                     ) {
                         Text(
-                            text = "حذف",
+                            text = "تأكيد",
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                             color = Color.White,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                         )
                     }
                 } else {
                     IconButton(
                         onClick = { confirmDelete = true },
-                        modifier = Modifier.size(32.dp),
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("vault_delete_${entry.id}"),
                     ) {
                         Icon(
                             imageVector = Icons.Outlined.DeleteOutline,
-                            contentDescription = "Delete encrypted photo",
+                            contentDescription = "حذف الصورة نهائياً",
                             tint = CrimsonAlert,
-                            modifier = Modifier.size(17.dp),
+                            modifier = Modifier.size(19.dp),
                         )
                     }
                 }
@@ -977,13 +1132,30 @@ private fun VaultPhotoGridCard(
 }
 
 @Composable
-private fun EncryptedVaultFileCard(
+private fun VaultProtectedFileCard(
     entry: VaultFileEntry,
     accent: Color,
-    onPlay: () -> Unit,
+    onOpen: () -> Unit,
+    onRestore: () -> Unit,
     onDelete: () -> Unit,
 ) {
+    val context = LocalContext.current
     var confirmDelete by remember(entry.uriString) { mutableStateOf(false) }
+
+    val videoThumbnail by produceState<ImageBitmap?>(
+        initialValue = null,
+        entry.uriString,
+        entry.localFilePath,
+        entry.category,
+    ) {
+        value = if (entry.category == VaultCategory.VIDEOS) {
+            withContext(Dispatchers.IO) {
+                decodeVideoThumbnail(context, entry)
+            }
+        } else {
+            null
+        }
+    }
 
     Surface(
         color = Color(0xFF0E1420),
@@ -992,13 +1164,13 @@ private fun EncryptedVaultFileCard(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(18.dp))
-            .clickable { onPlay() }
+            .clickable { onOpen() }
             .testTag("vault_entry_${entry.id}"),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
@@ -1008,24 +1180,46 @@ private fun EncryptedVaultFileCard(
             ) {
                 Surface(
                     color = accent.copy(alpha = 0.14f),
-                    shape = CircleShape,
+                    shape = RoundedCornerShape(14.dp),
                     border = BorderStroke(0.8.dp, accent.copy(alpha = 0.55f)),
-                    modifier = Modifier.size(44.dp),
+                    modifier = Modifier.size(52.dp),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         if (entry.category == VaultCategory.VIDEOS) {
-                            Icon(
-                                imageVector = Icons.Rounded.PlayArrow,
-                                contentDescription = "Decrypt and play ${entry.displayTitle}",
-                                tint = accent,
-                                modifier = Modifier.size(24.dp),
-                            )
+                            if (videoThumbnail != null) {
+                                Image(
+                                    bitmap = videoThumbnail!!,
+                                    contentDescription = entry.displayTitle,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(ObsidianVoid.copy(alpha = 0.35f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.PlayArrow,
+                                        contentDescription = "تشغيل ${entry.displayTitle}",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(24.dp),
+                                    )
+                                }
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayArrow,
+                                    contentDescription = "تشغيل ${entry.displayTitle}",
+                                    tint = accent,
+                                    modifier = Modifier.size(26.dp),
+                                )
+                            }
                         } else {
                             val extLabel = entry.displayTitle
                                 .substringAfterLast('.', "")
                                 .uppercase(Locale.US)
                                 .take(4)
-                            if (extLabel.isNotBlank() && extLabel != "BHV") {
+                            if (extLabel.isNotBlank()) {
                                 Text(
                                     text = extLabel,
                                     style = MaterialTheme.typography.labelSmall.copy(
@@ -1037,7 +1231,7 @@ private fun EncryptedVaultFileCard(
                             } else {
                                 Icon(
                                     imageVector = Icons.Outlined.Description,
-                                    contentDescription = "Decrypt and open ${entry.displayTitle}",
+                                    contentDescription = "فتح ${entry.displayTitle}",
                                     tint = accent,
                                     modifier = Modifier.size(22.dp),
                                 )
@@ -1055,8 +1249,9 @@ private fun EncryptedVaultFileCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Spacer(modifier = Modifier.height(3.dp))
+                    val locationLabel = if (entry.isSafExternal) "خزنة الهاتف المحمية" else "خزنة معزولة"
                     Text(
-                        text = "${if (entry.isSafExternal) "External .bhv" else "Internal .bhv"} · ${formatVaultMb(entry.sizeBytes)} · ${formatVaultDate(entry.lastModifiedMs)}",
+                        text = "$locationLabel · ${formatByteSize(entry.sizeBytes)} · ${formatShortDate(entry.lastModifiedMs)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                         maxLines = 1,
@@ -1065,35 +1260,52 @@ private fun EncryptedVaultFileCard(
                 }
             }
 
-            if (confirmDelete) {
-                Surface(
-                    color = CrimsonAlert,
-                    shape = RoundedCornerShape(50),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .clickable {
-                            confirmDelete = false
-                            onDelete()
-                        }
-                        .minimumInteractiveComponentSize(),
-                ) {
-                    Text(
-                        text = "CONFIRM",
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                    )
-                }
-            } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
-                    onClick = { confirmDelete = true },
-                    modifier = Modifier.minimumInteractiveComponentSize(),
+                    onClick = onRestore,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("vault_restore_${entry.id}"),
                 ) {
                     Icon(
-                        imageVector = Icons.Outlined.DeleteOutline,
-                        contentDescription = "Delete encrypted file",
-                        tint = CrimsonAlert,
+                        imageVector = Icons.Rounded.Restore,
+                        contentDescription = "استعادة إلى الجهاز",
+                        tint = NeonCyan,
                     )
+                }
+
+                if (confirmDelete) {
+                    Surface(
+                        color = CrimsonAlert,
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable {
+                                confirmDelete = false
+                                onDelete()
+                            }
+                            .minimumInteractiveComponentSize(),
+                    ) {
+                        Text(
+                            text = "حذف",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                } else {
+                    IconButton(
+                        onClick = { confirmDelete = true },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("vault_delete_${entry.id}"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = "حذف من الخزنة",
+                            tint = CrimsonAlert,
+                        )
+                    }
                 }
             }
         }
@@ -1124,10 +1336,10 @@ private fun VaultTransferAndStatusSection(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    val actionTitle = when {
-                        transfer.stage == VaultOperationStage.DERIVING_KEY -> "تجهيز مفتاح AES-256-GCM..."
-                        transfer.isEncrypting -> "جاري التشفير: ${transfer.label}"
-                        else -> "فك التشفير والتحقق: ${transfer.label}"
+                    val actionTitle = when (transfer.stage) {
+                        VaultTransferStage.PREPARING -> "تجهيز الملف للنقل..."
+                        VaultTransferStage.MOVING -> "جاري النقل إلى الخزنة: ${transfer.label}"
+                        VaultTransferStage.FINALIZING, VaultTransferStage.COMPLETED -> "تأمين الملف وإخفاء الأصل..."
                     }
                     Text(
                         text = actionTitle,
@@ -1160,12 +1372,12 @@ private fun VaultTransferAndStatusSection(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = "${formatVaultMb(transfer.bytesProcessed)} / ${formatVaultMb(transfer.totalBytes)}",
+                        text = "${formatByteSize(transfer.bytesProcessed)} / ${formatByteSize(transfer.totalBytes)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                     )
                     Text(
-                        text = "CANCEL",
+                        text = "إلغاء",
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                         color = CrimsonAlert,
                         modifier = Modifier
@@ -1206,11 +1418,11 @@ private fun VaultTransferAndStatusSection(
                     )
                     IconButton(
                         onClick = onDismissStatus,
-                        modifier = Modifier.size(28.dp),
+                        modifier = Modifier.size(32.dp),
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Close,
-                            contentDescription = "Dismiss message",
+                            contentDescription = "إغلاق التنبيه",
                             tint = MutedSlate,
                             modifier = Modifier.size(16.dp),
                         )
@@ -1258,17 +1470,54 @@ private fun VaultStorageChip(
     }
 }
 
-private fun formatVaultMb(bytes: Long): String {
-    if (bytes <= 0L) return "0.0 MB"
-    val mb = bytes / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        String.format(Locale.US, "%.1f MB", mb)
-    } else {
-        "${(bytes / 1024L).coerceAtLeast(1L)} KB"
+private fun decodePhotoThumbnail(context: Context, entry: VaultFileEntry, maxDim: Int): ImageBitmap? {
+    val localFile = entry.localFilePath?.let(::File)?.takeIf { it.exists() }
+    if (localFile != null) {
+        return runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(localFile.absolutePath, bounds)
+            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            var sampleSize = 1
+            while (longest / sampleSize > maxDim && sampleSize < 32) {
+                sampleSize *= 2
+            }
+            val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            BitmapFactory.decodeFile(localFile.absolutePath, opts)?.asImageBitmap()
+        }.getOrNull()
     }
+    val uri = Uri.parse(entry.uriString)
+    return runCatching {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, bounds)
+        }
+        val longest = maxOf(bounds.outWidth, bounds.outHeight)
+        var sampleSize = 1
+        while (longest / sampleSize > maxDim && sampleSize < 32) {
+            sampleSize *= 2
+        }
+        val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, opts)?.asImageBitmap()
+        }
+    }.getOrNull()
 }
 
-private fun formatVaultDate(timestampMs: Long): String {
-    if (timestampMs <= 0L) return ""
-    return SimpleDateFormat("MMM d", Locale.US).format(Date(timestampMs))
+private fun decodeVideoThumbnail(context: Context, entry: VaultFileEntry): ImageBitmap? {
+    val retriever = MediaMetadataRetriever()
+    return try {
+        val localPath = entry.localFilePath?.takeIf { File(it).exists() }
+        if (localPath != null) {
+            retriever.setDataSource(localPath)
+        } else {
+            retriever.setDataSource(context, Uri.parse(entry.uriString))
+        }
+        val frame = retriever.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            ?: retriever.getFrameAtTime(0L)
+        frame?.asImageBitmap()
+    } catch (_: Throwable) {
+        null
+    } finally {
+        runCatching { retriever.release() }
+    }
 }

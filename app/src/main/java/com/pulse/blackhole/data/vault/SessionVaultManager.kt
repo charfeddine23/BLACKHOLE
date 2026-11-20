@@ -119,30 +119,6 @@ class SessionVaultManager(context: Context) {
         }
     }
 
-    fun getLastSavedTimestampMs(): Long {
-        return synchronized(vaultLock) {
-            runCatching {
-                sharedPreferences.getLong(KEY_LAST_SAVED_MS, 0L)
-            }.getOrDefault(0L)
-        }
-    }
-
-    fun hasCompletedGoogleCookieResetV3(): Boolean {
-        return synchronized(vaultLock) {
-            runCatching {
-                sharedPreferences.getBoolean(KEY_GOOGLE_COOKIE_RESET_V3, false)
-            }.getOrDefault(false)
-        }
-    }
-
-    fun markGoogleCookieResetV3Done() {
-        synchronized(vaultLock) {
-            sharedPreferences.edit()
-                .putBoolean(KEY_GOOGLE_COOKIE_RESET_V3, true)
-                .commit()
-        }
-    }
-
     fun hasCompletedGoogleCookieResetV4(): Boolean {
         return synchronized(vaultLock) {
             runCatching {
@@ -174,38 +150,7 @@ class SessionVaultManager(context: Context) {
             runCatching {
                 if (backupVaultFile.exists()) backupVaultFile.delete()
             }
-            runCatching {
-                val tempFile = File(appContext.cacheDir, COOKIE_TEMP_FILE_NAME)
-                if (tempFile.exists()) tempFile.delete()
-            }
         }
-    }
-
-    /**
-     * Returns the absolute path to the Netscape-format cookies.txt file materialized
-     * from the encrypted Session Vault, or null if the vault is empty.
-     */
-    fun getCookieFilePath(): String? {
-        if (!hasActiveSession()) return null
-        return writeTempNetscapeCookiesFile(appContext.cacheDir)
-            ?.takeIf { it.exists() && it.length() > 0L }
-            ?.absolutePath
-    }
-
-    /**
-     * Writes stored Netscape-format cookies into a private temporary file for extractor injection.
-     */
-    fun writeTempNetscapeCookiesFile(targetDir: File = appContext.cacheDir): File? {
-        val raw = getCookies()?.trim().orEmpty()
-        if (raw.isBlank()) return null
-        val netscapeContent = normalizeToNetscapeFormat(raw)
-        if (netscapeContent.isBlank()) return null
-        return runCatching {
-            if (!targetDir.exists()) targetDir.mkdirs()
-            val tempFile = File(targetDir, COOKIE_TEMP_FILE_NAME)
-            tempFile.writeText(netscapeContent)
-            tempFile
-        }.getOrNull()
     }
 
     private fun writeToEncryptedBackupFile(content: String) {
@@ -297,9 +242,7 @@ class SessionVaultManager(context: Context) {
         private const val KEY_COOKIES_CONTENT = "KEY_COOKIES_CONTENT"
         private const val KEY_PERMANENT_LOCK = "KEY_PERMANENT_LOCK"
         private const val KEY_LAST_SAVED_MS = "KEY_LAST_SAVED_MS"
-        private const val KEY_GOOGLE_COOKIE_RESET_V3 = "KEY_GOOGLE_COOKIE_RESET_V3"
         private const val KEY_GOOGLE_COOKIE_RESET_V4 = "KEY_GOOGLE_COOKIE_RESET_V4"
-        private const val COOKIE_TEMP_FILE_NAME = "blackhole_session_cookies.txt"
         private const val TEN_YEARS_SECONDS = 315_360_000L
     }
 }

@@ -52,7 +52,7 @@ class ClipboardDetector(private val context: Context) {
         return null
     }
 
-    fun isSupportedVideoCandidate(url: String): Boolean {
+    private fun isSupportedVideoCandidate(url: String): Boolean {
         val lower = url.lowercase()
         if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
         return lower.contains(".") && !lower.contains(" ")

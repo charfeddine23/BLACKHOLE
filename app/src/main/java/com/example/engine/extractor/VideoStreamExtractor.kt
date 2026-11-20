@@ -5,6 +5,7 @@ import com.example.engine.model.ExtractedStream
 import com.example.engine.model.ExtractionResult
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
+import com.example.util.formatQualityLabel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
@@ -1264,15 +1265,6 @@ class VideoStreamExtractor(
             lower.contains("360") -> 360
             else -> 0
         }
-    }
-
-    private fun formatQualityLabel(height: Int): String = when {
-        height >= 2160 -> "4K 2160P"
-        height >= 1440 -> "2K 1440P"
-        height >= 1080 -> "1080P FHD"
-        height >= 720 -> "720P HD"
-        height > 0 -> "${height}P"
-        else -> "BEST HD"
     }
 
     companion object {

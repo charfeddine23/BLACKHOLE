@@ -5,6 +5,7 @@ import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.ExtractedStream
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
+import com.example.util.formatQualityLabel
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -1100,15 +1101,6 @@ internal class MetaVideoPowerExtractor(
             raw >= 700 -> 720
             else -> raw
         }
-    }
-
-    private fun formatQualityLabel(height: Int): String = when {
-        height >= 2160 -> "4K 2160P"
-        height >= 1440 -> "2K 1440P"
-        height >= 1080 -> "1080P FHD"
-        height >= 720 -> "720P HD"
-        height > 0 -> "${height}P"
-        else -> "BEST HD"
     }
 
     companion object {

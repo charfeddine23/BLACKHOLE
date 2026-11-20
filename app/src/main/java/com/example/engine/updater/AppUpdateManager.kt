@@ -308,7 +308,6 @@ class AppUpdateManager(
     }
 
     companion object {
-        const val REPO_URL = "https://github.com/charfeddine23/BLACKHOLE"
         const val REPO_RELEASES_FALLBACK_URL = "https://github.com/charfeddine23/BLACKHOLE/releases/latest"
         private const val LATEST_RELEASE_API =
             "https://api.github.com/repos/charfeddine23/BLACKHOLE/releases/latest"

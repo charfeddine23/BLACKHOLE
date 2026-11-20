@@ -22,16 +22,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -77,7 +73,6 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -98,12 +93,12 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
+import com.example.util.formatByteSize
+import com.example.util.formatDurationMs
+import com.example.util.formatShortDate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 @Composable
 fun DownloadedVideosSwipeUpSheet(
@@ -129,13 +124,7 @@ fun DownloadedVideosSwipeUpSheet(
     onDismissVaultStatus: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val density = LocalDensity.current
-    val cutoutTop = with(density) { WindowInsets.displayCutout.getTop(density).toDp() }
-    val statusTop = with(density) { WindowInsets.statusBars.getTop(density).toDp() }
-    val safeTopInset = maxOf(cutoutTop + 6.dp, statusTop, 32.dp)
-    val cutoutBottom = with(density) { WindowInsets.displayCutout.getBottom(density).toDp() }
-    val navBottom = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
-    val safeBottomInset = maxOf(cutoutBottom, navBottom, 12.dp)
+    val safeInsets = rememberSafeScreenInsets(cutoutExtraTop = 6.dp, minTop = 32.dp, minBottom = 12.dp)
 
     val gridState = rememberLazyGridState()
     var previewingVideo by remember { mutableStateOf<DownloadedVideoEntity?>(null) }
@@ -278,7 +267,7 @@ fun DownloadedVideosSwipeUpSheet(
                         )
                     },
                 )
-                .padding(top = safeTopInset, bottom = safeBottomInset),
+                .padding(top = safeInsets.top, bottom = safeInsets.bottom),
         ) {
             if (!showBrowserTab) {
                 // Sheet Header & Pull-Down Handle (hidden when Browser is Full Screen)
@@ -609,7 +598,7 @@ private fun SwipeSheetVideoCard(
                             .padding(12.dp),
                     ) {
                         Text(
-                            text = formatSheetDuration(video.durationMs),
+                            text = formatDurationMs(video.durationMs),
                             style = MaterialTheme.typography.labelSmall,
                             color = ChromeSilver,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -635,7 +624,7 @@ private fun SwipeSheetVideoCard(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "${video.platform} · ${formatSheetFileSize(video.fileSizeBytes)} · ${video.resolution} · ${formatSheetDate(video.createdAt)}",
+                        text = "${video.platform} · ${formatByteSize(video.fileSizeBytes)} · ${video.resolution} · ${formatShortDate(video.createdAt)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
                         maxLines = 1,
@@ -699,23 +688,13 @@ private fun InlineVideoPlayerView(
         }
     }
 
-    val playerDensity = LocalDensity.current
-    val playerTopInset = maxOf(
-        with(playerDensity) { WindowInsets.displayCutout.getTop(playerDensity).toDp() } + 6.dp,
-        with(playerDensity) { WindowInsets.statusBars.getTop(playerDensity).toDp() },
-        32.dp,
-    )
-    val playerBottomInset = maxOf(
-        with(playerDensity) { WindowInsets.displayCutout.getBottom(playerDensity).toDp() },
-        with(playerDensity) { WindowInsets.navigationBars.getBottom(playerDensity).toDp() },
-        12.dp,
-    )
+    val playerInsets = rememberSafeScreenInsets(cutoutExtraTop = 6.dp, minTop = 32.dp, minBottom = 12.dp)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid)
-            .padding(top = playerTopInset, bottom = playerBottomInset),
+            .padding(top = playerInsets.top, bottom = playerInsets.bottom),
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
@@ -734,7 +713,7 @@ private fun InlineVideoPlayerView(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = "${video.qualityLabel} · ${video.resolution} · ${formatSheetFileSize(video.fileSizeBytes)}",
+                        text = "${video.qualityLabel} · ${video.resolution} · ${formatByteSize(video.fileSizeBytes)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = NeonCyan,
                     )
@@ -790,25 +769,4 @@ private fun resolvePlayableVideoUri(context: Context, video: DownloadedVideoEnti
         )
     }
     return Uri.parse(video.contentUri)
-}
-
-private fun formatSheetDuration(durationMs: Long): String {
-    val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
-    val minutes = totalSeconds / 60L
-    val seconds = totalSeconds % 60L
-    return String.format(Locale.US, "%02d:%02d", minutes, seconds)
-}
-
-private fun formatSheetFileSize(bytes: Long): String {
-    val mb = bytes / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        String.format(Locale.US, "%.1f MB", mb)
-    } else {
-        "${(bytes / 1024L).coerceAtLeast(1L)} KB"
-    }
-}
-
-private fun formatSheetDate(timestamp: Long): String {
-    val formatter = SimpleDateFormat("MMM d", Locale.US)
-    return formatter.format(Date(timestamp))
 }

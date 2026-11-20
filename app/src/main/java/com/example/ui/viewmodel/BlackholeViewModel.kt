@@ -1,7 +1,6 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
-import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
@@ -32,7 +31,6 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 
 data class BlackholeUiState(
@@ -290,25 +288,6 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
     fun deleteVideo(video: DownloadedVideoEntity) {
         viewModelScope.launch {
             repository.deleteVideo(video)
-        }
-    }
-
-    fun importCookiesFromUri(uri: Uri) {
-        viewModelScope.launch {
-            val importedCount = withContext(Dispatchers.IO) {
-                runCatching {
-                    context.contentResolver.openInputStream(uri)?.use { stream ->
-                        stream.bufferedReader().use { reader ->
-                            cookieVault.importNetscapeCookiesTxt(reader.readText())
-                        }
-                    } ?: 0
-                }.getOrDefault(0)
-            }
-            _vaultStatusMessage.value = if (importedCount > 0) {
-                "Encrypted & stored $importedCount session cookies in AES-256 Vault."
-            } else {
-                "No valid Netscape/JSON cookies found in selected file."
-            }
         }
     }
 

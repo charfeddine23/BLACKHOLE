@@ -7,30 +7,27 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
-import android.util.Base64
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
-import com.example.vault.crypto.UltraVaultEngine
-import com.example.vault.crypto.VaultMediaMetadata
-import com.example.vault.crypto.VaultOperationProgress
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
-import java.security.SecureRandom
-import java.util.UUID
 
 enum class VaultStorageMode {
     INTERNAL,
@@ -44,6 +41,28 @@ enum class VaultCategory {
     FILES,
 }
 
+enum class VaultTransferStage {
+    PREPARING,
+    MOVING,
+    FINALIZING,
+    COMPLETED,
+}
+
+data class VaultMediaMetadata(
+    val originalName: String,
+    val mimeType: String,
+    val originalSizeBytes: Long,
+)
+
+data class VaultTransferProgress(
+    val fraction: Float,
+    val bytesProcessed: Long,
+    val totalBytes: Long,
+    val stage: VaultTransferStage,
+    val metadata: VaultMediaMetadata,
+    val originalDeleted: Boolean = false,
+)
+
 data class VaultFileEntry(
     val id: String,
     val fileName: String,
@@ -51,6 +70,7 @@ data class VaultFileEntry(
     val sizeBytes: Long,
     val lastModifiedMs: Long,
     val uriString: String,
+    val localFilePath: String? = null,
     val isSafExternal: Boolean,
     val mimeType: String = "video/mp4",
     val category: VaultCategory = VaultCategory.VIDEOS,
@@ -64,83 +84,48 @@ class SafVaultRepository(context: Context) {
     @Volatile
     private var cachedPrefs: SharedPreferences? = null
 
-    private fun getSecurePrefs(): SharedPreferences {
+    private fun getPrefs(): SharedPreferences {
         cachedPrefs?.let { return it }
         return synchronized(prefsLock) {
             cachedPrefs?.let { return it }
-            val created = runCatching {
-                val masterKey = MasterKey.Builder(appContext)
-                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                    .build()
-                EncryptedSharedPreferences.create(
-                    appContext,
-                    VAULT_PREFS_NAME,
-                    masterKey,
-                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-                )
-            }.recoverCatching {
-                runCatching {
-                    File(appContext.filesDir.parentFile, "shared_prefs/$VAULT_PREFS_NAME.xml").delete()
-                }
-                val masterKey = MasterKey.Builder(appContext)
-                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                    .build()
-                EncryptedSharedPreferences.create(
-                    appContext,
-                    VAULT_PREFS_NAME,
-                    masterKey,
-                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-                )
-            }.getOrElse {
-                appContext.getSharedPreferences(VAULT_FALLBACK_PREFS_NAME, Context.MODE_PRIVATE)
+            appContext.getSharedPreferences(VAULT_PREFS_NAME, Context.MODE_PRIVATE).also {
+                cachedPrefs = it
             }
-            cachedPrefs = created
-            created
         }
     }
 
     private val internalVaultDir: File
         get() = File(appContext.filesDir, INTERNAL_VAULT_FOLDER).apply {
-            if (!exists()) mkdirs()
+            ensureProtectedDir(this)
         }
 
     @Suppress("DEPRECATION")
-    private val legacyPublicDownloadsDir: File
-        get() = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            PUBLIC_VAULT_FOLDER,
-        )
+    private val hiddenExternalVaultDir: File
+        get() = File(Environment.getExternalStorageDirectory(), HIDDEN_EXTERNAL_VAULT_FOLDER)
 
-    private fun hasLegacyExternalWritePermission(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true
-        return ContextCompat.checkSelfPermission(
-            appContext,
-            Manifest.permission.WRITE_EXTERNAL_STORAGE,
-        ) == PackageManager.PERMISSION_GRANTED
-    }
-
-    suspend fun getOrCreateBiometricVaultSecret(): CharArray = withContext(Dispatchers.IO) {
-        val prefs = getSecurePrefs()
-        val existing = prefs.getString(KEY_BIOMETRIC_MASTER_SECRET, null)
-        if (!existing.isNullOrBlank()) {
-            return@withContext existing.toCharArray()
+    fun hasAllFilesAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            ) == PackageManager.PERMISSION_GRANTED
         }
-        val randomBytes = ByteArray(32)
-        SecureRandom().nextBytes(randomBytes)
-        val encoded = Base64.encodeToString(randomBytes, Base64.NO_WRAP)
-        randomBytes.fill(0)
-        prefs.edit().putString(KEY_BIOMETRIC_MASTER_SECRET, encoded).commit()
-        encoded.toCharArray()
     }
 
-    suspend fun getSafTreeUri(): Uri? = withContext(Dispatchers.IO) {
-        getSafTreeUriBlocking()
+    private fun ensureProtectedDir(dir: File) {
+        if (!dir.exists()) {
+            dir.mkdirs()
+        }
+        val nomedia = File(dir, NOMEDIA_FILE_NAME)
+        if (!nomedia.exists()) {
+            runCatching { nomedia.createNewFile() }
+        }
     }
 
     private fun getSafTreeUriBlocking(): Uri? {
-        val raw = getSecurePrefs().getString(KEY_SAF_TREE_URI, null) ?: return null
+        val raw = getPrefs().getString(KEY_SAF_TREE_URI, null) ?: return null
         val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return null
         val hasPersistedPerm = runCatching {
             appContext.contentResolver.persistedUriPermissions.any { perm ->
@@ -156,9 +141,11 @@ class SafVaultRepository(context: Context) {
     }
 
     private fun getActiveStorageModeBlocking(): VaultStorageMode {
-        val savedMode = getSecurePrefs().getString(KEY_STORAGE_MODE, null)
-        if (savedMode == VaultStorageMode.PHONE_DOWNLOADS.name && hasLegacyExternalWritePermission()) {
-            return VaultStorageMode.PHONE_DOWNLOADS
+        val savedMode = getPrefs().getString(KEY_STORAGE_MODE, null)
+        if (savedMode == VaultStorageMode.PHONE_DOWNLOADS.name) {
+            if (hasAllFilesAccess() || Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                return VaultStorageMode.PHONE_DOWNLOADS
+            }
         }
         if (savedMode == VaultStorageMode.INTERNAL.name) {
             return VaultStorageMode.INTERNAL
@@ -166,23 +153,14 @@ class SafVaultRepository(context: Context) {
         if (getSafTreeUriBlocking() != null) {
             return VaultStorageMode.SAF_EXTERNAL
         }
-        if (savedMode == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val hasInternalFiles = internalVaultDir.listFiles()?.any {
-                it.isFile && it.name.endsWith(VAULT_EXT, ignoreCase = true)
-            } == true
-            if (!hasInternalFiles) {
-                return VaultStorageMode.PHONE_DOWNLOADS
-            }
+        if (savedMode == null && hasAllFilesAccess()) {
+            return VaultStorageMode.PHONE_DOWNLOADS
         }
         return VaultStorageMode.INTERNAL
     }
 
     suspend fun getActiveStorageMode(): VaultStorageMode = withContext(Dispatchers.IO) {
         getActiveStorageModeBlocking()
-    }
-
-    suspend fun isExternalSafActive(): Boolean = withContext(Dispatchers.IO) {
-        getActiveStorageModeBlocking() != VaultStorageMode.INTERNAL
     }
 
     suspend fun getStorageDisplayLabel(): String = withContext(Dispatchers.IO) {
@@ -193,16 +171,20 @@ class SafVaultRepository(context: Context) {
                     runCatching { DocumentFile.fromTreeUri(appContext, it)?.name }.getOrNull()
                 }.orEmpty()
                 if (docName.isNotBlank()) {
-                    "SAF External: $docName (Survives Uninstall)"
+                    "External SAF: $docName (.nomedia)"
                 } else {
-                    "SAF External Folder (Survives Uninstall)"
+                    "External SAF Folder (.nomedia)"
                 }
             }
             VaultStorageMode.PHONE_DOWNLOADS -> {
-                "Phone Storage: Download/$PUBLIC_VAULT_FOLDER"
+                if (hasAllFilesAccess()) {
+                    "Phone Hidden Vault: $HIDDEN_EXTERNAL_VAULT_FOLDER"
+                } else {
+                    "Phone Downloads: Download/$PUBLIC_DOWNLOADS_SUBFOLDER"
+                }
             }
             VaultStorageMode.INTERNAL -> {
-                "Private Internal Vault (App Storage)"
+                "Private App Vault (Isolated Sandbox)"
             }
         }
     }
@@ -231,7 +213,10 @@ class SafVaultRepository(context: Context) {
         if (!writable) {
             return@withContext false
         }
-        getSecurePrefs().edit()
+        if (doc != null && doc.findFile(NOMEDIA_FILE_NAME) == null) {
+            runCatching { doc.createFile("application/octet-stream", NOMEDIA_FILE_NAME) }
+        }
+        getPrefs().edit()
             .putString(KEY_SAF_TREE_URI, treeUri.toString())
             .putString(KEY_STORAGE_MODE, VaultStorageMode.SAF_EXTERNAL.name)
             .commit()
@@ -239,30 +224,26 @@ class SafVaultRepository(context: Context) {
     }
 
     suspend fun activatePhoneDownloadsVault(): Boolean = withContext(Dispatchers.IO) {
-        if (!hasLegacyExternalWritePermission()) {
+        if (!hasAllFilesAccess() && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return@withContext false
         }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            val dir = legacyPublicDownloadsDir
-            if (!dir.exists() && !dir.mkdirs()) {
-                return@withContext false
-            }
+        if (hasAllFilesAccess()) {
+            ensureProtectedDir(hiddenExternalVaultDir)
         }
-        getSecurePrefs().edit()
+        getPrefs().edit()
             .putString(KEY_STORAGE_MODE, VaultStorageMode.PHONE_DOWNLOADS.name)
             .commit()
         true
     }
 
-    suspend fun clearSafTreeUri() = withContext(Dispatchers.IO) {
-        getSecurePrefs().edit()
+    suspend fun revertToInternalVaultStorage() = withContext(Dispatchers.IO) {
+        getPrefs().edit()
             .remove(KEY_SAF_TREE_URI)
             .putString(KEY_STORAGE_MODE, VaultStorageMode.INTERNAL.name)
             .commit()
     }
 
     suspend fun listVaultEntries(): List<VaultFileEntry> = withContext(Dispatchers.IO) {
-        val prefs = getSecurePrefs()
         when (getActiveStorageModeBlocking()) {
             VaultStorageMode.SAF_EXTERNAL -> {
                 val safUri = getSafTreeUriBlocking()
@@ -274,16 +255,31 @@ class SafVaultRepository(context: Context) {
                             .forEach { runCatching { it.delete() } }
 
                         return@withContext files
-                            .filter { it.isFile && it.name?.endsWith(VAULT_EXT, ignoreCase = true) == true }
+                            .filter { doc ->
+                                val name = doc.name.orEmpty()
+                                doc.isFile &&
+                                    name.isNotBlank() &&
+                                    !name.equals(NOMEDIA_FILE_NAME, ignoreCase = true) &&
+                                    !name.startsWith(".") &&
+                                    !name.endsWith(STAGING_SUFFIX, ignoreCase = true) &&
+                                    !name.endsWith(LEGACY_ENCRYPTED_EXT, ignoreCase = true)
+                            }
                             .map { doc ->
-                                val name = doc.name ?: "vault_item$VAULT_EXT"
-                                buildVaultEntry(
-                                    prefs = prefs,
+                                val name = doc.name ?: "vault_item"
+                                val mime = doc.type?.takeIf { it.isNotBlank() }
+                                    ?: inferMimeFromFileName(name)
+                                    ?: "application/octet-stream"
+                                VaultFileEntry(
+                                    id = doc.uri.toString().hashCode().toString(),
                                     fileName = name,
+                                    displayTitle = name,
                                     sizeBytes = doc.length(),
                                     lastModifiedMs = doc.lastModified(),
                                     uriString = doc.uri.toString(),
-                                    isExternalFlag = true,
+                                    localFilePath = null,
+                                    isSafExternal = true,
+                                    mimeType = mime,
+                                    category = classifyCategory(name, mime),
                                 )
                             }
                             .sortedByDescending { it.lastModifiedMs }
@@ -292,47 +288,56 @@ class SafVaultRepository(context: Context) {
             }
 
             VaultStorageMode.PHONE_DOWNLOADS -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val mediaEntries = listMediaStoreDownloadsEntries(prefs)
-                    return@withContext mediaEntries
-                } else {
-                    val dir = legacyPublicDownloadsDir.apply { if (!exists()) mkdirs() }
-                    return@withContext listDirectoryEntries(dir, prefs, isExternalFlag = false)
+                if (hasAllFilesAccess()) {
+                    val dir = hiddenExternalVaultDir.apply { ensureProtectedDir(this) }
+                    return@withContext listDirectoryEntries(dir, isExternalFlag = true)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    return@withContext listMediaStoreDownloadsEntries()
                 }
             }
 
             VaultStorageMode.INTERNAL -> Unit
         }
 
-        // Default / fallback to private app vault directory
         val dir = internalVaultDir
-        listDirectoryEntries(dir, prefs, isExternalFlag = false)
+        listDirectoryEntries(dir, isExternalFlag = false)
     }
 
     private fun listDirectoryEntries(
         dir: File,
-        prefs: SharedPreferences,
         isExternalFlag: Boolean,
     ): List<VaultFileEntry> {
+        ensureProtectedDir(dir)
         dir.listFiles()?.filter { it.name.endsWith(STAGING_SUFFIX, ignoreCase = true) }
-            ?.forEach { UltraVaultEngine.secureDeleteFile(it) }
+            ?.forEach { runCatching { it.delete() } }
 
         return (dir.listFiles()?.toList() ?: emptyList())
-            .filter { it.isFile && it.name.endsWith(VAULT_EXT, ignoreCase = true) }
+            .filter { file ->
+                file.isFile &&
+                    !file.name.equals(NOMEDIA_FILE_NAME, ignoreCase = true) &&
+                    !file.name.startsWith(".") &&
+                    !file.name.endsWith(STAGING_SUFFIX, ignoreCase = true) &&
+                    !file.name.endsWith(LEGACY_ENCRYPTED_EXT, ignoreCase = true)
+            }
             .map { file ->
-                buildVaultEntry(
-                    prefs = prefs,
+                val mime = inferMimeFromFileName(file.name) ?: "application/octet-stream"
+                VaultFileEntry(
+                    id = file.absolutePath.hashCode().toString(),
                     fileName = file.name,
+                    displayTitle = file.name,
                     sizeBytes = file.length(),
                     lastModifiedMs = file.lastModified(),
                     uriString = Uri.fromFile(file).toString(),
-                    isExternalFlag = isExternalFlag,
+                    localFilePath = file.absolutePath,
+                    isSafExternal = isExternalFlag,
+                    mimeType = mime,
+                    category = classifyCategory(file.name, mime),
                 )
             }
             .sortedByDescending { it.lastModifiedMs }
     }
 
-    private fun listMediaStoreDownloadsEntries(prefs: SharedPreferences): List<VaultFileEntry> {
+    private fun listMediaStoreDownloadsEntries(): List<VaultFileEntry> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return emptyList()
         val results = mutableListOf<VaultFileEntry>()
         val resolver = appContext.contentResolver
@@ -340,6 +345,7 @@ class SafVaultRepository(context: Context) {
         val projection = arrayOf(
             MediaStore.Downloads._ID,
             MediaStore.Downloads.DISPLAY_NAME,
+            MediaStore.Downloads.MIME_TYPE,
             MediaStore.Downloads.SIZE,
             MediaStore.Downloads.DATE_MODIFIED,
             MediaStore.Downloads.IS_PENDING,
@@ -349,34 +355,47 @@ class SafVaultRepository(context: Context) {
                 collection,
                 projection,
                 "${MediaStore.Downloads.RELATIVE_PATH} LIKE ?",
-                arrayOf("%$PUBLIC_VAULT_FOLDER%"),
+                arrayOf("%$PUBLIC_DOWNLOADS_SUBFOLDER%"),
                 "${MediaStore.Downloads.DATE_MODIFIED} DESC",
             )?.use { cursor ->
                 val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID)
                 val nameIdx = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DISPLAY_NAME)
+                val mimeIdx = cursor.getColumnIndexOrThrow(MediaStore.Downloads.MIME_TYPE)
                 val sizeIdx = cursor.getColumnIndexOrThrow(MediaStore.Downloads.SIZE)
                 val dateIdx = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DATE_MODIFIED)
                 val pendingIdx = cursor.getColumnIndexOrThrow(MediaStore.Downloads.IS_PENDING)
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idIdx)
                     val rowUri = ContentUris.withAppendedId(collection, id)
-                    val isPending = cursor.getInt(pendingIdx) == 1
-                    val name = cursor.getString(nameIdx).orEmpty()
-                    if (isPending) {
+                    if (cursor.getInt(pendingIdx) == 1) {
                         runCatching { resolver.delete(rowUri, null, null) }
                         continue
                     }
-                    if (!name.contains(VAULT_EXT, ignoreCase = true)) continue
+                    val name = cursor.getString(nameIdx).orEmpty()
+                    if (name.isBlank() ||
+                        name.equals(NOMEDIA_FILE_NAME, ignoreCase = true) ||
+                        name.endsWith(LEGACY_ENCRYPTED_EXT, ignoreCase = true)
+                    ) {
+                        continue
+                    }
+                    val mime = cursor.getString(mimeIdx)
+                        ?.takeIf { it.isNotBlank() && it != "application/octet-stream" }
+                        ?: inferMimeFromFileName(name)
+                        ?: "application/octet-stream"
                     val size = cursor.getLong(sizeIdx)
                     val modifiedMs = cursor.getLong(dateIdx) * 1000L
                     results.add(
-                        buildVaultEntry(
-                            prefs = prefs,
+                        VaultFileEntry(
+                            id = "ms_$id",
                             fileName = name,
+                            displayTitle = name,
                             sizeBytes = size,
                             lastModifiedMs = modifiedMs,
                             uriString = rowUri.toString(),
-                            isExternalFlag = true,
+                            localFilePath = null,
+                            isSafExternal = true,
+                            mimeType = mime,
+                            category = classifyCategory(name, mime),
                         ),
                     )
                 }
@@ -385,206 +404,326 @@ class SafVaultRepository(context: Context) {
         return results
     }
 
-    fun encryptMediaFromUri(
+    fun moveMediaToVault(
         sourceUri: Uri,
-        password: CharArray,
         fallbackCategory: VaultCategory = VaultCategory.VIDEOS,
-    ): Flow<VaultOperationProgress> = flow {
+        deleteOriginal: Boolean = true,
+    ): Flow<VaultTransferProgress> = flow {
         val meta = resolveSourceMetadata(sourceUri, fallbackCategory)
-        val inputStream = if (sourceUri.scheme.equals("file", ignoreCase = true)) {
-            val filePath = sourceUri.path ?: throw IllegalStateException("Invalid selected file path.")
-            File(filePath).inputStream()
-        } else {
-            appContext.contentResolver.openInputStream(sourceUri)
-                ?: throw IllegalStateException("Unable to open selected video stream.")
+        val totalBytes = meta.originalSizeBytes.coerceAtLeast(1L)
+        val sanitizedName = sanitizeTargetFileName(meta.originalName, fallbackCategory)
+
+        emit(
+            VaultTransferProgress(
+                fraction = 0.04f,
+                bytesProcessed = 0L,
+                totalBytes = totalBytes,
+                stage = VaultTransferStage.PREPARING,
+                metadata = meta,
+            ),
+        )
+
+        val sourceFile = resolveLocalFileFromUri(sourceUri)
+        val activeMode = getActiveStorageModeBlocking()
+
+        // Fast atomic local rename when source and target are plain Files on the same volume
+        if (deleteOriginal && sourceFile != null && sourceFile.exists() && sourceFile.canWrite()) {
+            val targetDir = when (activeMode) {
+                VaultStorageMode.PHONE_DOWNLOADS -> {
+                    if (hasAllFilesAccess()) {
+                        hiddenExternalVaultDir.apply { ensureProtectedDir(this) }
+                    } else {
+                        null
+                    }
+                }
+                VaultStorageMode.INTERNAL -> internalVaultDir
+                VaultStorageMode.SAF_EXTERNAL -> null
+            }
+            if (targetDir != null) {
+                val destFile = resolveUniqueFile(targetDir, sanitizedName)
+                if (sourceFile.renameTo(destFile)) {
+                    scanDeletedPath(sourceFile.absolutePath)
+                    tryDeleteMediaStoreRow(sourceUri)
+                    emit(
+                        VaultTransferProgress(
+                            fraction = 1f,
+                            bytesProcessed = destFile.length(),
+                            totalBytes = destFile.length().coerceAtLeast(totalBytes),
+                            stage = VaultTransferStage.COMPLETED,
+                            metadata = meta.copy(originalName = destFile.name),
+                            originalDeleted = true,
+                        ),
+                    )
+                    return@flow
+                }
+            }
         }
 
-        val itemId = "bhv_${UUID.randomUUID().toString().replace("-", "").take(16)}"
-        val finalName = "$itemId$VAULT_EXT"
-        val stagingName = "$finalName$STAGING_SUFFIX"
+        val inputStream: InputStream = if (sourceFile != null && sourceFile.exists()) {
+            sourceFile.inputStream()
+        } else {
+            appContext.contentResolver.openInputStream(sourceUri)
+                ?: throw IllegalStateException("تعذر قراءة الملف المختار من الجهاز.")
+        }
 
-        when (getActiveStorageModeBlocking()) {
-            VaultStorageMode.SAF_EXTERNAL -> {
+        var commitAction: suspend () -> String = { sanitizedName }
+        var cleanupAction: suspend () -> Unit = {}
+        val outStream: OutputStream
+
+        when {
+            activeMode == VaultStorageMode.SAF_EXTERNAL -> {
                 val safUri = getSafTreeUriBlocking()
                     ?: run {
                         runCatching { inputStream.close() }
-                        throw IllegalStateException("External SAF Vault directory unavailable.")
+                        throw IllegalStateException("المجلد الخارجي (SAF) غير متاح.")
                     }
                 val tree = DocumentFile.fromTreeUri(appContext, safUri)
                     ?: run {
                         runCatching { inputStream.close() }
-                        throw IllegalStateException("External SAF Vault directory unavailable.")
+                        throw IllegalStateException("المجلد الخارجي (SAF) غير متاح.")
                     }
+                val uniqueName = resolveUniqueSafName(tree, sanitizedName)
+                val stagingName = "$uniqueName$STAGING_SUFFIX"
                 val stagingDoc = tree.createFile("application/octet-stream", stagingName)
                     ?: run {
                         runCatching { inputStream.close() }
-                        throw IllegalStateException("Failed to create encrypted SAF staging file.")
+                        throw IllegalStateException("تعذر إنشاء ملف النقل في المجلد المختار.")
                     }
-                val outStream = appContext.contentResolver.openOutputStream(stagingDoc.uri, "w")
+                outStream = appContext.contentResolver.openOutputStream(stagingDoc.uri, "w")
                     ?: run {
                         runCatching { stagingDoc.delete() }
                         runCatching { inputStream.close() }
-                        throw IllegalStateException("Failed to open SAF output stream.")
+                        throw IllegalStateException("تعذر فتح المجلد الخارجي للكتابة.")
                     }
-
-                val streamFlow = UltraVaultEngine.encryptStream(
-                    inputStream = inputStream,
-                    outputStream = outStream,
-                    password = password,
-                    metadata = meta,
-                    onCommitAtomic = {
-                        runCatching { outStream.close() }
-                        runCatching { inputStream.close() }
-                        val renamed = runCatching { stagingDoc.renameTo(finalName) }.getOrDefault(false)
-                        if (!renamed) {
-                            val committedDoc = tree.createFile("application/octet-stream", finalName)
-                                ?: throw IllegalStateException("Failed to finalize SAF vault file.")
-                            appContext.contentResolver.openInputStream(stagingDoc.uri)?.use { src ->
-                                appContext.contentResolver.openOutputStream(committedDoc.uri, "w")?.use { dst ->
-                                    src.copyTo(dst, 64 * 1024)
-                                    dst.flush()
-                                }
+                commitAction = {
+                    val renamed = runCatching { stagingDoc.renameTo(uniqueName) }.getOrDefault(false)
+                    if (!renamed) {
+                        val committedDoc = tree.createFile(meta.mimeType, uniqueName)
+                            ?: throw IllegalStateException("تعذر حفظ الملف داخل المجلد الخارجي.")
+                        appContext.contentResolver.openInputStream(stagingDoc.uri)?.use { src ->
+                            appContext.contentResolver.openOutputStream(committedDoc.uri, "w")?.use { dst ->
+                                src.copyTo(dst, 64 * 1024)
+                                dst.flush()
                             }
-                            runCatching { stagingDoc.delete() }
                         }
-                        cacheEncryptedMetadata(finalName, meta.originalName, meta.mimeType)
-                    },
-                    onCleanupFailed = {
-                        runCatching { outStream.close() }
                         runCatching { stagingDoc.delete() }
-                        runCatching { inputStream.close() }
-                    },
-                )
-                emitAll(streamFlow)
-            }
-
-            VaultStorageMode.PHONE_DOWNLOADS -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val resolver = appContext.contentResolver
-                    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                    val values = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, finalName)
-                        put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
-                        put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_VAULT_FOLDER")
-                        put(MediaStore.Downloads.IS_PENDING, 1)
                     }
-                    val pendingUri = resolver.insert(collection, values)
-                        ?: run {
-                            runCatching { inputStream.close() }
-                            throw IllegalStateException("Unable to create file in Download/$PUBLIC_VAULT_FOLDER.")
-                        }
-                    val outStream = resolver.openOutputStream(pendingUri, "w")
-                        ?: run {
-                            runCatching { resolver.delete(pendingUri, null, null) }
-                            runCatching { inputStream.close() }
-                            throw IllegalStateException("Unable to open Download/$PUBLIC_VAULT_FOLDER output stream.")
-                        }
+                    uniqueName
+                }
+                cleanupAction = {
+                    runCatching { stagingDoc.delete() }
+                }
+            }
 
-                    val streamFlow = UltraVaultEngine.encryptStream(
-                        inputStream = inputStream,
-                        outputStream = outStream,
-                        password = password,
-                        metadata = meta,
-                        onCommitAtomic = {
-                            runCatching { outStream.close() }
-                            runCatching { inputStream.close() }
-                            val commitValues = ContentValues().apply {
-                                put(MediaStore.Downloads.IS_PENDING, 0)
-                            }
-                            resolver.update(pendingUri, commitValues, null, null)
-                            val committedName = queryDisplayNameForUri(pendingUri) ?: finalName
-                            cacheEncryptedMetadata(committedName, meta.originalName, meta.mimeType)
-                            cacheEncryptedMetadata(finalName, meta.originalName, meta.mimeType)
-                        },
-                        onCleanupFailed = {
-                            runCatching { outStream.close() }
-                            runCatching { resolver.delete(pendingUri, null, null) }
-                            runCatching { inputStream.close() }
-                        },
-                    )
-                    emitAll(streamFlow)
+            activeMode == VaultStorageMode.PHONE_DOWNLOADS &&
+                !hasAllFilesAccess() &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                val resolver = appContext.contentResolver
+                val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, sanitizedName)
+                    put(MediaStore.Downloads.MIME_TYPE, meta.mimeType)
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_DOWNLOADS_SUBFOLDER")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val pendingUri = resolver.insert(collection, values)
+                    ?: run {
+                        runCatching { inputStream.close() }
+                        throw IllegalStateException("تعذر حفظ الملف في Download/$PUBLIC_DOWNLOADS_SUBFOLDER.")
+                    }
+                outStream = resolver.openOutputStream(pendingUri, "w")
+                    ?: run {
+                        runCatching { resolver.delete(pendingUri, null, null) }
+                        runCatching { inputStream.close() }
+                        throw IllegalStateException("تعذر فتح مجلد التنزيلات للكتابة.")
+                    }
+                commitAction = {
+                    val commitValues = ContentValues().apply {
+                        put(MediaStore.Downloads.IS_PENDING, 0)
+                    }
+                    resolver.update(pendingUri, commitValues, null, null)
+                    queryDisplayNameForUri(pendingUri) ?: sanitizedName
+                }
+                cleanupAction = {
+                    runCatching { resolver.delete(pendingUri, null, null) }
+                }
+            }
+
+            else -> {
+                val targetDir = if (activeMode == VaultStorageMode.PHONE_DOWNLOADS && hasAllFilesAccess()) {
+                    hiddenExternalVaultDir.apply { ensureProtectedDir(this) }
                 } else {
-                    val dir = legacyPublicDownloadsDir.apply { if (!exists()) mkdirs() }
-                    emitAll(encryptIntoLocalDirectory(dir, finalName, stagingName, inputStream, password, meta))
+                    internalVaultDir
+                }
+                val destFile = resolveUniqueFile(targetDir, sanitizedName)
+                val stagingFile = File(targetDir, ".${destFile.name}$STAGING_SUFFIX")
+                outStream = try {
+                    stagingFile.outputStream()
+                } catch (t: Throwable) {
+                    runCatching { inputStream.close() }
+                    throw t
+                }
+                commitAction = {
+                    if (destFile.exists()) destFile.delete()
+                    if (!stagingFile.renameTo(destFile)) {
+                        stagingFile.copyTo(destFile, overwrite = true)
+                        stagingFile.delete()
+                    }
+                    destFile.name
+                }
+                cleanupAction = {
+                    runCatching { stagingFile.delete() }
                 }
             }
-
-            VaultStorageMode.INTERNAL -> {
-                emitAll(encryptIntoLocalDirectory(internalVaultDir, finalName, stagingName, inputStream, password, meta))
-            }
-        }
-    }.flowOn(Dispatchers.IO)
-
-    private fun encryptIntoLocalDirectory(
-        dir: File,
-        finalName: String,
-        stagingName: String,
-        inputStream: InputStream,
-        password: CharArray,
-        meta: VaultMediaMetadata,
-    ): Flow<VaultOperationProgress> {
-        val stagingFile = File(dir, stagingName)
-        val finalFile = File(dir, finalName)
-        val outStream: OutputStream = try {
-            stagingFile.outputStream()
-        } catch (t: Throwable) {
-            runCatching { inputStream.close() }
-            throw t
         }
 
-        return UltraVaultEngine.encryptStream(
-            inputStream = inputStream,
-            outputStream = outStream,
-            password = password,
-            metadata = meta,
-            onCommitAtomic = {
-                runCatching { outStream.close() }
-                runCatching { inputStream.close() }
-                if (finalFile.exists()) finalFile.delete()
-                val renamed = stagingFile.renameTo(finalFile)
-                if (!renamed) {
-                    stagingFile.copyTo(finalFile, overwrite = true)
-                    UltraVaultEngine.secureDeleteFile(stagingFile)
-                }
-                cacheEncryptedMetadata(finalName, meta.originalName, meta.mimeType)
-            },
-            onCleanupFailed = {
-                runCatching { outStream.close() }
-                UltraVaultEngine.secureDeleteFile(stagingFile)
-                runCatching { inputStream.close() }
-            },
-        )
-    }
+        val buffer = ByteArray(128 * 1024)
+        var bytesCopied = 0L
+        var committed = false
 
-    fun decryptEntryToTempCache(
-        entry: VaultFileEntry,
-        password: CharArray,
-    ): Flow<VaultOperationProgress> = flow {
-        val input: InputStream = openEntryInputStream(entry)
-            ?: throw IllegalStateException("Encrypted file could not be opened.")
         try {
-            emitAll(
-                UltraVaultEngine.decryptToTempFile(
-                    context = appContext,
-                    inputStream = input,
-                    encryptedFileLengthHint = entry.sizeBytes,
-                    password = password,
+            BufferedInputStream(inputStream, 64 * 1024).use { bufferedIn ->
+                BufferedOutputStream(outStream, 64 * 1024).use { bufferedOut ->
+                    while (true) {
+                        val read = bufferedIn.read(buffer)
+                        if (read == -1) break
+                        bufferedOut.write(buffer, 0, read)
+                        bytesCopied += read
+                        val fraction = (0.06f + 0.88f * (bytesCopied.toFloat() / totalBytes.toFloat()))
+                            .coerceIn(0.06f, 0.94f)
+                        emit(
+                            VaultTransferProgress(
+                                fraction = fraction,
+                                bytesProcessed = bytesCopied,
+                                totalBytes = totalBytes,
+                                stage = VaultTransferStage.MOVING,
+                                metadata = meta,
+                            ),
+                        )
+                    }
+                    bufferedOut.flush()
+                }
+            }
+
+            emit(
+                VaultTransferProgress(
+                    fraction = 0.97f,
+                    bytesProcessed = bytesCopied,
+                    totalBytes = totalBytes,
+                    stage = VaultTransferStage.FINALIZING,
+                    metadata = meta,
                 ),
             )
+
+            val committedName = commitAction()
+            committed = true
+
+            val originalRemoved = if (deleteOriginal) {
+                deleteOriginalSource(sourceUri, sourceFile)
+            } else {
+                false
+            }
+
+            emit(
+                VaultTransferProgress(
+                    fraction = 1f,
+                    bytesProcessed = bytesCopied,
+                    totalBytes = bytesCopied.coerceAtLeast(totalBytes),
+                    stage = VaultTransferStage.COMPLETED,
+                    metadata = meta.copy(originalName = committedName),
+                    originalDeleted = originalRemoved,
+                ),
+            )
+        } catch (t: Throwable) {
+            if (!committed) {
+                withContext(NonCancellable) {
+                    runCatching { outStream.close() }
+                    cleanupAction()
+                }
+            }
+            if (t is CancellationException) throw t
+            throw t
         } finally {
-            runCatching { input.close() }
+            runCatching { inputStream.close() }
         }
     }.flowOn(Dispatchers.IO)
 
+    suspend fun restoreEntryToDevice(entry: VaultFileEntry): Boolean = withContext(Dispatchers.IO) {
+        val publicDir = when (entry.category) {
+            VaultCategory.PHOTOS -> Environment.DIRECTORY_PICTURES
+            VaultCategory.VIDEOS -> Environment.DIRECTORY_MOVIES
+            VaultCategory.FILES -> Environment.DIRECTORY_DOWNLOADS
+        }
+        val entryUri = Uri.parse(entry.uriString)
+        val inputStream = entry.localFilePath?.let { File(it) }?.takeIf { it.exists() }?.inputStream()
+            ?: runCatching { appContext.contentResolver.openInputStream(entryUri) }.getOrNull()
+            ?: return@withContext false
+
+        val restoredPath: String? = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !hasAllFilesAccess()) {
+                val resolver = appContext.contentResolver
+                val collection = when (entry.category) {
+                    VaultCategory.PHOTOS -> MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                    VaultCategory.VIDEOS -> MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                    VaultCategory.FILES -> MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                }
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, entry.fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, entry.mimeType)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "$publicDir/$RESTORED_SUBFOLDER")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val outUri = resolver.insert(collection, values) ?: return@withContext false
+                val copied = runCatching {
+                    resolver.openOutputStream(outUri, "w")?.use { dst ->
+                        inputStream.use { src -> src.copyTo(dst, 64 * 1024) }
+                        dst.flush()
+                    } ?: error("Output stream null")
+                    resolver.update(outUri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+                }.isSuccess
+                if (!copied) {
+                    runCatching { resolver.delete(outUri, null, null) }
+                    return@withContext false
+                }
+                null
+            } else {
+                @Suppress("DEPRECATION")
+                val targetDir = File(
+                    Environment.getExternalStoragePublicDirectory(publicDir),
+                    RESTORED_SUBFOLDER,
+                ).apply { if (!exists()) mkdirs() }
+                val destFile = resolveUniqueFile(targetDir, entry.fileName)
+                inputStream.use { src ->
+                    destFile.outputStream().use { dst ->
+                        src.copyTo(dst, 64 * 1024)
+                        dst.flush()
+                    }
+                }
+                destFile.absolutePath
+            }
+        } catch (_: Throwable) {
+            runCatching { inputStream.close() }
+            return@withContext false
+        }
+
+        if (restoredPath != null) {
+            MediaScannerConnection.scanFile(appContext, arrayOf(restoredPath), arrayOf(entry.mimeType), null)
+        }
+        deleteEntry(entry)
+        true
+    }
+
     suspend fun deleteEntry(entry: VaultFileEntry): Boolean = withContext(Dispatchers.IO) {
+        val localFile = entry.localFilePath?.let(::File)
+        if (localFile != null && localFile.exists()) {
+            return@withContext runCatching { localFile.delete() }.getOrDefault(false)
+        }
         val uri = Uri.parse(entry.uriString)
-        val deleted = if (uri.scheme.equals("content", ignoreCase = true)) {
+        if (uri.scheme.equals("content", ignoreCase = true)) {
             val directDelete = runCatching {
                 appContext.contentResolver.delete(uri, null, null) > 0
             }.getOrDefault(false)
-            if (directDelete) {
-                true
-            } else {
+            if (directDelete) true else {
                 runCatching {
                     DocumentFile.fromSingleUri(appContext, uri)?.delete() == true
                 }.getOrDefault(false)
@@ -592,33 +731,9 @@ class SafVaultRepository(context: Context) {
         } else {
             runCatching {
                 val file = File(uri.path ?: return@runCatching false)
-                UltraVaultEngine.secureDeleteFile(file)
-                !file.exists()
+                file.delete()
             }.getOrDefault(false)
         }
-        if (deleted) {
-            getSecurePrefs().edit()
-                .remove("$KEY_TITLE_PREFIX${entry.fileName}")
-                .remove("$KEY_MIME_PREFIX${entry.fileName}")
-                .commit()
-        }
-        deleted
-    }
-
-    suspend fun cacheEncryptedDisplayTitle(fileName: String, originalTitle: String) =
-        withContext(Dispatchers.IO) {
-            getSecurePrefs().edit().putString("$KEY_TITLE_PREFIX$fileName", originalTitle).commit()
-        }
-
-    suspend fun cacheEncryptedMetadata(
-        fileName: String,
-        originalTitle: String,
-        mimeType: String,
-    ) = withContext(Dispatchers.IO) {
-        getSecurePrefs().edit()
-            .putString("$KEY_TITLE_PREFIX$fileName", originalTitle)
-            .putString("$KEY_MIME_PREFIX$fileName", mimeType)
-            .commit()
     }
 
     suspend fun listBlackholeDownloadedVideos(): List<File> = withContext(Dispatchers.IO) {
@@ -626,20 +741,142 @@ class SafVaultRepository(context: Context) {
         if (!downloadsDir.exists() || !downloadsDir.isDirectory) return@withContext emptyList()
         (downloadsDir.listFiles()?.toList() ?: emptyList())
             .filter { file ->
-                file.isFile && file.length() > 0L && !file.name.endsWith(".tmp", ignoreCase = true)
+                file.isFile && file.length() > 0L && !file.name.endsWith(STAGING_SUFFIX, ignoreCase = true)
             }
             .sortedByDescending { it.lastModified() }
     }
 
-    private fun openEntryInputStream(entry: VaultFileEntry): InputStream? {
-        val uri = Uri.parse(entry.uriString)
-        return if (uri.scheme.equals("content", ignoreCase = true)) {
-            appContext.contentResolver.openInputStream(uri)
-        } else {
-            val path = uri.path ?: return null
-            val file = File(path)
-            if (file.exists()) file.inputStream() else null
+    private fun deleteOriginalSource(sourceUri: Uri, resolvedFile: File?): Boolean {
+        var deleted = false
+        if (resolvedFile != null && resolvedFile.exists()) {
+            val path = resolvedFile.absolutePath
+            if (runCatching { resolvedFile.delete() }.getOrDefault(false) || !resolvedFile.exists()) {
+                deleted = true
+                scanDeletedPath(path)
+            }
         }
+        if (tryDeleteMediaStoreRow(sourceUri)) {
+            deleted = true
+        }
+        if (!deleted && DocumentsContract.isDocumentUri(appContext, sourceUri)) {
+            val docDeleted = runCatching {
+                DocumentsContract.deleteDocument(appContext.contentResolver, sourceUri)
+            }.getOrDefault(false)
+            if (docDeleted) deleted = true
+        }
+        return deleted
+    }
+
+    private fun tryDeleteMediaStoreRow(uri: Uri): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        return runCatching {
+            appContext.contentResolver.delete(uri, null, null) > 0
+        }.getOrDefault(false)
+    }
+
+    private fun scanDeletedPath(path: String) {
+        runCatching {
+            MediaScannerConnection.scanFile(appContext, arrayOf(path), null, null)
+        }
+    }
+
+    private fun resolveLocalFileFromUri(uri: Uri): File? {
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            return uri.path?.let(::File)?.takeIf { it.exists() }
+        }
+        if (!uri.scheme.equals("content", ignoreCase = true)) return null
+
+        // 1. ExternalStorageDocuments document URI (e.g., primary:DCIM/Camera/vid.mp4)
+        if (DocumentsContract.isDocumentUri(appContext, uri)) {
+            val authority = uri.authority.orEmpty()
+            val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull().orEmpty()
+            if (authority == "com.android.externalstorage.documents" && docId.contains(":")) {
+                val type = docId.substringBefore(":")
+                val relPath = docId.substringAfter(":")
+                if (type.equals("primary", ignoreCase = true)) {
+                    @Suppress("DEPRECATION")
+                    val candidate = File(Environment.getExternalStorageDirectory(), relPath)
+                    if (candidate.exists()) return candidate
+                }
+            } else if (authority == "com.android.providers.downloads.documents" && docId.startsWith("raw:")) {
+                val candidate = File(docId.removePrefix("raw:"))
+                if (candidate.exists()) return candidate
+            } else if (authority == "com.android.providers.media.documents" && docId.contains(":")) {
+                val mediaType = docId.substringBefore(":")
+                val idNum = docId.substringAfter(":").toLongOrNull()
+                if (idNum != null) {
+                    val contentUri = when (mediaType) {
+                        "image" -> ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, idNum)
+                        "video" -> ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, idNum)
+                        "audio" -> ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, idNum)
+                        else -> null
+                    }
+                    contentUri?.let { queryDataColumnFile(it) }?.let { return it }
+                }
+            }
+        }
+
+        // 2. Direct MediaStore or File-backed content URI _data lookup
+        return queryDataColumnFile(uri)
+    }
+
+    private fun queryDataColumnFile(uri: Uri): File? {
+        return runCatching {
+            @Suppress("DEPRECATION")
+            val column = MediaStore.MediaColumns.DATA
+            appContext.contentResolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(column)
+                    if (idx >= 0) {
+                        val path = cursor.getString(idx)
+                        if (!path.isNullOrBlank()) {
+                            return@runCatching File(path).takeIf { it.exists() }
+                        }
+                    }
+                }
+                null
+            }
+        }.getOrNull()
+    }
+
+    private fun resolveUniqueFile(dir: File, desiredName: String): File {
+        var candidate = File(dir, desiredName)
+        if (!candidate.exists()) return candidate
+        val base = desiredName.substringBeforeLast('.', desiredName)
+        val ext = desiredName.substringAfterLast('.', "")
+        var idx = 1
+        while (candidate.exists()) {
+            val nextName = if (ext.isNotEmpty()) "${base}_$idx.$ext" else "${base}_$idx"
+            candidate = File(dir, nextName)
+            idx++
+        }
+        return candidate
+    }
+
+    private fun resolveUniqueSafName(tree: DocumentFile, desiredName: String): String {
+        val existingNames = runCatching {
+            tree.listFiles().mapNotNull { it.name }.toHashSet()
+        }.getOrDefault(emptySet())
+        if (desiredName !in existingNames) return desiredName
+        val base = desiredName.substringBeforeLast('.', desiredName)
+        val ext = desiredName.substringAfterLast('.', "")
+        var idx = 1
+        while (true) {
+            val nextName = if (ext.isNotEmpty()) "${base}_$idx.$ext" else "${base}_$idx"
+            if (nextName !in existingNames) return nextName
+            idx++
+        }
+    }
+
+    private fun sanitizeTargetFileName(rawName: String, fallbackCategory: VaultCategory): String {
+        val cleaned = rawName.replace(Regex("""[/\\:*?"<>|]"""), "_").trim()
+        if (cleaned.isNotBlank() && !cleaned.startsWith(".")) return cleaned
+        val ext = when (fallbackCategory) {
+            VaultCategory.PHOTOS -> "jpg"
+            VaultCategory.VIDEOS -> "mp4"
+            VaultCategory.FILES -> "bin"
+        }
+        return "vault_${System.currentTimeMillis()}.$ext"
     }
 
     private fun queryDisplayNameForUri(uri: Uri): String? {
@@ -734,52 +971,16 @@ class SafVaultRepository(context: Context) {
         )
     }
 
-    private fun buildVaultEntry(
-        prefs: SharedPreferences,
-        fileName: String,
-        sizeBytes: Long,
-        lastModifiedMs: Long,
-        uriString: String,
-        isExternalFlag: Boolean,
-    ): VaultFileEntry {
-        val normalizedKey = fileName.substringBefore(".bin")
-        val cachedTitle = prefs.getString("$KEY_TITLE_PREFIX$fileName", null)
-            ?: prefs.getString("$KEY_TITLE_PREFIX$normalizedKey", null)
-        val cachedMime = prefs.getString("$KEY_MIME_PREFIX$fileName", null)
-            ?: prefs.getString("$KEY_MIME_PREFIX$normalizedKey", null)
-        val displayTitle = cachedTitle ?: "Encrypted Item (${fileName.take(10)})"
-        val effectiveMime = cachedMime
-            ?: inferMimeFromFileName(cachedTitle.orEmpty())
-            ?: if (cachedTitle == null || cachedTitle.startsWith("vault_video", ignoreCase = true)) {
-                "video/mp4"
-            } else {
-                "application/octet-stream"
-            }
-        val category = classifyCategory(displayTitle, effectiveMime)
-        return VaultFileEntry(
-            id = fileName.substringBefore(VAULT_EXT),
-            fileName = fileName,
-            displayTitle = displayTitle,
-            sizeBytes = sizeBytes,
-            lastModifiedMs = lastModifiedMs,
-            uriString = uriString,
-            isSafExternal = isExternalFlag,
-            mimeType = effectiveMime,
-            category = category,
-        )
-    }
-
     companion object {
         private const val VAULT_PREFS_NAME = "blackhole_vault_saf_prefs"
-        private const val VAULT_FALLBACK_PREFS_NAME = "blackhole_vault_saf_prefs_fb"
         private const val KEY_SAF_TREE_URI = "KEY_SAF_TREE_URI"
         private const val KEY_STORAGE_MODE = "KEY_STORAGE_MODE"
-        private const val KEY_BIOMETRIC_MASTER_SECRET = "KEY_BIOMETRIC_MASTER_SECRET"
-        private const val KEY_TITLE_PREFIX = "TITLE_"
-        private const val KEY_MIME_PREFIX = "MIME_"
         private const val INTERNAL_VAULT_FOLDER = "blackhole_vault"
-        private const val PUBLIC_VAULT_FOLDER = "BlackholeVault"
-        private const val VAULT_EXT = ".bhv"
+        private const val HIDDEN_EXTERNAL_VAULT_FOLDER = ".BlackholeVault"
+        private const val PUBLIC_DOWNLOADS_SUBFOLDER = "BlackholeVault"
+        private const val RESTORED_SUBFOLDER = "BlackholeRestored"
+        private const val NOMEDIA_FILE_NAME = ".nomedia"
+        private const val LEGACY_ENCRYPTED_EXT = ".bhv"
         private const val STAGING_SUFFIX = ".tmp"
 
         private val PHOTO_EXTENSIONS = setOf(

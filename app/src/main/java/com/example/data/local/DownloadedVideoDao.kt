@@ -12,9 +12,6 @@ interface DownloadedVideoDao {
     @Query("SELECT * FROM downloaded_videos ORDER BY createdAt DESC")
     fun observeAllVideos(): Flow<List<DownloadedVideoEntity>>
 
-    @Query("SELECT * FROM downloaded_videos WHERE id = :id LIMIT 1")
-    suspend fun getVideoById(id: Long): DownloadedVideoEntity?
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertVideo(video: DownloadedVideoEntity): Long
 

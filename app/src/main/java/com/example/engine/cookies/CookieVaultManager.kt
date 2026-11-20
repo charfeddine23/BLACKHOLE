@@ -3,8 +3,6 @@ package com.example.engine.cookies
 import android.content.Context
 import android.webkit.CookieManager
 import android.webkit.WebStorage
-import com.example.engine.model.PlatformBadge
-import com.example.engine.network.ClientSpoofer
 import com.pulse.blackhole.data.vault.SessionVaultManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -254,7 +252,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                     }
                 }
                 resetGoogleWebViewCookies()
-                sessionVault.markGoogleCookieResetV3Done()
                 sessionVault.markGoogleCookieResetV4Done()
             } else {
                 listOf("google.com", "google.fr", "youtube.com", "accounts.google.com", "accounts.youtube.com").forEach { key ->
@@ -503,56 +500,6 @@ class CookieVaultManager private constructor(private val appContext: Context) {
                 CookieManager.getInstance().flush()
             }
         }
-    }
-
-    fun buildExtractionCommand(
-        targetUrl: String,
-        vault: SessionVaultManager = sessionVault,
-    ): List<String> {
-        val platform = PlatformBadge.fromUrl(targetUrl)
-        val command = mutableListOf(
-            "yt-dlp",
-            "--user-agent",
-            ClientSpoofer.nextRotatedUserAgent(targetUrl),
-            "--no-check-certificate",
-            "--geo-bypass",
-        )
-
-        if (vault.hasActiveSession()) {
-            val cookieFile = vault.writeTempNetscapeCookiesFile(appContext.cacheDir)
-            if (cookieFile != null && cookieFile.exists()) {
-                command.add("--cookies")
-                command.add(cookieFile.absolutePath)
-            }
-        }
-
-        when (platform) {
-            PlatformBadge.YOUTUBE -> {
-                command.add("--extractor-args")
-                command.add("youtube:player_client=ios,web")
-                command.add("-f")
-                command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
-            }
-            PlatformBadge.TIKTOK -> {
-                command.add("--referer")
-                command.add("https://www.tiktok.com/")
-                command.add("-f")
-                command.add("best")
-            }
-            else -> {
-                command.add("--referer")
-                command.add(ClientSpoofer.refererForUrl(targetUrl))
-                command.add("-f")
-                command.add("best")
-            }
-        }
-
-        command.add(targetUrl)
-        return command
-    }
-
-    fun getTikTokExtractionCommand(targetUrl: String): List<String> {
-        return buildExtractionCommand(targetUrl, sessionVault)
     }
 
     fun getCookieHeaderForUrl(url: String): String {

@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,14 +29,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -72,7 +70,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -84,6 +81,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.ui.components.rememberSafeScreenInsets
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.EmeraldPulse
@@ -118,18 +116,18 @@ fun VaultScreen(
         }
     }
 
-    // Auto-lock and scrub decrypted temp cache on genuine backgrounding or leaving screen,
-    // while ignoring temporary ON_STOP transitions caused by system file/biometric pickers.
+    // Auto-lock on genuine backgrounding/leaving screen while keeping external system flows unlocked
     DisposableEffect(lifecycleOwner, vaultViewModel) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
                     if (!vaultViewModel.isAwaitingExternalSystemFlow()) {
-                        vaultViewModel.lockVaultAndWipe()
+                        vaultViewModel.lockVaultNow()
                     }
                 }
                 Lifecycle.Event.ON_RESUME -> {
                     vaultViewModel.endExternalSystemFlow()
+                    vaultViewModel.refreshPermissionAndEntries()
                 }
                 else -> Unit
             }
@@ -137,16 +135,16 @@ fun VaultScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            vaultViewModel.lockVaultAndWipe()
+            vaultViewModel.lockVaultNow()
         }
     }
 
     BackHandler {
         when {
-            uiState.activePlayback != null -> vaultViewModel.closePlayerAndWipeTemp()
+            uiState.activePlayback != null -> vaultViewModel.closePlayer()
             uiState.selectedCategory != null -> vaultViewModel.selectCategory(null)
             else -> {
-                vaultViewModel.lockVaultAndWipe()
+                vaultViewModel.lockVaultNow()
                 onBack()
             }
         }
@@ -159,7 +157,7 @@ fun VaultScreen(
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
-            vaultViewModel.encryptVideoFromPicker(selectedUri, pendingPickCategory)
+            vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
 
@@ -168,7 +166,7 @@ fun VaultScreen(
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
-            vaultViewModel.encryptVideoFromPicker(selectedUri, pendingPickCategory)
+            vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
 
@@ -182,7 +180,7 @@ fun VaultScreen(
             null
         }
         if (selectedUri != null) {
-            vaultViewModel.encryptVideoFromPicker(selectedUri, pendingPickCategory)
+            vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
 
@@ -191,7 +189,7 @@ fun VaultScreen(
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
-            vaultViewModel.encryptVideoFromPicker(selectedUri, pendingPickCategory)
+            vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
 
@@ -218,6 +216,55 @@ fun VaultScreen(
         }
     }
 
+    val allFilesSettingsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) {
+        vaultViewModel.endExternalSystemFlow()
+        vaultViewModel.refreshPermissionAndEntries()
+    }
+
+    val legacyStoragePermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        vaultViewModel.endExternalSystemFlow()
+        val writeGranted = grants[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
+        vaultViewModel.refreshPermissionAndEntries()
+        if (!writeGranted) {
+            vaultViewModel.reportStatusError("تم رفض صلاحية الوصول إلى ملفات الجهاز.")
+        }
+    }
+
+    val requestAllFilesAccess: () -> Unit = {
+        vaultViewModel.beginExternalSystemFlow()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val appSettingsIntent = Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:${context.packageName}"),
+            )
+            val fallbackSettingsIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+            val launched = runCatching {
+                allFilesSettingsLauncher.launch(appSettingsIntent)
+                true
+            }.getOrElse {
+                runCatching {
+                    allFilesSettingsLauncher.launch(fallbackSettingsIntent)
+                    true
+                }.getOrDefault(false)
+            }
+            if (!launched) {
+                vaultViewModel.endExternalSystemFlow()
+                vaultViewModel.reportStatusError("تعذر فتح إعدادات صلاحية الوصول إلى الملفات.")
+            }
+        } else {
+            legacyStoragePermissionsLauncher.launch(
+                arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                ),
+            )
+        }
+    }
+
     var pendingPhoneFallbackNotice by remember { mutableStateOf<String?>(null) }
 
     val legacyWritePermissionLauncher = rememberLauncherForActivityResult(
@@ -230,7 +277,7 @@ fun VaultScreen(
             vaultViewModel.activatePhoneDownloadsVault(notice)
         } else {
             vaultViewModel.reportStatusError(
-                "Storage write permission denied. Internal Vault remains active.",
+                "تم رفض صلاحية الكتابة في الهاتف. سيبقى التخزين الداخلي قيد الاستخدام.",
             )
         }
     }
@@ -380,7 +427,7 @@ fun VaultScreen(
         if (!launched) {
             vaultViewModel.endExternalSystemFlow()
             switchToPhoneDownloadsVault(
-                "System SAF picker unavailable — Phone Storage Vault (Download/BlackholeVault) activated automatically.",
+                "مختار SAF غير متاح — تم تفعيل مجلد الخزنة على الهاتف تلقائياً.",
             )
         }
     }
@@ -390,7 +437,7 @@ fun VaultScreen(
     val triggerBiometricAuth: () -> Unit = {
         val fragmentActivity = context.findFragmentActivity()
         if (fragmentActivity == null) {
-            biometricError = "Biometric prompt unavailable in current host."
+            biometricError = "تعذر تشغيل نافذة البصمة على هذا الجهاز."
         } else {
             val bioManager = BiometricManager.from(fragmentActivity)
             val authenticators = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -405,8 +452,8 @@ fun VaultScreen(
                     biometricError = null
                     vaultViewModel.beginExternalSystemFlow()
                     val promptBuilder = BiometricPrompt.PromptInfo.Builder()
-                        .setTitle("Unlock BlackHole Vault")
-                        .setSubtitle("Verify your fingerprint or biometric")
+                        .setTitle("فتح خزنة BlackHole")
+                        .setSubtitle("تحقق ببصمة الإصبع أو قفل الجهاز للدخول")
 
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         promptBuilder.setAllowedAuthenticators(authenticators)
@@ -438,7 +485,7 @@ fun VaultScreen(
                                 }
 
                                 override fun onAuthenticationFailed() {
-                                    biometricError = "Biometric did not match. Try again."
+                                    biometricError = "البصمة غير مطابقة. حاول مجدداً."
                                 }
                             },
                         )
@@ -448,13 +495,13 @@ fun VaultScreen(
                     if (launched.isFailure) {
                         vaultViewModel.endExternalSystemFlow()
                         biometricError = launched.exceptionOrNull()?.message
-                            ?: "Unable to open biometric prompt."
+                            ?: "تعذر فتح نافذة التحقق بالبصمة."
                     }
                 }
                 else -> {
                     biometricError = null
                     vaultViewModel.unlockAfterBiometricVerification(
-                        noticeMessage = "No biometric enrolled on this device — unlocked with local key.",
+                        noticeMessage = "لا توجد بصمة مسجلة — تم فتح الخزنة المحمية مباشرة.",
                     )
                 }
             }
@@ -469,14 +516,7 @@ fun VaultScreen(
         }
     }
 
-    val density = LocalDensity.current
-    val cutoutTop = with(density) { WindowInsets.displayCutout.getTop(density).toDp() }
-    val statusTop = with(density) { WindowInsets.statusBars.getTop(density).toDp() }
-    val safeTopInset = maxOf(cutoutTop + 8.dp, statusTop, 36.dp)
-    val cutoutBottom = with(density) { WindowInsets.displayCutout.getBottom(density).toDp() }
-    val navBottom = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
-    val safeBottomInset = maxOf(cutoutBottom, navBottom, 16.dp)
-
+    val safeInsets = rememberSafeScreenInsets(cutoutExtraTop = 8.dp, minTop = 36.dp, minBottom = 16.dp)
     val activeCategory = uiState.selectedCategory
 
     Scaffold(
@@ -497,7 +537,7 @@ fun VaultScreen(
                     containerColor = fabAccent,
                     contentColor = ObsidianVoid,
                     modifier = Modifier
-                        .padding(bottom = safeBottomInset)
+                        .padding(bottom = safeInsets.bottom)
                         .testTag("vault_add_video_fab"),
                 ) {
                     Icon(
@@ -532,7 +572,7 @@ fun VaultScreen(
                         center = Offset(size.width * 0.5f, size.height * 0.35f),
                     )
                 }
-                .padding(top = safeTopInset, bottom = safeBottomInset),
+                .padding(top = safeInsets.top, bottom = safeInsets.bottom),
         ) {
             when {
                 uiState.isLocked -> {
@@ -540,7 +580,7 @@ fun VaultScreen(
                         uiState = uiState,
                         biometricMessage = biometricError,
                         onBack = {
-                            vaultViewModel.lockVaultAndWipe()
+                            vaultViewModel.lockVaultNow()
                             onBack()
                         },
                         onTriggerBiometric = triggerBiometricAuth,
@@ -551,11 +591,12 @@ fun VaultScreen(
                     VaultHomeCategoriesDashboard(
                         uiState = uiState,
                         onBack = {
-                            vaultViewModel.lockVaultAndWipe()
+                            vaultViewModel.lockVaultNow()
                             onBack()
                         },
-                        onLockNow = vaultViewModel::lockVaultAndWipe,
+                        onLockNow = vaultViewModel::lockVaultNow,
                         onOpenCategory = { cat -> vaultViewModel.selectCategory(cat) },
+                        onRequestAllFilesAccess = requestAllFilesAccess,
                         onSelectPhoneDownloads = { switchToPhoneDownloadsVault(null) },
                         onSelectSafFolder = launchSafFolderSelection,
                         onRevertInternalStorage = vaultViewModel::revertToInternalVaultStorage,
@@ -568,12 +609,13 @@ fun VaultScreen(
                         category = activeCategory,
                         uiState = uiState,
                         onBackToCategories = { vaultViewModel.selectCategory(null) },
-                        onLockNow = vaultViewModel::lockVaultAndWipe,
+                        onLockNow = vaultViewModel::lockVaultNow,
                         onPickFromGallery = { launchCategoryPicker(activeCategory, false) },
                         onPickFromPhoneFiles = { launchCategoryPicker(activeCategory, true) },
-                        onEncryptDownloadedVideo = vaultViewModel::encryptDownloadedVideo,
+                        onMoveDownloadedVideo = vaultViewModel::moveDownloadedVideoToVault,
                         onCancelTransfer = vaultViewModel::cancelActiveTransfer,
-                        onPlayEntry = vaultViewModel::decryptAndPlayEntry,
+                        onOpenEntry = vaultViewModel::openEntry,
+                        onRestoreEntry = vaultViewModel::restoreEntry,
                         onDeleteEntry = vaultViewModel::deleteEntry,
                         onDismissStatus = vaultViewModel::dismissStatus,
                     )
@@ -582,19 +624,19 @@ fun VaultScreen(
 
             uiState.activePlayback?.let { session ->
                 when (session.category) {
-                    VaultCategory.PHOTOS -> VaultZeroFootprintPhotoViewer(
+                    VaultCategory.PHOTOS -> VaultProtectedPhotoViewer(
                         session = session,
-                        onCloseAndWipe = vaultViewModel::closePlayerAndWipeTemp,
+                        onClose = vaultViewModel::closePlayer,
                     )
-                    VaultCategory.VIDEOS -> VaultZeroFootprintPlayer(
+                    VaultCategory.VIDEOS -> VaultProtectedVideoPlayer(
                         session = session,
-                        onCloseAndWipe = vaultViewModel::closePlayerAndWipeTemp,
+                        onClose = vaultViewModel::closePlayer,
                     )
-                    VaultCategory.FILES -> VaultZeroFootprintFileViewer(
+                    VaultCategory.FILES -> VaultProtectedFileViewer(
                         session = session,
                         onBeforeExternalOpen = vaultViewModel::beginExternalSystemFlow,
                         onReportOpenError = vaultViewModel::reportStatusError,
-                        onCloseAndWipe = vaultViewModel::closePlayerAndWipeTemp,
+                        onClose = vaultViewModel::closePlayer,
                     )
                 }
             }
@@ -700,7 +742,7 @@ private fun VaultLockedGate(
                 Spacer(modifier = Modifier.height(18.dp))
 
                 Text(
-                    text = "BIOMETRIC VAULT",
+                    text = "الخزنة المحمية",
                     style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
                     color = ChromeSilver,
                     textAlign = TextAlign.Center,
@@ -709,7 +751,7 @@ private fun VaultLockedGate(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "AES-256-GCM Chunked Vault · Hardware Keystore\nVerify fingerprint to enter",
+                    text = "خزنة محمية بالبصمة · FLAG_SECURE\nتحقق بالبصمة للدخول ونقل وإخفاء ملفاتك بأمان",
                     style = MaterialTheme.typography.bodySmall,
                     color = MutedSlate,
                     textAlign = TextAlign.Center,
@@ -745,7 +787,7 @@ private fun VaultLockedGate(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "UNLOCK WITH BIOMETRIC",
+                        text = "فتح الخزنة بالبصمة",
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
                     )
                 }

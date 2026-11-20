@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -42,12 +43,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -72,20 +75,27 @@ import com.example.ui.theme.GlassStrokeBright
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
+import com.example.util.formatByteSize
 import com.example.vault.ui.VaultPlaybackSession
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.Locale
 
 @OptIn(UnstableApi::class)
 @Composable
-fun VaultZeroFootprintPlayer(
+fun VaultProtectedVideoPlayer(
     session: VaultPlaybackSession,
-    onCloseAndWipe: () -> Unit,
+    onClose: () -> Unit,
 ) {
     val context = LocalContext.current
-    val player = remember(session.tempFile.absolutePath) {
+    val mediaUri = remember(session.uriString, session.localFile) {
+        session.localFile?.takeIf { it.exists() }?.let { Uri.fromFile(it) }
+            ?: Uri.parse(session.uriString)
+    }
+
+    val player = remember(mediaUri) {
         ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(Uri.fromFile(session.tempFile)))
+            setMediaItem(MediaItem.fromUri(mediaUri))
             prepare()
             playWhenReady = true
         }
@@ -105,8 +115,8 @@ fun VaultZeroFootprintPlayer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "Zero-Footprint Cache · FLAG_SECURE Active",
-                onCloseAndWipe = onCloseAndWipe,
+                subtitle = "محمي داخل الخزنة · FLAG_SECURE Active",
+                onClose = onClose,
             )
 
             Box(
@@ -137,12 +147,19 @@ fun VaultZeroFootprintPlayer(
 }
 
 @Composable
-fun VaultZeroFootprintPhotoViewer(
+fun VaultProtectedPhotoViewer(
     session: VaultPlaybackSession,
-    onCloseAndWipe: () -> Unit,
+    onClose: () -> Unit,
 ) {
-    val imageBitmap = remember(session.tempFile.absolutePath) {
-        decodeDownsampledImageBitmap(session.tempFile, maxDim = 2560)
+    val context = LocalContext.current
+    val imageBitmap by produceState<ImageBitmap?>(
+        initialValue = null,
+        session.uriString,
+        session.localFile?.absolutePath,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            decodeDownsampledSessionBitmap(context, session, maxDim = 2560)
+        }
     }
 
     var scale by remember { mutableFloatStateOf(1f) }
@@ -158,8 +175,8 @@ fun VaultZeroFootprintPhotoViewer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "Zero-Footprint Photo Cache · FLAG_SECURE Active",
-                onCloseAndWipe = onCloseAndWipe,
+                subtitle = "صورة محمية داخل الخزنة · FLAG_SECURE Active",
+                onClose = onClose,
             )
 
             Box(
@@ -169,7 +186,7 @@ fun VaultZeroFootprintPhotoViewer(
                     .padding(horizontal = 12.dp, vertical = 8.dp)
                     .clip(RoundedCornerShape(20.dp))
                     .background(Color(0xFF070A10))
-                    .pointerInput(session.tempFile.absolutePath) {
+                    .pointerInput(session.uriString) {
                         detectTransformGestures { _, pan, zoom, _ ->
                             val nextScale = (scale * zoom).coerceIn(1f, 5f)
                             scale = nextScale
@@ -186,7 +203,7 @@ fun VaultZeroFootprintPhotoViewer(
             ) {
                 if (imageBitmap != null) {
                     Image(
-                        bitmap = imageBitmap,
+                        bitmap = imageBitmap!!,
                         contentDescription = session.displayTitle,
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
@@ -213,35 +230,39 @@ fun VaultZeroFootprintPhotoViewer(
 }
 
 @Composable
-fun VaultZeroFootprintFileViewer(
+fun VaultProtectedFileViewer(
     session: VaultPlaybackSession,
     onBeforeExternalOpen: () -> Unit,
     onReportOpenError: (String) -> Unit,
-    onCloseAndWipe: () -> Unit,
+    onClose: () -> Unit,
 ) {
     val context = LocalContext.current
-    val isTextPreviewable = remember(session.tempFile.absolutePath, session.mimeType) {
+    val isTextPreviewable = remember(session.displayTitle, session.mimeType) {
         val ext = session.displayTitle.substringAfterLast('.', "").lowercase()
         session.mimeType.startsWith("text/", ignoreCase = true) ||
             session.mimeType.contains("json", ignoreCase = true) ||
             session.mimeType.contains("xml", ignoreCase = true) ||
             ext in setOf("txt", "json", "csv", "log", "md", "xml", "yml", "yaml")
     }
-    val textSnippet = remember(session.tempFile.absolutePath, isTextPreviewable) {
-        if (!isTextPreviewable) {
+    val textSnippet by produceState<String?>(
+        initialValue = null,
+        session.uriString,
+        session.localFile?.absolutePath,
+        isTextPreviewable,
+    ) {
+        value = if (!isTextPreviewable) {
             null
         } else {
-            runCatching {
-                session.tempFile.bufferedReader().use { reader ->
-                    val chars = CharArray(16_384)
-                    val read = reader.read(chars)
-                    if (read > 0) String(chars, 0, read) else ""
-                }
-            }.getOrNull()
+            withContext(Dispatchers.IO) {
+                readSessionTextSnippet(context, session)
+            }
         }
     }
 
     var launchedMessage by remember { mutableStateOf<String?>(null) }
+    val displayBytes = remember(session.localFile, session.sizeBytes) {
+        session.localFile?.takeIf { it.exists() }?.length() ?: session.sizeBytes
+    }
 
     Box(
         modifier = Modifier
@@ -252,8 +273,8 @@ fun VaultZeroFootprintFileViewer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "Zero-Footprint Decrypted File · FLAG_SECURE Active",
-                onCloseAndWipe = onCloseAndWipe,
+                subtitle = "ملف محمي داخل الخزنة · FLAG_SECURE Active",
+                onClose = onClose,
             )
 
             Column(
@@ -297,7 +318,7 @@ fun VaultZeroFootprintFileViewer(
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
-                                    text = "${session.mimeType} · ${formatViewerBytes(session.tempFile.length())}",
+                                    text = "${session.mimeType} · ${formatByteSize(displayBytes, "0 KB")}",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MutedSlate,
                                 )
@@ -315,7 +336,7 @@ fun VaultZeroFootprintFileViewer(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "تم التحقق من السلامة والتشفير (AES-256-GCM + AAD)",
+                                text = "محمي ومخفي داخل الخزنة (.nomedia) · FLAG_SECURE",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = EmeraldPulse,
                             )
@@ -326,14 +347,9 @@ fun VaultZeroFootprintFileViewer(
                         Button(
                             onClick = {
                                 val openResult = runCatching {
-                                    val authority = "${context.packageName}.fileprovider"
-                                    val contentUri = FileProvider.getUriForFile(
-                                        context,
-                                        authority,
-                                        session.tempFile,
-                                    )
+                                    val shareUri = resolveViewableFileUri(context, session)
                                     val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                                        setDataAndType(contentUri, session.mimeType)
+                                        setDataAndType(shareUri, session.mimeType)
                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                     }
                                     onBeforeExternalOpen()
@@ -347,7 +363,7 @@ fun VaultZeroFootprintFileViewer(
                                             ?: "لا يوجد تطبيق على الهاتف لفتح هذا النوع من الملفات.",
                                     )
                                 } else {
-                                    launchedMessage = "تم فتح الملف عبر التطبيق الخارجي — سيُحذف الكاش المؤقت فور إغلاق العارض."
+                                    launchedMessage = "تم فتح الملف عبر التطبيق المختار مع بقاء نسخته محمية داخل الخزنة."
                                 }
                             },
                             shape = RoundedCornerShape(14.dp),
@@ -398,7 +414,7 @@ fun VaultZeroFootprintFileViewer(
                                 .padding(14.dp),
                         ) {
                             Text(
-                                text = textSnippet.ifBlank { "(Empty text file)" },
+                                text = textSnippet.orEmpty().ifBlank { "(ملف نصي فارغ)" },
                                 style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                                 color = ChromeSilver,
                             )
@@ -414,7 +430,7 @@ fun VaultZeroFootprintFileViewer(
 private fun VaultViewerHeaderBar(
     title: String,
     subtitle: String,
-    onCloseAndWipe: () -> Unit,
+    onClose: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -446,7 +462,7 @@ private fun VaultViewerHeaderBar(
             border = BorderStroke(0.9.dp, CrimsonAlert),
             modifier = Modifier
                 .clip(RoundedCornerShape(50))
-                .clickable { onCloseAndWipe() }
+                .clickable { onClose() }
                 .minimumInteractiveComponentSize()
                 .testTag("vault_close_player_button"),
         ) {
@@ -456,13 +472,13 @@ private fun VaultViewerHeaderBar(
             ) {
                 Icon(
                     imageVector = Icons.Rounded.Close,
-                    contentDescription = "Close and wipe cache",
+                    contentDescription = "إغلاق العارض",
                     tint = CrimsonAlert,
                     modifier = Modifier.size(16.dp),
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "CLOSE & WIPE",
+                    text = "إغلاق",
                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                     color = Color.White,
                 )
@@ -471,26 +487,72 @@ private fun VaultViewerHeaderBar(
     }
 }
 
-private fun decodeDownsampledImageBitmap(file: File, maxDim: Int): androidx.compose.ui.graphics.ImageBitmap? {
+private fun resolveViewableFileUri(context: Context, session: VaultPlaybackSession): Uri {
+    val localFile: File? = session.localFile?.takeIf { it.exists() }
+    if (localFile != null) {
+        val provided = runCatching {
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", localFile)
+        }.getOrNull()
+        if (provided != null) return provided
+    }
+    return Uri.parse(session.uriString)
+}
+
+private fun decodeDownsampledSessionBitmap(
+    context: Context,
+    session: VaultPlaybackSession,
+    maxDim: Int,
+): ImageBitmap? {
+    val localFile = session.localFile?.takeIf { it.exists() }
+    if (localFile != null) {
+        return runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(localFile.absolutePath, bounds)
+            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            var sampleSize = 1
+            while (longest / sampleSize > maxDim && sampleSize < 32) {
+                sampleSize *= 2
+            }
+            val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            BitmapFactory.decodeFile(localFile.absolutePath, opts)?.asImageBitmap()
+        }.getOrNull()
+    }
+
+    val uri = Uri.parse(session.uriString)
     return runCatching {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, bounds)
+        }
         val longest = maxOf(bounds.outWidth, bounds.outHeight)
         var sampleSize = 1
         while (longest / sampleSize > maxDim && sampleSize < 32) {
             sampleSize *= 2
         }
         val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-        BitmapFactory.decodeFile(file.absolutePath, opts)?.asImageBitmap()
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, opts)?.asImageBitmap()
+        }
     }.getOrNull()
 }
 
-private fun formatViewerBytes(bytes: Long): String {
-    if (bytes <= 0L) return "0 KB"
-    val mb = bytes / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        String.format(Locale.US, "%.1f MB", mb)
-    } else {
-        "${(bytes / 1024L).coerceAtLeast(1L)} KB"
+private fun readSessionTextSnippet(context: Context, session: VaultPlaybackSession): String? {
+    val localFile = session.localFile?.takeIf { it.exists() }
+    if (localFile != null) {
+        return runCatching {
+            localFile.bufferedReader().use { reader ->
+                val chars = CharArray(16_384)
+                val read = reader.read(chars)
+                if (read > 0) String(chars, 0, read) else ""
+            }
+        }.getOrNull()
     }
+    val uri = Uri.parse(session.uriString)
+    return runCatching {
+        context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { reader ->
+            val chars = CharArray(16_384)
+            val read = reader.read(chars)
+            if (read > 0) String(chars, 0, read) else ""
+        }
+    }.getOrNull()
 }

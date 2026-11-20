@@ -2,6 +2,7 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <files-path name="blackhole_videos" path="blackhole_videos/" />
     <files-path name="blackhole_thumbs" path="blackhole_thumbs/" />
+    <files-path name="blackhole_vault" path="blackhole_vault/" />
     <external-files-path name="external_movies" path="Movies/" />
-    <cache-path name="vault_stream_tmp" path="vault_stream_tmp/" />
+    <external-path name="external_vault" path=".BlackholeVault/" />
 </paths>

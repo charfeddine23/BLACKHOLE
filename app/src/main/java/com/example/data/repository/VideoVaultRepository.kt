@@ -19,10 +19,6 @@ class VideoVaultRepository(
         return videoDao.insertVideo(video)
     }
 
-    suspend fun getVideoById(id: Long): DownloadedVideoEntity? {
-        return videoDao.getVideoById(id)
-    }
-
     suspend fun deleteVideo(video: DownloadedVideoEntity) {
         withContext(Dispatchers.IO) {
             runCatching {

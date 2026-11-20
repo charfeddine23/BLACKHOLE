@@ -35,6 +35,9 @@ import com.example.engine.model.ExtractionResult
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
 import com.example.engine.service.DownloadStateCoordinator
+import com.example.util.formatMb
+import com.example.util.formatSecondsMmSs
+import com.example.util.formatTransferSpeed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,7 +52,6 @@ import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 class BlackholeDownloadService : Service() {
@@ -546,11 +548,11 @@ class BlackholeDownloadService : Service() {
         etaSeconds: Long,
         downloadedBytes: Long,
     ): String {
-        val etaPart = if (etaSeconds > 0L) " · ETA ${formatEta(etaSeconds)}" else ""
+        val etaPart = if (etaSeconds > 0L) " · ETA ${formatSecondsMmSs(etaSeconds)}" else ""
         return if (percent > 0) {
-            "$qualityLabel · $percent% · ${formatSpeed(speedBytesPerSec)}$etaPart"
+            "$qualityLabel · $percent% · ${formatTransferSpeed(speedBytesPerSec)}$etaPart"
         } else {
-            "$qualityLabel · ${formatSize(downloadedBytes)} · ${formatSpeed(speedBytesPerSec)}"
+            "$qualityLabel · ${formatMb(downloadedBytes)} · ${formatTransferSpeed(speedBytesPerSec)}"
         }
     }
 
@@ -720,26 +722,6 @@ class BlackholeDownloadService : Service() {
         mimeType.contains("quicktime") -> "mov"
         mimeType.contains("matroska") -> "mkv"
         else -> "mp4"
-    }
-
-    private fun formatSpeed(bytesPerSec: Long): String {
-        val mb = bytesPerSec / (1024.0 * 1024.0)
-        return if (mb >= 1.0) {
-            String.format(Locale.US, "%.1f MB/s", mb)
-        } else {
-            "${(bytesPerSec / 1024L).coerceAtLeast(1L)} KB/s"
-        }
-    }
-
-    private fun formatSize(bytes: Long): String {
-        val mb = bytes / (1024.0 * 1024.0)
-        return String.format(Locale.US, "%.1f MB", mb)
-    }
-
-    private fun formatEta(seconds: Long): String {
-        val mins = seconds / 60L
-        val secs = seconds % 60L
-        return String.format(Locale.US, "%02d:%02d", mins, secs)
     }
 
     override fun onDestroy() {

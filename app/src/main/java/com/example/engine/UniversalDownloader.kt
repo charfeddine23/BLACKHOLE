@@ -7,27 +7,23 @@ import com.example.engine.extractor.WebViewStreamSniffer
 import com.example.engine.model.ExtractionResult
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
-import com.pulse.blackhole.data.vault.SessionVaultManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
 
 data class UniversalExtractionOutcome(
     val canonicalUrl: String,
     val platform: PlatformBadge,
-    val routerCommand: List<String>,
     val result: ExtractionResult,
 )
 
 /**
  * Universal Smart Router & Multi-Platform Extraction Engine for Blackhole.
  *
- * Dynamically routes URLs across YouTube, TikTok, Instagram, Facebook, X/Twitter,
- * Vimeo, Reddit, and direct progressive/HLS media endpoints while enforcing
- * anti-bot header rotation, short-link resolution, and Encrypted Session Vault
- * Netscape cookie injection.
+ * Resolves shortened links and delegates extraction across YouTube, TikTok, Instagram,
+ * Facebook, X/Twitter, Vimeo, Reddit, and direct progressive/HLS media endpoints while
+ * sharing Encrypted Cookie Vault sessions.
  */
 class UniversalDownloader(
     private val context: Context,
@@ -37,167 +33,6 @@ class UniversalDownloader(
     private val streamExtractor: VideoStreamExtractor = VideoStreamExtractor(httpClient, webViewSniffer, cookieVault),
 ) {
 
-    val sessionVault: SessionVaultManager
-        get() = cookieVault.sessionVault
-
-    /**
-     * Smart Extractor Router that dynamically builds extraction flags and
-     * platform-specific client rules for any video URL.
-     */
-    fun getUniversalExtractionCommand(
-        targetUrl: String,
-        sessionVault: SessionVaultManager = this.sessionVault,
-    ): List<String> {
-        val cleanUrl = targetUrl.trim()
-        val platform = PlatformBadge.fromUrl(cleanUrl)
-        val rotatedUa = ClientSpoofer.nextRotatedUserAgent(cleanUrl)
-
-        val command = mutableListOf("yt-dlp")
-
-        // General Anti-Bot & Geo/TLS flags for all URLs
-        command.add("--user-agent")
-        command.add(rotatedUa)
-        command.add("--no-check-certificate")
-        command.add("--geo-bypass")
-
-        // Encrypted Session Vault Cookie Injection (Netscape cookies.txt)
-        if (sessionVault.hasActiveSession()) {
-            val cookieFile = sessionVault.writeTempNetscapeCookiesFile(context.cacheDir)
-            if (cookieFile != null && cookieFile.exists()) {
-                command.add("--cookies")
-                command.add(cookieFile.absolutePath)
-            }
-        }
-
-        // Platform-Specific Extraction Rules
-        when (platform) {
-            PlatformBadge.YOUTUBE -> {
-                command.add("--extractor-args")
-                command.add("youtube:player_client=ios,web")
-                command.add("-f")
-                command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
-            }
-
-            PlatformBadge.TIKTOK -> {
-                command.add("--referer")
-                command.add("https://www.tiktok.com/")
-                command.add("-f")
-                command.add("best")
-            }
-
-            PlatformBadge.INSTAGRAM -> {
-                command.add("--referer")
-                command.add("https://www.instagram.com/")
-                command.add("--add-header")
-                command.add("X-IG-App-ID:936619743392459")
-                command.add("-f")
-                command.add("best")
-            }
-
-            PlatformBadge.FACEBOOK -> {
-                command.add("--referer")
-                command.add("https://www.facebook.com/")
-                command.add("-f")
-                command.add("best")
-            }
-
-            else -> {
-                command.add("--referer")
-                command.add(ClientSpoofer.refererForUrl(cleanUrl))
-                command.add("-f")
-                command.add("best")
-            }
-        }
-
-        command.add(cleanUrl)
-        return command
-    }
-
-    /**
-     * Strict Bulletproof Extraction Command builder requiring a valid Netscape cookies file path
-     * from SessionVaultManager to bypass login-gated Instagram and YouTube restrictions.
-     */
-    fun getBulletproofExtractionCommand(
-        targetUrl: String,
-        cookieFilePath: String? = sessionVault.writeTempNetscapeCookiesFile(context.cacheDir)?.absolutePath,
-    ): List<String> {
-        val command = mutableListOf("yt-dlp")
-
-        // 1. Mandatory Netscape cookies injection when session is present
-        if (!cookieFilePath.isNullOrBlank()) {
-            command.add("--cookies")
-            command.add(cookieFilePath)
-        } else {
-            throw IllegalStateException("Session Vault is empty! Please import cookies.txt to bypass authentication.")
-        }
-
-        // 2. Anti-bot spoofing headers & bypass flags
-        command.add("--user-agent")
-        command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
-        command.add("--no-check-certificate")
-        command.add("--geo-bypass")
-
-        // 3. Smart platform-specific routing
-        val lower = targetUrl.lowercase()
-        when {
-            lower.contains("youtube.com") || lower.contains("youtu.be") -> {
-                command.add("--extractor-args")
-                command.add("youtube:player_client=ios,web")
-                command.add("-f")
-                command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
-            }
-            lower.contains("instagram.com") || lower.contains("instagr.am") -> {
-                command.add("--referer")
-                command.add("https://www.instagram.com/")
-                command.add("-f")
-                command.add("best")
-            }
-            lower.contains("tiktok.com") -> {
-                command.add("--referer")
-                command.add("https://www.tiktok.com/")
-                command.add("-f")
-                command.add("best")
-            }
-            else -> {
-                command.add("-f")
-                command.add("best")
-            }
-        }
-
-        command.add(targetUrl)
-        return command
-    }
-
-    fun getFinalExecutionCommand(
-        targetUrl: String,
-        sessionVault: SessionVaultManager = this.sessionVault,
-    ): List<String> {
-        val command = mutableListOf("yt-dlp")
-
-        // 1. Validate Netscape cookies file from encrypted Session Vault
-        val cookiePath = sessionVault.getCookieFilePath()
-        if (!cookiePath.isNullOrBlank() && File(cookiePath).exists()) {
-            command.add("--cookies")
-            command.add(cookiePath)
-        } else {
-            throw IllegalStateException("Session Vault is empty! Please import Netscape cookies.txt.")
-        }
-
-        // 2. Client spoofing & anti-bot flags
-        command.add("--extractor-args")
-        command.add("youtube:player_client=ios,web")
-        command.add("--user-agent")
-        command.add(ClientSpoofer.TIKTOK_IOS_USER_AGENT)
-        command.add("--no-check-certificate")
-
-        // 3. Best video+audio merge selector & target URL
-        command.add("-f")
-        command.add("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b")
-        command.add(targetUrl)
-
-        return command
-    }
-
     /**
      * Resolves shortened URLs (vt.tiktok.com, vm.tiktok.com, fb.watch, instagr.am, t.co, etc.)
      * and executes multi-strategy extraction with CookieVault session injection.
@@ -206,17 +41,10 @@ class UniversalDownloader(
         val trimmed = rawUrl.trim()
         val canonicalUrl = resolveShortUrlIfNeeded(trimmed)
         val platform = PlatformBadge.fromUrl(canonicalUrl)
-        val commandPlan = runCatching {
-            getFinalExecutionCommand(canonicalUrl, sessionVault)
-        }.getOrElse {
-            getUniversalExtractionCommand(canonicalUrl, sessionVault)
-        }
-
         val result = streamExtractor.extractHighestQuality(canonicalUrl)
         UniversalExtractionOutcome(
             canonicalUrl = canonicalUrl,
             platform = platform,
-            routerCommand = commandPlan,
             result = result,
         )
     }

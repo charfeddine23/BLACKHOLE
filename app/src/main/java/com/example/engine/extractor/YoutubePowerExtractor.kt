@@ -4,7 +4,9 @@ import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.model.ExtractedStream
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
+import com.example.util.formatQualityLabel
 import okhttp3.CookieJar
+import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -12,14 +14,98 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.schabi.newpipe.extractor.MediaFormat
+import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.downloader.Request as NewPipeRequest
+import org.schabi.newpipe.extractor.downloader.Response as NewPipeResponse
+import org.schabi.newpipe.extractor.localization.ContentCountry
+import org.schabi.newpipe.extractor.localization.Localization
 import org.schabi.newpipe.extractor.stream.AudioStream
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.VideoStream
+import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Custom OkHttp-backed NewPipeExtractor Downloader so YouTube extraction shares
+ * connection pooling, redirects, and EU SOCS consent cookies cleanly.
+ */
+internal class OkHttpNewPipeDownloader(
+    baseOkHttpClient: OkHttpClient,
+) : Downloader() {
+
+    private val okHttpClient: OkHttpClient = baseOkHttpClient.newBuilder()
+        .cookieJar(CookieJar.NO_COOKIES)
+        .build()
+
+    @Throws(IOException::class)
+    override fun execute(request: NewPipeRequest): NewPipeResponse {
+        val bodyBytes = request.dataToSend()
+        val requestBody = bodyBytes?.toRequestBody("application/json; charset=utf-8".toMediaType())
+
+        val headerMap = mutableMapOf<String, String>()
+        for ((key, values) in request.headers()) {
+            if (values.isNotEmpty()) {
+                headerMap[key] = values.joinToString(", ")
+            }
+        }
+        if (!headerMap.containsKey("User-Agent")) {
+            headerMap["User-Agent"] = ClientSpoofer.CHROME_DESKTOP_USER_AGENT
+        }
+        if (!headerMap.containsKey("Accept-Language")) {
+            headerMap["Accept-Language"] = "en-US,en;q=0.9"
+        }
+        val reqUrlLower = request.url().lowercase()
+        if (request.httpMethod().equals("GET", ignoreCase = true) &&
+            (reqUrlLower.contains("youtube.com/") || reqUrlLower.contains("youtu.be/")) &&
+            !reqUrlLower.contains("/youtubei/") &&
+            !headerMap.containsKey("Cookie")
+        ) {
+            headerMap["Cookie"] = "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; PREF=f6=40000000&hl=en&gl=US"
+        }
+
+        val okRequest = Request.Builder()
+            .url(request.url())
+            .headers(headerMap.toHeaders())
+            .method(request.httpMethod(), requestBody)
+            .build()
+
+        okHttpClient.newCall(okRequest).execute().use { response ->
+            val bodyString = response.body?.string().orEmpty()
+            return NewPipeResponse(
+                response.code,
+                response.message,
+                response.headers.toMultimap(),
+                bodyString,
+                response.request.url.toString(),
+            )
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var initialized = false
+        private val lock = Any()
+
+        fun ensureNewPipeInitialized(okHttpClient: OkHttpClient) {
+            if (initialized) return
+            synchronized(lock) {
+                if (!initialized) {
+                    NewPipe.init(
+                        OkHttpNewPipeDownloader(okHttpClient),
+                        Localization("en", "US"),
+                        ContentCountry("US"),
+                    )
+                    initialized = true
+                }
+            }
+        }
+    }
+}
 
 internal data class YoutubeExtractionOutcome(
     val streams: List<ExtractedStream>,
@@ -1102,15 +1188,6 @@ internal class YoutubePowerExtractor(
             raw >= 700 -> 720
             else -> raw
         }
-    }
-
-    private fun formatQualityLabel(height: Int): String = when {
-        height >= 2160 -> "4K 2160P"
-        height >= 1440 -> "2K 1440P"
-        height >= 1080 -> "1080P FHD"
-        height >= 720 -> "720P HD"
-        height > 0 -> "${height}P"
-        else -> "BEST HD"
     }
 
     companion object {

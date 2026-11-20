@@ -25,14 +25,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -87,6 +84,7 @@ import com.example.engine.updater.UpdateCheckState
 import com.example.ui.animation.rememberBlackholeAnimationController
 import com.example.ui.components.BlackholeCoreButton
 import com.example.ui.components.DownloadedVideosSwipeUpSheet
+import com.example.ui.components.rememberSafeScreenInsets
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.EmeraldPulse
@@ -97,9 +95,10 @@ import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeUiState
 import com.example.ui.viewmodel.BlackholeViewModel
+import com.example.util.formatMb
+import com.example.util.formatTransferSpeed
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
-import java.util.Locale
 
 @Composable
 fun BlackholeScreen(
@@ -342,12 +341,7 @@ private fun BlackholeScreenContent(
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                val cutoutTopDp = with(density) { WindowInsets.displayCutout.getTop(density).toDp() }
-                val statusTopDp = with(density) { WindowInsets.statusBars.getTop(density).toDp() }
-                val safeTopInset = maxOf(cutoutTopDp, statusTopDp, 44.dp)
-                val cutoutBottomDp = with(density) { WindowInsets.displayCutout.getBottom(density).toDp() }
-                val navBottomDp = with(density) { WindowInsets.navigationBars.getBottom(density).toDp() }
-                val safeBottomInset = maxOf(cutoutBottomDp, navBottomDp, 22.dp)
+                val safeInsets = rememberSafeScreenInsets(minTop = 44.dp, minBottom = 22.dp)
 
                 Column(
                     modifier = Modifier
@@ -356,8 +350,8 @@ private fun BlackholeScreenContent(
                         .padding(
                             start = 24.dp,
                             end = 24.dp,
-                            top = safeTopInset + 18.dp,
-                            bottom = safeBottomInset + 14.dp,
+                            top = safeInsets.top + 18.dp,
+                            bottom = safeInsets.bottom + 14.dp,
                         ),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.SpaceBetween,
@@ -531,11 +525,11 @@ private fun BlackholeBareStatusCaption(
         }
         DownloadPhase.DOWNLOADING -> {
             val sizePart = if (telemetry.totalBytes > 0L) {
-                "${formatCaptionMb(telemetry.bytesDownloaded)} / ${formatCaptionMb(telemetry.totalBytes)}"
+                "${formatMb(telemetry.bytesDownloaded)} / ${formatMb(telemetry.totalBytes)}"
             } else {
-                formatCaptionMb(telemetry.bytesDownloaded)
+                formatMb(telemetry.bytesDownloaded)
             }
-            val speedPart = formatCaptionSpeed(telemetry.speedBytesPerSec)
+            val speedPart = formatTransferSpeed(telemetry.speedBytesPerSec)
             val titlePart = telemetry.title.takeIf { it.isNotBlank() }?.let { "$it · " }.orEmpty()
             "$titlePart${telemetry.qualityLabel} · $sizePart · $speedPart" to ChromeSilver
         }
@@ -570,19 +564,5 @@ private fun BlackholeBareStatusCaption(
                     .testTag("blackhole_status_caption"),
             )
         }
-    }
-}
-
-private fun formatCaptionMb(bytes: Long): String {
-    val mb = bytes / (1024.0 * 1024.0)
-    return String.format(Locale.US, "%.1f MB", mb)
-}
-
-private fun formatCaptionSpeed(bytesPerSec: Long): String {
-    val mb = bytesPerSec / (1024.0 * 1024.0)
-    return if (mb >= 1.0) {
-        String.format(Locale.US, "%.1f MB/s", mb)
-    } else {
-        "${(bytesPerSec / 1024L).coerceAtLeast(1L)} KB/s"
     }
 }
