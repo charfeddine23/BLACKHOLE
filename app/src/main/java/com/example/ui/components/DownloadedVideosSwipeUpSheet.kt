@@ -89,6 +89,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.data.local.DownloadedVideoEntity
+import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.CyanGlowSoft
@@ -266,7 +267,7 @@ fun DownloadedVideosSwipeUpSheet(
                 .background(
                     if (showBrowserTab) {
                         Brush.verticalGradient(
-                            colors = listOf(Color(0xFFF3F4F6), Color(0xFFF3F4F6)),
+                            colors = listOf(AbyssalSurface, ObsidianVoid),
                         )
                     } else {
                         Brush.verticalGradient(

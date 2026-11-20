@@ -86,6 +86,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -104,8 +105,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.engine.network.ClientSpoofer
+import com.example.ui.theme.AbyssalSurface
+import com.example.ui.theme.AmberWarning
+import com.example.ui.theme.ChromeSilver
+import com.example.ui.theme.CrimsonAlert
+import com.example.ui.theme.DimSlate
 import com.example.ui.theme.EmeraldPulse
+import com.example.ui.theme.GlassStrokeBright
+import com.example.ui.theme.GlassStrokeSubtle
+import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
+import com.example.ui.theme.ObsidianVoid
+import com.example.ui.theme.PlasmaViolet
 import java.util.UUID
 
 private const val HOME_TAB_URL = "about:blackhole-home"
@@ -144,7 +155,7 @@ private val StartPageSpeedDials = listOf(
     SpeedDialShortcut("IG Reels", "Rls", "https://www.instagram.com/reels/", listOf(Color(0xFFE4405F), Color(0xFFC92A4C))),
     SpeedDialShortcut("FB Watch", "W", "https://m.facebook.com/watch/", listOf(Color(0xFF3B5998), Color(0xFF283E6E))),
     SpeedDialShortcut("YT Shorts", "S", "https://m.youtube.com/shorts/", listOf(Color(0xFFFF1744), Color(0xFFD50000))),
-    SpeedDialShortcut("Google", "G", "https://www.google.com/", listOf(Color(0xFF7B8088), Color(0xFF5F6368))),
+    SpeedDialShortcut("Google", "G", "https://www.google.com/", listOf(Color(0xFF1F2736), Color(0xFF111722))),
     SpeedDialShortcut("Twitch", "Tw", "https://m.twitch.tv/", listOf(Color(0xFF9146FF), Color(0xFF6B28D9))),
 )
 
@@ -180,13 +191,15 @@ private const val DESKTOP_VIEWPORT_JS = """
 })();
 """
 
-// Samsung Internet light chrome + warm dark nebula start page palette
-private val ChromeBarSurface = Color(0xFFF3F4F6)
-private val ChromePillWhite = Color(0xFFFFFFFF)
-private val ChromeTabInactive = Color(0xFFE5E7EB)
-private val ChromeTextPrimary = Color(0xFF1A1C1E)
-private val ChromeTextMuted = Color(0xFF5F6368)
-private val ChromeDivider = Color(0xFFDDE0E4)
+// Cohesive Nocturnal Obsidian & Liquid Glass Browser Palette
+private val NightChromeSurface = AbyssalSurface
+private val NightAddressPill = Color(0xFF0E1522)
+private val NightAddressFocused = Color(0xFF131D2E)
+private val NightTabSelected = Color(0xFF141E30)
+private val NightTabInactive = Color(0xFF0B101A)
+private val NightTrayPill = Color(0xFF111927)
+private val NightCardSurface = Color(0xFF0C1320)
+private val NightHairline = GlassStrokeSubtle
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -419,289 +432,309 @@ fun DownloadedVideosBrowserPanel(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(ChromeBarSurface)
+            .background(ObsidianVoid)
             .testTag("downloaded_videos_browser_panel"),
     ) {
-        // 1. Samsung-Style Top Tab Bar + New Tab (+) Button
-        Row(
+        // 1. Compact Nocturnal Top Tab Strip + Exit Pill
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(ChromeBarSurface)
-                .padding(start = 10.dp, end = 10.dp, top = 6.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(NightChromeSurface, Color(0xFF070B11)),
+                    ),
+                ),
         ) {
             Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
+                    .fillMaxWidth()
+                    .padding(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 3.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                tabs.forEachIndexed { index, tab ->
-                    val isSelected = index == activeTabIndex
-                    Surface(
-                        color = if (isSelected) ChromePillWhite else ChromeTabInactive,
-                        shape = RoundedCornerShape(50),
-                        shadowElevation = if (isSelected) 1.5.dp else 0.dp,
-                        border = BorderStroke(
-                            width = 0.6.dp,
-                            color = if (isSelected) ChromeDivider else Color.Transparent,
-                        ),
-                        modifier = Modifier
-                            .height(34.dp)
-                            .clip(RoundedCornerShape(50))
-                            .clickable { activeTabIndex = index }
-                            .testTag("browser_tab_${index}"),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(start = 10.dp, end = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    tabs.forEachIndexed { index, tab ->
+                        val isSelected = index == activeTabIndex
+                        Surface(
+                            color = if (isSelected) NightTabSelected else NightTabInactive,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                width = 0.7.dp,
+                                color = if (isSelected) NeonCyan.copy(alpha = 0.45f) else NightHairline,
+                            ),
+                            modifier = Modifier
+                                .height(26.dp)
+                                .clip(RoundedCornerShape(50))
+                                .clickable { activeTabIndex = index }
+                                .testTag("browser_tab_${index}"),
                         ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Public,
-                                contentDescription = null,
-                                tint = if (isSelected) ChromeTextPrimary else ChromeTextMuted,
-                                modifier = Modifier.size(15.dp),
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = tab.title.ifBlank { "New tab" },
-                                style = MaterialTheme.typography.labelMedium.copy(
-                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                ),
-                                color = if (isSelected) ChromeTextPrimary else ChromeTextMuted,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.width(88.dp),
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(CircleShape)
-                                    .clickable { closeTab(index) }
-                                    .testTag("browser_close_tab_${index}"),
-                                contentAlignment = Alignment.Center,
+                            Row(
+                                modifier = Modifier.padding(start = 7.dp, end = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Icon(
-                                    imageVector = Icons.Rounded.Close,
-                                    contentDescription = "Close tab",
-                                    tint = ChromeTextMuted,
-                                    modifier = Modifier.size(15.dp),
+                                    imageVector = Icons.Outlined.Public,
+                                    contentDescription = null,
+                                    tint = if (isSelected) NeonCyan else MutedSlate,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = tab.title.ifBlank { "New tab" },
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = 11.sp,
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                    ),
+                                    color = if (isSelected) ChromeSilver else MutedSlate,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.width(74.dp),
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .clip(CircleShape)
+                                        .clickable { closeTab(index) }
+                                        .testTag("browser_close_tab_${index}"),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Close,
+                                        contentDescription = "Close tab",
+                                        tint = MutedSlate,
+                                        modifier = Modifier.size(12.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // + Add New Tab Button (compact)
+                    Surface(
+                        color = NightTabInactive,
+                        shape = CircleShape,
+                        border = BorderStroke(0.7.dp, GlassStrokeBright.copy(alpha = 0.2f)),
+                        modifier = Modifier
+                            .size(26.dp)
+                            .clip(CircleShape)
+                            .clickable { openNewTab() }
+                            .testTag("browser_new_tab_button"),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Rounded.Add,
+                                contentDescription = "New tab",
+                                tint = ChromeSilver,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(5.dp))
+
+                // Compact Exit Full-Screen Browser -> Downloaded Videos button
+                Surface(
+                    color = NightAddressPill,
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(0.75.dp, NeonCyan.copy(alpha = 0.45f)),
+                    modifier = Modifier
+                        .height(26.dp)
+                        .clip(RoundedCornerShape(50))
+                        .clickable { onExitBrowser() }
+                        .testTag("browser_exit_fullscreen_button"),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Movie,
+                            contentDescription = "Back to downloaded videos",
+                            tint = NeonCyan,
+                            modifier = Modifier.size(12.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "VIDEOS",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 9.5.sp,
+                                fontWeight = FontWeight.Bold,
+                            ),
+                            color = ChromeSilver,
+                        )
+                    }
+                }
+            }
+
+            // 2. Ultra-Compact Nocturnal Search / URL Pill Bar
+            Surface(
+                color = if (isUrlFocused) NightAddressFocused else NightAddressPill,
+                shape = RoundedCornerShape(17.dp),
+                border = BorderStroke(
+                    width = if (isUrlFocused) 0.9.dp else 0.7.dp,
+                    color = if (isUrlFocused) {
+                        NeonCyan.copy(alpha = 0.65f)
+                    } else {
+                        GlassStrokeBright.copy(alpha = 0.22f)
+                    },
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp)
+                    .padding(bottom = 5.dp)
+                    .height(34.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (!activeTab.isHome || isUrlFocused) {
+                        Icon(
+                            imageVector = Icons.Rounded.Lock,
+                            contentDescription = null,
+                            tint = if (activeTab.url.startsWith("https://", true)) EmeraldPulse else MutedSlate,
+                            modifier = Modifier.size(13.dp),
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                    }
+
+                    Box(
+                        modifier = Modifier.weight(1f),
+                        contentAlignment = if (activeTab.isHome && addressText.isEmpty() && !isUrlFocused) {
+                            Alignment.Center
+                        } else {
+                            Alignment.CenterStart
+                        },
+                    ) {
+                        BasicTextField(
+                            value = addressText,
+                            onValueChange = { addressText = it },
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodySmall.copy(
+                                fontSize = 12.5.sp,
+                                color = ChromeSilver,
+                            ),
+                            cursorBrush = SolidColor(NeonCyan),
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Uri,
+                                imeAction = ImeAction.Go,
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onGo = {
+                                    isUrlFocused = false
+                                    openUrlInActiveTab(addressText)
+                                },
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { focusState ->
+                                    isUrlFocused = focusState.isFocused
+                                    if (focusState.isFocused && activeTab.isHome && addressText == HOME_TAB_URL) {
+                                        addressText = ""
+                                    }
+                                }
+                                .testTag("browser_address_input"),
+                        ) { innerTextField ->
+                            if (addressText.isEmpty()) {
+                                Text(
+                                    text = "Search or URL",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        fontSize = 12.5.sp,
+                                        color = MutedSlate,
+                                    ),
+                                    textAlign = if (!isUrlFocused && activeTab.isHome) TextAlign.Center else TextAlign.Start,
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            } else {
+                                innerTextField()
+                            }
+                        }
+                    }
+
+                    if (isDesktopMode) {
+                        Surface(
+                            color = NeonCyan.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(6.dp),
+                            border = BorderStroke(0.6.dp, NeonCyan.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { toggleDesktopMode() }
+                                .padding(end = 3.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.DesktopWindows,
+                                    contentDescription = "Desktop view enabled",
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(11.dp),
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Text(
+                                    text = "PC",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                    ),
+                                    color = NeonCyan,
                                 )
                             }
                         }
                     }
-                }
 
-                // + Add New Tab Button
-                Surface(
-                    color = ChromeTabInactive.copy(alpha = 0.8f),
-                    shape = CircleShape,
-                    modifier = Modifier
-                        .size(34.dp)
-                        .clip(CircleShape)
-                        .clickable { openNewTab() }
-                        .testTag("browser_new_tab_button"),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Rounded.Add,
-                            contentDescription = "New tab",
-                            tint = ChromeTextPrimary,
-                            modifier = Modifier.size(19.dp),
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.width(6.dp))
-
-            // Compact Exit Full-Screen Browser -> Downloaded Videos button
-            Surface(
-                color = Color(0xFF101622),
-                shape = RoundedCornerShape(50),
-                border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.55f)),
-                modifier = Modifier
-                    .height(34.dp)
-                    .clip(RoundedCornerShape(50))
-                    .clickable { onExitBrowser() }
-                    .testTag("browser_exit_fullscreen_button"),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Movie,
-                        contentDescription = "Back to downloaded videos",
-                        tint = NeonCyan,
-                        modifier = Modifier.size(15.dp),
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "VIDEOS",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                        ),
-                        color = Color.White,
-                    )
-                }
-            }
-        }
-
-        // 2. Samsung-Style Rounded Search / URL Pill Bar
-        Surface(
-            color = ChromePillWhite,
-            shape = RoundedCornerShape(24.dp),
-            shadowElevation = 1.dp,
-            border = BorderStroke(0.75.dp, ChromeDivider),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(bottom = 8.dp)
-                .height(44.dp),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (!activeTab.isHome || isUrlFocused) {
-                    Icon(
-                        imageVector = Icons.Rounded.Lock,
-                        contentDescription = null,
-                        tint = ChromeTextMuted,
-                        modifier = Modifier.size(15.dp),
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-
-                Box(
-                    modifier = Modifier.weight(1f),
-                    contentAlignment = if (activeTab.isHome && addressText.isEmpty() && !isUrlFocused) {
-                        Alignment.Center
-                    } else {
-                        Alignment.CenterStart
-                    },
-                ) {
-                    BasicTextField(
-                        value = addressText,
-                        onValueChange = { addressText = it },
-                        singleLine = true,
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(
-                            color = ChromeTextPrimary,
-                        ),
-                        cursorBrush = SolidColor(Color(0xFF2563EB)),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Uri,
-                            imeAction = ImeAction.Go,
-                        ),
-                        keyboardActions = KeyboardActions(
-                            onGo = {
-                                isUrlFocused = false
-                                openUrlInActiveTab(addressText)
-                            },
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .onFocusChanged { focusState ->
-                                isUrlFocused = focusState.isFocused
-                                if (focusState.isFocused && activeTab.isHome && addressText == HOME_TAB_URL) {
-                                    addressText = ""
-                                }
-                            }
-                            .testTag("browser_address_input"),
-                    ) { innerTextField ->
-                        if (addressText.isEmpty()) {
+                    if (!activeTab.isHome) {
+                        if (zoomPercent != 100) {
                             Text(
-                                text = "Search or URL",
-                                style = MaterialTheme.typography.bodyMedium.copy(
-                                    fontSize = 15.sp,
-                                    color = ChromeTextMuted,
-                                ),
-                                textAlign = if (!isUrlFocused && activeTab.isHome) TextAlign.Center else TextAlign.Start,
-                                modifier = Modifier.fillMaxWidth(),
+                                text = "$zoomPercent%",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = NeonCyan,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable { showToolsBar = !showToolsBar }
+                                    .padding(horizontal = 5.dp, vertical = 1.dp),
                             )
-                        } else {
-                            innerTextField()
                         }
-                    }
-                }
-
-                if (isDesktopMode) {
-                    Surface(
-                        color = Color(0xFF2563EB).copy(alpha = 0.12f),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { toggleDesktopMode() }
-                            .padding(end = 4.dp),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                        Box(
+                            modifier = Modifier
+                                .size(26.dp)
+                                .clip(CircleShape)
+                                .clickable { webViews[activeTab.id]?.reload() }
+                                .testTag("browser_url_reload_button"),
+                            contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.DesktopWindows,
-                                contentDescription = "Desktop view enabled",
-                                tint = Color(0xFF2563EB),
-                                modifier = Modifier.size(13.dp),
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            Text(
-                                text = "PC",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                ),
-                                color = Color(0xFF2563EB),
+                                imageVector = Icons.Rounded.Refresh,
+                                contentDescription = "Reload page",
+                                tint = ChromeSilver.copy(alpha = 0.85f),
+                                modifier = Modifier.size(15.dp),
                             )
                         }
                     }
                 }
-
-                if (!activeTab.isHome) {
-                    if (zoomPercent != 100) {
-                        Text(
-                            text = "$zoomPercent%",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF2563EB),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable { showToolsBar = !showToolsBar }
-                                .padding(horizontal = 6.dp, vertical = 2.dp),
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(CircleShape)
-                            .clickable { webViews[activeTab.id]?.reload() }
-                            .testTag("browser_url_reload_button"),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Refresh,
-                            contentDescription = "Reload page",
-                            tint = ChromeTextMuted,
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                }
             }
-        }
 
-        if (!activeTab.isHome && activeTab.progress in 1..99) {
-            LinearProgressIndicator(
-                progress = { activeTab.progress / 100f },
-                color = Color(0xFF2563EB),
-                trackColor = ChromeDivider,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(2.dp),
-            )
+            if (!activeTab.isHome && activeTab.progress in 1..99) {
+                LinearProgressIndicator(
+                    progress = { activeTab.progress / 100f },
+                    color = NeonCyan,
+                    trackColor = NightHairline,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(1.5.dp),
+                )
+            } else {
+                HorizontalDivider(color = NightHairline, thickness = 0.6.dp)
+            }
         }
 
         // 3. Browser Viewport: Samsung-Style Start Page OR Live WebView Page
@@ -732,6 +765,7 @@ fun DownloadedVideosBrowserPanel(
                             }
                             CookieManager.getInstance().setAcceptCookie(true)
                             WebView(ctx).apply {
+                                setBackgroundColor(android.graphics.Color.parseColor("#050709"))
                                 layoutParams = FrameLayout.LayoutParams(
                                     ViewGroup.LayoutParams.MATCH_PARENT,
                                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -885,7 +919,7 @@ fun DownloadedVideosBrowserPanel(
             }
         }
 
-        // 4. Inline Cookie Status Toast (Zero Dialog)
+        // 4. Inline Cookie Status Toast (Zero Dialog — Nocturnal)
         AnimatedVisibility(
             visible = !statusMessage.isNullOrBlank(),
             enter = expandVertically() + fadeIn(),
@@ -893,13 +927,14 @@ fun DownloadedVideosBrowserPanel(
         ) {
             statusMessage?.let { msg ->
                 Surface(
-                    color = Color(0xFF101622),
+                    color = Color(0xFF0C1320),
+                    border = BorderStroke(0.6.dp, NeonCyan.copy(alpha = 0.25f)),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
@@ -913,7 +948,7 @@ fun DownloadedVideosBrowserPanel(
                         )
                         Box(
                             modifier = Modifier
-                                .size(28.dp)
+                                .size(26.dp)
                                 .clip(CircleShape)
                                 .clickable { onDismissStatus() },
                             contentAlignment = Alignment.Center,
@@ -921,8 +956,8 @@ fun DownloadedVideosBrowserPanel(
                             Icon(
                                 imageVector = Icons.Rounded.Close,
                                 contentDescription = "Dismiss status",
-                                tint = Color(0xFF9CA3AF),
-                                modifier = Modifier.size(16.dp),
+                                tint = MutedSlate,
+                                modifier = Modifier.size(15.dp),
                             )
                         }
                     }
@@ -930,69 +965,69 @@ fun DownloadedVideosBrowserPanel(
             }
         }
 
-        // 5. Inline Tools & Zoom Tray (Zero Popup — toggled via More / Tune)
+        // 5. Inline Tools & Zoom Tray (Zero Popup — Nocturnal Obsidian)
         AnimatedVisibility(
             visible = showToolsBar,
             enter = expandVertically() + fadeIn(),
             exit = shrinkVertically() + fadeOut(),
         ) {
             Surface(
-                color = ChromeBarSurface,
+                color = NightChromeSurface,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    HorizontalDivider(color = ChromeDivider, thickness = 0.8.dp)
+                    HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         // Zoom Out / % Reset / Zoom In Capsule
                         Surface(
-                            color = ChromePillWhite,
+                            color = NightTrayPill,
                             shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.8.dp, ChromeDivider),
+                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(
                                     onClick = { zoomPageBy(-20) },
                                     enabled = !activeTab.isHome,
                                     modifier = Modifier
-                                        .size(38.dp)
+                                        .size(36.dp)
                                         .testTag("browser_zoom_out_button"),
                                 ) {
                                     Icon(
                                         imageVector = Icons.Rounded.ZoomOut,
                                         contentDescription = "Zoom out page",
-                                        tint = if (activeTab.isHome) ChromeTextMuted.copy(alpha = 0.45f) else ChromeTextPrimary,
-                                        modifier = Modifier.size(19.dp),
+                                        tint = if (activeTab.isHome) DimSlate else ChromeSilver,
+                                        modifier = Modifier.size(18.dp),
                                     )
                                 }
                                 Text(
                                     text = "$zoomPercent%",
                                     style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (zoomPercent == 100) ChromeTextMuted else Color(0xFF2563EB),
+                                    color = if (zoomPercent == 100) MutedSlate else NeonCyan,
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(8.dp))
                                         .clickable(enabled = !activeTab.isHome) { resetZoom() }
-                                        .padding(horizontal = 6.dp, vertical = 6.dp)
+                                        .padding(horizontal = 6.dp, vertical = 5.dp)
                                         .testTag("browser_zoom_reset_button"),
                                 )
                                 IconButton(
                                     onClick = { zoomPageBy(+20) },
                                     enabled = !activeTab.isHome,
                                     modifier = Modifier
-                                        .size(38.dp)
+                                        .size(36.dp)
                                         .testTag("browser_zoom_in_button"),
                                 ) {
                                     Icon(
                                         imageVector = Icons.Rounded.ZoomIn,
                                         contentDescription = "Zoom in page",
-                                        tint = if (activeTab.isHome) ChromeTextMuted.copy(alpha = 0.45f) else Color(0xFF2563EB),
-                                        modifier = Modifier.size(19.dp),
+                                        tint = if (activeTab.isHome) DimSlate else NeonCyan,
+                                        modifier = Modifier.size(18.dp),
                                     )
                                 }
                             }
@@ -1000,11 +1035,11 @@ fun DownloadedVideosBrowserPanel(
 
                         // Desktop View Toggle Action
                         Surface(
-                            color = if (isDesktopMode) Color(0xFF0E1726) else ChromePillWhite,
+                            color = if (isDesktopMode) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
                             shape = RoundedCornerShape(50),
                             border = BorderStroke(
-                                0.85.dp,
-                                if (isDesktopMode) Color(0xFF2563EB) else ChromeDivider,
+                                0.8.dp,
+                                if (isDesktopMode) NeonCyan.copy(alpha = 0.7f) else GlassStrokeBright.copy(alpha = 0.2f),
                             ),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
@@ -1018,25 +1053,25 @@ fun DownloadedVideosBrowserPanel(
                                 Icon(
                                     imageVector = Icons.Rounded.DesktopWindows,
                                     contentDescription = "Toggle desktop view",
-                                    tint = if (isDesktopMode) NeonCyan else ChromeTextPrimary,
-                                    modifier = Modifier.size(16.dp),
+                                    tint = if (isDesktopMode) NeonCyan else ChromeSilver,
+                                    modifier = Modifier.size(15.dp),
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     text = if (isDesktopMode) "DESKTOP ON" else "DESKTOP VIEW",
                                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (isDesktopMode) Color.White else ChromeTextPrimary,
+                                    color = if (isDesktopMode) NeonCyan else ChromeSilver,
                                 )
                             }
                         }
 
                         // Permanent AES-256 Cookie Lock Pill
                         Surface(
-                            color = if (isPermanentCookieLock) Color(0xFFECFDF5) else ChromePillWhite,
+                            color = if (isPermanentCookieLock) EmeraldPulse.copy(alpha = 0.13f) else NightTrayPill,
                             shape = RoundedCornerShape(50),
                             border = BorderStroke(
-                                0.85.dp,
-                                if (isPermanentCookieLock) EmeraldPulse else ChromeDivider,
+                                0.8.dp,
+                                if (isPermanentCookieLock) EmeraldPulse.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
                             ),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
@@ -1050,8 +1085,8 @@ fun DownloadedVideosBrowserPanel(
                                 Icon(
                                     imageVector = Icons.Rounded.VerifiedUser,
                                     contentDescription = "Permanent cookie protection",
-                                    tint = if (isPermanentCookieLock) Color(0xFF059669) else ChromeTextMuted,
-                                    modifier = Modifier.size(16.dp),
+                                    tint = if (isPermanentCookieLock) EmeraldPulse else MutedSlate,
+                                    modifier = Modifier.size(15.dp),
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
@@ -1061,16 +1096,16 @@ fun DownloadedVideosBrowserPanel(
                                         "TEMP SESSION · $storedCookieCount"
                                     },
                                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (isPermanentCookieLock) Color(0xFF065F46) else ChromeTextPrimary,
+                                    color = if (isPermanentCookieLock) EmeraldPulse else ChromeSilver,
                                 )
                             }
                         }
 
                         // Sync Cookies Action
                         Surface(
-                            color = ChromePillWhite,
+                            color = NightTrayPill,
                             shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.8.dp, ChromeDivider),
+                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
                                 .clickable {
@@ -1088,13 +1123,13 @@ fun DownloadedVideosBrowserPanel(
                                     imageVector = Icons.Rounded.Sync,
                                     contentDescription = "Sync cookies",
                                     tint = EmeraldPulse,
-                                    modifier = Modifier.size(16.dp),
+                                    modifier = Modifier.size(15.dp),
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     text = "SYNC (${syncedDomains.size})",
                                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = ChromeTextPrimary,
+                                    color = ChromeSilver,
                                 )
                             }
                         }
@@ -1102,11 +1137,11 @@ fun DownloadedVideosBrowserPanel(
                         // Clear Cookies (Inline 2-tap confirm, zero dialog)
                         if (storedCookieCount > 0) {
                             Surface(
-                                color = if (confirmClearCookies) Color(0xFFDC2626) else ChromePillWhite,
+                                color = if (confirmClearCookies) CrimsonAlert else CrimsonAlert.copy(alpha = 0.12f),
                                 shape = RoundedCornerShape(50),
                                 border = BorderStroke(
                                     0.8.dp,
-                                    if (confirmClearCookies) Color(0xFFDC2626) else ChromeDivider,
+                                    CrimsonAlert.copy(alpha = if (confirmClearCookies) 1f else 0.55f),
                                 ),
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(50))
@@ -1127,14 +1162,14 @@ fun DownloadedVideosBrowserPanel(
                                     Icon(
                                         imageVector = Icons.Outlined.DeleteOutline,
                                         contentDescription = "Clear cookie vault",
-                                        tint = if (confirmClearCookies) Color.White else Color(0xFFDC2626),
-                                        modifier = Modifier.size(16.dp),
+                                        tint = if (confirmClearCookies) Color.White else CrimsonAlert,
+                                        modifier = Modifier.size(15.dp),
                                     )
                                     Spacer(modifier = Modifier.width(5.dp))
                                     Text(
                                         text = if (confirmClearCookies) "TAP AGAIN TO CLEAR" else "CLEAR VAULT",
                                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                        color = if (confirmClearCookies) Color.White else Color(0xFFDC2626),
+                                        color = if (confirmClearCookies) Color.White else CrimsonAlert,
                                     )
                                 }
                             }
@@ -1142,9 +1177,9 @@ fun DownloadedVideosBrowserPanel(
 
                         // Reload Action
                         Surface(
-                            color = ChromePillWhite,
+                            color = NightTrayPill,
                             shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.8.dp, ChromeDivider),
+                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
                                 .clickable(enabled = !activeTab.isHome) { webViews[activeTab.id]?.reload() }
@@ -1157,14 +1192,14 @@ fun DownloadedVideosBrowserPanel(
                                 Icon(
                                     imageVector = Icons.Rounded.Refresh,
                                     contentDescription = "Reload page",
-                                    tint = ChromeTextPrimary,
-                                    modifier = Modifier.size(16.dp),
+                                    tint = if (activeTab.isHome) DimSlate else ChromeSilver,
+                                    modifier = Modifier.size(15.dp),
                                 )
                                 Spacer(modifier = Modifier.width(5.dp))
                                 Text(
                                     text = "RELOAD",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = ChromeTextPrimary,
+                                    color = if (activeTab.isHome) DimSlate else ChromeSilver,
                                 )
                             }
                         }
@@ -1172,8 +1207,9 @@ fun DownloadedVideosBrowserPanel(
                         // Pull Video Action
                         if (!activeTab.isHome) {
                             Surface(
-                                color = Color(0xFF0E1726),
+                                color = NeonCyan.copy(alpha = 0.16f),
                                 shape = RoundedCornerShape(50),
+                                border = BorderStroke(0.85.dp, NeonCyan.copy(alpha = 0.7f)),
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(50))
                                     .clickable {
@@ -1191,13 +1227,13 @@ fun DownloadedVideosBrowserPanel(
                                         imageVector = Icons.Rounded.ArrowDownward,
                                         contentDescription = "Pull video",
                                         tint = NeonCyan,
-                                        modifier = Modifier.size(16.dp),
+                                        modifier = Modifier.size(15.dp),
                                     )
                                     Spacer(modifier = Modifier.width(5.dp))
                                     Text(
                                         text = "PULL VIDEO",
                                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                        color = Color.White,
+                                        color = ChromeSilver,
                                     )
                                 }
                             }
@@ -1207,57 +1243,57 @@ fun DownloadedVideosBrowserPanel(
             }
         }
 
-        // 6. Inline Tab Manager Strip (Zero Popup — toggled via [N] tab counter)
+        // 6. Inline Tab Manager Strip (Zero Popup — Nocturnal)
         AnimatedVisibility(
             visible = showTabsBarTray,
             enter = expandVertically() + fadeIn(),
             exit = shrinkVertically() + fadeOut(),
         ) {
             Surface(
-                color = ChromeBarSurface,
+                color = NightChromeSurface,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    HorizontalDivider(color = ChromeDivider, thickness = 0.8.dp)
+                    HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         tabs.forEachIndexed { idx, t ->
                             val selected = idx == activeTabIndex
                             Surface(
-                                color = if (selected) Color(0xFF101622) else ChromePillWhite,
-                                shape = RoundedCornerShape(14.dp),
+                                color = if (selected) NightTabSelected else NightTrayPill,
+                                shape = RoundedCornerShape(12.dp),
                                 border = BorderStroke(
-                                    0.9.dp,
-                                    if (selected) NeonCyan else ChromeDivider,
+                                    0.85.dp,
+                                    if (selected) NeonCyan.copy(alpha = 0.7f) else NightHairline,
                                 ),
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(14.dp))
+                                    .clip(RoundedCornerShape(12.dp))
                                     .clickable {
                                         activeTabIndex = idx
                                         showTabsBarTray = false
                                     },
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(
                                         text = "${idx + 1}. ${t.title}",
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = if (selected) Color.White else ChromeTextPrimary,
+                                        color = if (selected) ChromeSilver else MutedSlate,
                                         maxLines = 1,
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Icon(
                                         imageVector = Icons.Rounded.Close,
                                         contentDescription = "Close tab",
-                                        tint = if (selected) Color.White.copy(alpha = 0.8f) else ChromeTextMuted,
+                                        tint = MutedSlate,
                                         modifier = Modifier
                                             .size(14.dp)
                                             .clickable { closeTab(idx) },
@@ -1266,28 +1302,28 @@ fun DownloadedVideosBrowserPanel(
                             }
                         }
                         Surface(
-                            color = ChromePillWhite,
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(0.9.dp, ChromeDivider),
+                            color = NightTrayPill,
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(0.8.dp, GlassStrokeBright.copy(alpha = 0.22f)),
                             modifier = Modifier
-                                .clip(RoundedCornerShape(14.dp))
+                                .clip(RoundedCornerShape(12.dp))
                                 .clickable { openNewTab() },
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Add,
                                     contentDescription = "Add tab",
-                                    tint = ChromeTextPrimary,
-                                    modifier = Modifier.size(16.dp),
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(15.dp),
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
                                     text = "New tab",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = ChromeTextPrimary,
+                                    color = ChromeSilver,
                                 )
                             }
                         }
@@ -1296,13 +1332,13 @@ fun DownloadedVideosBrowserPanel(
             }
         }
 
-        // 7. Samsung-Style Bottom Navigation Bar (Back, Forward, Home, Pull, Cookies, [Tabs], More)
-        HorizontalDivider(color = ChromeDivider, thickness = 0.8.dp)
+        // 7. Compact Nocturnal Bottom Navigation Bar (Back, Forward, Home, Pull, Cookies, [Tabs], More)
+        HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(ChromeBarSurface)
-                .padding(horizontal = 6.dp, vertical = 4.dp),
+                .background(NightChromeSurface)
+                .padding(horizontal = 4.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
@@ -1316,8 +1352,8 @@ fun DownloadedVideosBrowserPanel(
                 Icon(
                     imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowLeft,
                     contentDescription = "Back",
-                    tint = if (!activeTab.isHome && activeTab.canGoBack) ChromeTextPrimary else ChromeTextMuted.copy(alpha = 0.42f),
-                    modifier = Modifier.size(26.dp),
+                    tint = if (!activeTab.isHome && activeTab.canGoBack) ChromeSilver else DimSlate,
+                    modifier = Modifier.size(24.dp),
                 )
             }
 
@@ -1331,8 +1367,8 @@ fun DownloadedVideosBrowserPanel(
                 Icon(
                     imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
                     contentDescription = "Forward",
-                    tint = if (!activeTab.isHome && activeTab.canGoForward) ChromeTextPrimary else ChromeTextMuted.copy(alpha = 0.42f),
-                    modifier = Modifier.size(26.dp),
+                    tint = if (!activeTab.isHome && activeTab.canGoForward) ChromeSilver else DimSlate,
+                    modifier = Modifier.size(24.dp),
                 )
             }
 
@@ -1348,8 +1384,8 @@ fun DownloadedVideosBrowserPanel(
                 Icon(
                     imageVector = Icons.Outlined.Home,
                     contentDescription = "Browser Home",
-                    tint = if (activeTab.isHome) Color(0xFF2563EB) else ChromeTextPrimary,
-                    modifier = Modifier.size(24.dp),
+                    tint = if (activeTab.isHome) NeonCyan else ChromeSilver,
+                    modifier = Modifier.size(22.dp),
                 )
             }
 
@@ -1371,8 +1407,8 @@ fun DownloadedVideosBrowserPanel(
                 Icon(
                     imageVector = Icons.Rounded.ArrowDownward,
                     contentDescription = "Download video from current page",
-                    tint = if (!activeTab.isHome) Color(0xFF2563EB) else ChromeTextPrimary,
-                    modifier = Modifier.size(22.dp),
+                    tint = if (!activeTab.isHome) NeonCyan else ChromeSilver,
+                    modifier = Modifier.size(21.dp),
                 )
             }
 
@@ -1389,14 +1425,14 @@ fun DownloadedVideosBrowserPanel(
                     Icon(
                         imageVector = Icons.Outlined.Lock,
                         contentDescription = "Sync cookies",
-                        tint = ChromeTextPrimary,
-                        modifier = Modifier.size(22.dp),
+                        tint = ChromeSilver,
+                        modifier = Modifier.size(20.dp),
                     )
                     if (syncedDomains.isNotEmpty()) {
                         Box(
                             modifier = Modifier
                                 .offset(x = 3.dp, y = (-2).dp)
-                                .size(7.dp)
+                                .size(6.dp)
                                 .clip(CircleShape)
                                 .background(EmeraldPulse),
                         )
@@ -1418,10 +1454,10 @@ fun DownloadedVideosBrowserPanel(
             ) {
                 Box(
                     modifier = Modifier
-                        .size(21.dp)
+                        .size(20.dp)
                         .border(
-                            width = 1.6.dp,
-                            color = if (showTabsBarTray) Color(0xFF2563EB) else ChromeTextPrimary,
+                            width = 1.5.dp,
+                            color = if (showTabsBarTray) NeonCyan else ChromeSilver,
                             shape = RoundedCornerShape(6.dp),
                         ),
                     contentAlignment = Alignment.Center,
@@ -1429,10 +1465,10 @@ fun DownloadedVideosBrowserPanel(
                     Text(
                         text = tabs.size.toString(),
                         style = MaterialTheme.typography.labelSmall.copy(
-                            fontSize = 11.sp,
+                            fontSize = 10.5.sp,
                             fontWeight = FontWeight.Bold,
                         ),
-                        color = if (showTabsBarTray) Color(0xFF2563EB) else ChromeTextPrimary,
+                        color = if (showTabsBarTray) NeonCyan else ChromeSilver,
                     )
                 }
             }
@@ -1451,16 +1487,16 @@ fun DownloadedVideosBrowserPanel(
                     Icon(
                         imageVector = Icons.Rounded.MoreVert,
                         contentDescription = "Zoom & browser tools",
-                        tint = if (showToolsBar || zoomPercent != 100) Color(0xFF2563EB) else ChromeTextPrimary,
-                        modifier = Modifier.size(24.dp),
+                        tint = if (showToolsBar || zoomPercent != 100) NeonCyan else ChromeSilver,
+                        modifier = Modifier.size(22.dp),
                     )
                     if (syncedDomains.isNotEmpty() || zoomPercent != 100) {
                         Box(
                             modifier = Modifier
                                 .offset(x = 2.dp, y = 1.dp)
-                                .size(6.dp)
+                                .size(5.5.dp)
                                 .clip(CircleShape)
-                                .background(Color(0xFFF97316)),
+                                .background(AmberWarning),
                         )
                     }
                 }
@@ -1484,25 +1520,37 @@ private fun SamsungStartPageHome(
         modifier = Modifier
             .fillMaxSize()
             .background(
-                Brush.linearGradient(
+                Brush.verticalGradient(
                     colors = listOf(
-                        Color(0xFF31241E),
-                        Color(0xFF1D222B),
-                        Color(0xFF17181E),
-                        Color(0xFF251A16),
+                        Color(0xFF060911),
+                        Color(0xFF0A0F1A),
+                        ObsidianVoid,
                     ),
-                    start = Offset(0f, 0f),
-                    end = Offset(900f, 1600f),
                 ),
             )
+            .drawBehind {
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            PlasmaViolet.copy(alpha = 0.14f),
+                            NeonCyan.copy(alpha = 0.06f),
+                            Color.Transparent,
+                        ),
+                        center = Offset(size.width * 0.82f, size.height * 0.18f),
+                        radius = size.minDimension * 0.65f,
+                    ),
+                    radius = size.minDimension * 0.65f,
+                    center = Offset(size.width * 0.82f, size.height * 0.18f),
+                )
+            }
             .testTag("browser_start_page_home"),
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
+                .padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
-            // Top-right Controls (Tools/Zoom + Vault Session Badge matching screenshot header)
+            // Top-right Controls (Tools/Zoom + Vault Session Badge)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End,
@@ -1510,25 +1558,25 @@ private fun SamsungStartPageHome(
             ) {
                 IconButton(
                     onClick = onToggleTools,
-                    modifier = Modifier.size(38.dp),
+                    modifier = Modifier.size(34.dp),
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Tune,
                         contentDescription = "Browser settings, desktop & zoom",
-                        tint = Color.White.copy(alpha = 0.88f),
-                        modifier = Modifier.size(20.dp),
+                        tint = ChromeSilver,
+                        modifier = Modifier.size(18.dp),
                     )
                 }
                 Spacer(modifier = Modifier.width(6.dp))
                 Surface(
-                    color = if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.16f),
+                    color = if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.16f) else NightCardSurface,
                     shape = CircleShape,
                     border = BorderStroke(
-                        0.9.dp,
-                        if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.75f) else Color.White.copy(alpha = 0.35f),
+                        0.85.dp,
+                        if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.7f) else GlassStrokeBright.copy(alpha = 0.25f),
                     ),
                     modifier = Modifier
-                        .size(30.dp)
+                        .size(28.dp)
                         .clip(CircleShape)
                         .clickable { onManualSync() }
                         .testTag("browser_home_vault_badge"),
@@ -1537,56 +1585,61 @@ private fun SamsungStartPageHome(
                         Text(
                             text = syncedDomainsCount.toString(),
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            color = Color.White,
+                            color = if (syncedDomainsCount > 0) EmeraldPulse else ChromeSilver,
                         )
                     }
                 }
             }
 
-            // Frosted Translucent Feature Banner Card (Dismissible via X, Zero Ads/Popups)
+            // Nocturnal Liquid Glass Feature Banner Card (Dismissible via X, Zero Ads/Popups)
             AnimatedVisibility(visible = showBanner) {
                 Surface(
-                    color = Color.White.copy(alpha = 0.24f),
-                    shape = RoundedCornerShape(22.dp),
-                    border = BorderStroke(0.75.dp, Color.White.copy(alpha = 0.2f)),
+                    color = NightCardSurface.copy(alpha = 0.92f),
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(0.8.dp, GlassStrokeBright.copy(alpha = 0.24f)),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 6.dp, vertical = 8.dp),
+                        .padding(horizontal = 4.dp, vertical = 6.dp),
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 18.dp, vertical = 16.dp),
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
                     ) {
-                        // Subtle glowing ringed planet ornament on right (echoing Samsung Browser card)
+                        // Subtle glowing ringed blackhole ornament on right
                         Canvas(
                             modifier = Modifier
-                                .size(92.dp)
+                                .size(86.dp)
                                 .align(Alignment.CenterEnd)
-                                .offset(x = 12.dp, y = 6.dp),
+                                .offset(x = 10.dp, y = 4.dp),
                         ) {
                             drawCircle(
                                 brush = Brush.radialGradient(
                                     colors = listOf(
-                                        Color.White.copy(alpha = 0.88f),
-                                        Color(0xFF93C5FD).copy(alpha = 0.45f),
-                                        Color(0xFF1E293B).copy(alpha = 0.25f),
+                                        ObsidianVoid,
+                                        Color(0xFF10192B),
+                                        NeonCyan.copy(alpha = 0.22f),
                                     ),
                                 ),
-                                radius = size.minDimension * 0.36f,
+                                radius = size.minDimension * 0.34f,
                             )
-                            rotate(-30f) {
+                            drawCircle(
+                                color = NeonCyan.copy(alpha = 0.4f),
+                                radius = size.minDimension * 0.34f,
+                                style = Stroke(width = 1.2.dp.toPx()),
+                            )
+                            rotate(-28f) {
                                 drawOval(
                                     brush = Brush.linearGradient(
                                         colors = listOf(
-                                            Color(0xFF67E8F9),
-                                            Color(0xFF38BDF8),
-                                            Color(0xFF818CF8),
+                                            NeonCyan.copy(alpha = 0.85f),
+                                            PlasmaViolet.copy(alpha = 0.85f),
+                                            EmeraldPulse.copy(alpha = 0.55f),
                                         ),
                                     ),
-                                    style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round),
-                                    topLeft = Offset(size.width * 0.04f, size.height * 0.34f),
-                                    size = androidx.compose.ui.geometry.Size(size.width * 0.92f, size.height * 0.32f),
+                                    style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round),
+                                    topLeft = Offset(size.width * 0.05f, size.height * 0.35f),
+                                    size = androidx.compose.ui.geometry.Size(size.width * 0.9f, size.height * 0.3f),
                                 )
                             }
                         }
@@ -1595,17 +1648,17 @@ private fun SamsungStartPageHome(
                         Box(
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
-                                .size(26.dp)
+                                .size(24.dp)
                                 .clip(CircleShape)
-                                .background(Color.Black.copy(alpha = 0.25f))
+                                .background(Color.White.copy(alpha = 0.07f))
                                 .clickable { onDismissBanner() },
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.Close,
                                 contentDescription = "Dismiss banner",
-                                tint = Color.White.copy(alpha = 0.85f),
-                                modifier = Modifier.size(15.dp),
+                                tint = MutedSlate,
+                                modifier = Modifier.size(14.dp),
                             )
                         }
 
@@ -1614,16 +1667,16 @@ private fun SamsungStartPageHome(
                                 text = "Blackhole Browser",
                                 style = MaterialTheme.typography.titleMedium.copy(
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = 18.sp,
+                                    fontSize = 17.sp,
                                 ),
-                                color = Color.White,
+                                color = ChromeSilver,
                             )
                             Text(
                                 text = if (isPermanentCookieLock) "AES-256 Forever Vault" else "for Session Vault",
-                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
-                                color = Color.White.copy(alpha = 0.9f),
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                color = NeonCyan,
                             )
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = if (storedCookieCount > 0) {
                                     "$storedCookieCount cookies encrypted & locked forever across $syncedDomainsCount domains."
@@ -1631,21 +1684,22 @@ private fun SamsungStartPageHome(
                                     "Sign in once — AES-256 encrypted & saved forever for effortless downloads."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color.White.copy(alpha = 0.82f),
+                                color = MutedSlate,
                             )
-                            Spacer(modifier = Modifier.height(12.dp))
+                            Spacer(modifier = Modifier.height(10.dp))
                             Surface(
-                                color = Color(0xFF0A0D12),
+                                color = NeonCyan.copy(alpha = 0.14f),
                                 shape = RoundedCornerShape(50),
+                                border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.55f)),
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(50))
                                     .clickable { onManualSync() },
                             ) {
                                 Text(
                                     text = if (storedCookieCount > 0) "Sync forever vault" else "Sync session",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = Color.White,
-                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = NeonCyan,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
                                 )
                             }
                         }
@@ -1653,13 +1707,13 @@ private fun SamsungStartPageHome(
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
-            // 5-Column Samsung-Style Quick Access Speed Dial Grid
+            // 5-Column Nocturnal Quick Access Speed Dial Grid
             LazyVerticalGrid(
                 columns = GridCells.Fixed(5),
                 contentPadding = PaddingValues(vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier
                     .weight(1f)
@@ -1676,14 +1730,19 @@ private fun SamsungStartPageHome(
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(50.dp)
-                                .clip(RoundedCornerShape(16.dp))
+                                .size(48.dp)
+                                .clip(RoundedCornerShape(15.dp))
                                 .background(
                                     if (item.tileColors.size > 1) {
                                         Brush.linearGradient(item.tileColors)
                                     } else {
                                         SolidColor(item.tileColors.first())
                                     },
+                                )
+                                .border(
+                                    width = 0.75.dp,
+                                    color = GlassStrokeBright.copy(alpha = 0.24f),
+                                    shape = RoundedCornerShape(15.dp),
                                 ),
                             contentAlignment = Alignment.Center,
                         ) {
@@ -1692,24 +1751,24 @@ private fun SamsungStartPageHome(
                                     imageVector = Icons.Rounded.PlayArrow,
                                     contentDescription = item.label,
                                     tint = item.glyphColor,
-                                    modifier = Modifier.size(28.dp),
+                                    modifier = Modifier.size(26.dp),
                                 )
                             } else {
                                 Text(
                                     text = item.glyph,
                                     style = MaterialTheme.typography.titleMedium.copy(
                                         fontWeight = FontWeight.Bold,
-                                        fontSize = if (item.glyph.length > 2) 15.sp else 20.sp,
+                                        fontSize = if (item.glyph.length > 2) 14.sp else 19.sp,
                                     ),
                                     color = item.glyphColor,
                                 )
                             }
                         }
-                        Spacer(modifier = Modifier.height(6.dp))
+                        Spacer(modifier = Modifier.height(5.dp))
                         Text(
                             text = item.label,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                            color = Color.White.copy(alpha = 0.92f),
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
+                            color = ChromeSilver.copy(alpha = 0.9f),
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                             textAlign = TextAlign.Center,
