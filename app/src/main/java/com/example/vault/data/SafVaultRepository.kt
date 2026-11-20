@@ -5,6 +5,7 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentSender
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.media.MediaScannerConnection
@@ -112,6 +113,37 @@ class SafVaultRepository(context: Context) {
                 Manifest.permission.WRITE_EXTERNAL_STORAGE,
             ) == PackageManager.PERMISSION_GRANTED
         }
+    }
+
+    fun hasMediaReadAccess(): Boolean {
+        if (hasAllFilesAccess()) return true
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.READ_MEDIA_IMAGES,
+            ) == PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(
+                    appContext,
+                    Manifest.permission.READ_MEDIA_VIDEO,
+                ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    fun buildMediaStoreDeleteSender(uris: List<Uri>): IntentSender? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val mediaUris = uris.filter {
+            it.scheme.equals("content", ignoreCase = true) &&
+                it.authority == MediaStore.AUTHORITY
+        }
+        if (mediaUris.isEmpty()) return null
+        return runCatching {
+            MediaStore.createDeleteRequest(appContext.contentResolver, mediaUris).intentSender
+        }.getOrNull()
     }
 
     private fun ensureProtectedDir(dir: File) {

@@ -15,6 +15,7 @@ import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
@@ -142,6 +143,11 @@ fun VaultScreen(
     BackHandler {
         when {
             uiState.activePlayback != null -> vaultViewModel.closePlayer()
+            uiState.devicePicker.isOpen -> {
+                if (!vaultViewModel.navigateUpDeviceDirectory()) {
+                    vaultViewModel.closeDevicePicker()
+                }
+            }
             uiState.selectedCategory != null -> vaultViewModel.selectCategory(null)
             else -> {
                 vaultViewModel.lockVaultNow()
@@ -157,6 +163,7 @@ fun VaultScreen(
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
+            vaultViewModel.closeDevicePicker()
             vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
@@ -166,6 +173,7 @@ fun VaultScreen(
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
+            vaultViewModel.closeDevicePicker()
             vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
@@ -180,6 +188,7 @@ fun VaultScreen(
             null
         }
         if (selectedUri != null) {
+            vaultViewModel.closeDevicePicker()
             vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
@@ -189,6 +198,7 @@ fun VaultScreen(
     ) { selectedUri: Uri? ->
         vaultViewModel.endExternalSystemFlow()
         if (selectedUri != null) {
+            vaultViewModel.closeDevicePicker()
             vaultViewModel.moveMediaToVault(selectedUri, pendingPickCategory)
         }
     }
@@ -216,6 +226,26 @@ fun VaultScreen(
         }
     }
 
+    val mediaDeleteRequestLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult(),
+    ) { result ->
+        vaultViewModel.endExternalSystemFlow()
+        vaultViewModel.consumePendingMediaDeleteSender(result.resultCode == Activity.RESULT_OK)
+    }
+
+    LaunchedEffect(uiState.pendingMediaDeleteSender) {
+        val sender = uiState.pendingMediaDeleteSender ?: return@LaunchedEffect
+        vaultViewModel.beginExternalSystemFlow()
+        val launched = runCatching {
+            mediaDeleteRequestLauncher.launch(IntentSenderRequest.Builder(sender).build())
+            true
+        }.getOrDefault(false)
+        if (!launched) {
+            vaultViewModel.endExternalSystemFlow()
+            vaultViewModel.consumePendingMediaDeleteSender(false)
+        }
+    }
+
     val allFilesSettingsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult(),
     ) {
@@ -223,45 +253,74 @@ fun VaultScreen(
         vaultViewModel.refreshPermissionAndEntries()
     }
 
-    val legacyStoragePermissionsLauncher = rememberLauncherForActivityResult(
+    val runtimeMediaPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
         vaultViewModel.endExternalSystemFlow()
-        val writeGranted = grants[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
         vaultViewModel.refreshPermissionAndEntries()
-        if (!writeGranted) {
-            vaultViewModel.reportStatusError("تم رفض صلاحية الوصول إلى ملفات الجهاز.")
+        val anyGranted = grants.values.any { it }
+        if (!anyGranted && !uiState.hasAllFilesAccess) {
+            vaultViewModel.reportStatusError("يرجى منح صلاحية الوصول إلى ملفات وصور الهاتف للمتابعة.")
+        }
+    }
+
+    val requestMediaAccessPermission: () -> Unit = {
+        vaultViewModel.beginExternalSystemFlow()
+        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO,
+            )
+        } else {
+            arrayOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            )
+        }
+        val launched = runCatching {
+            runtimeMediaPermissionsLauncher.launch(perms)
+            true
+        }.getOrDefault(false)
+        if (!launched) {
+            vaultViewModel.endExternalSystemFlow()
         }
     }
 
     val requestAllFilesAccess: () -> Unit = {
-        vaultViewModel.beginExternalSystemFlow()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            vaultViewModel.beginExternalSystemFlow()
             val appSettingsIntent = Intent(
                 Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                 Uri.parse("package:${context.packageName}"),
             )
             val fallbackSettingsIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-            val launched = runCatching {
-                allFilesSettingsLauncher.launch(appSettingsIntent)
-                true
-            }.getOrElse {
-                runCatching {
+            val launched = when {
+                appSettingsIntent.resolveActivity(context.packageManager) != null && runCatching {
+                    allFilesSettingsLauncher.launch(appSettingsIntent)
+                    true
+                }.getOrDefault(false) -> true
+                fallbackSettingsIntent.resolveActivity(context.packageManager) != null && runCatching {
                     allFilesSettingsLauncher.launch(fallbackSettingsIntent)
                     true
-                }.getOrDefault(false)
+                }.getOrDefault(false) -> true
+                else -> false
             }
             if (!launched) {
                 vaultViewModel.endExternalSystemFlow()
-                vaultViewModel.reportStatusError("تعذر فتح إعدادات صلاحية الوصول إلى الملفات.")
+                requestMediaAccessPermission()
             }
         } else {
-            legacyStoragePermissionsLauncher.launch(
-                arrayOf(
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                ),
-            )
+            requestMediaAccessPermission()
+        }
+    }
+
+    // Auto-request runtime storage/media permission on first Vault unlock if not granted yet
+    var autoRequestedMediaOnUnlock by remember { mutableStateOf(false) }
+    LaunchedEffect(uiState.isLocked) {
+        if (!uiState.isLocked && !uiState.hasMediaAccess && !autoRequestedMediaOnUnlock) {
+            autoRequestedMediaOnUnlock = true
+            requestMediaAccessPermission()
         }
     }
 
@@ -300,10 +359,21 @@ fun VaultScreen(
         }
     }
 
-    val launchCategoryPicker: (VaultCategory, Boolean) -> Unit = { category, preferFilesExplorer ->
+    // Open reliable built-in Device Media & Files Explorer directly inside the Vault
+    val openInAppDevicePicker: (VaultCategory, Boolean) -> Unit = { category, browseFolders ->
+        pendingPickCategory = category
+        vaultViewModel.openDevicePicker(category = category, browseFolders = browseFolders)
+        if (!uiState.hasMediaAccess) {
+            requestMediaAccessPermission()
+        }
+    }
+
+    // Safely guarded optional OS picker fallback (never throws or crashes if system picker is missing)
+    val launchSystemPickerFallback: (VaultCategory, Boolean) -> Unit = { category, preferFilesExplorer ->
         pendingPickCategory = category
         vaultViewModel.beginExternalSystemFlow()
 
+        val pm = context.packageManager
         val mimeArray = when (category) {
             VaultCategory.PHOTOS -> arrayOf("image/*")
             VaultCategory.VIDEOS -> arrayOf("video/*")
@@ -311,6 +381,15 @@ fun VaultScreen(
         }
         val singleMime = mimeArray.first()
 
+        val openDocIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = singleMime
+            putExtra(Intent.EXTRA_MIME_TYPES, mimeArray)
+        }
+        val getContentIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = singleMime
+        }
         val mediaPickIntent = when (category) {
             VaultCategory.PHOTOS -> Intent(
                 Intent.ACTION_PICK,
@@ -320,24 +399,12 @@ fun VaultScreen(
                 Intent.ACTION_PICK,
                 MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             )
-            VaultCategory.FILES -> Intent(Intent.ACTION_GET_CONTENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "*/*"
-            }
+            VaultCategory.FILES -> getContentIntent
         }
-
-        val getContentChooserIntent = Intent.createChooser(
-            Intent(Intent.ACTION_GET_CONTENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = singleMime
-            },
-            "اختر من ملفات الهاتف",
-        )
 
         val photoPickerAvailable = runCatching {
             ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(context)
         }.getOrDefault(false)
-
         val photoPickerType = when (category) {
             VaultCategory.PHOTOS -> ActivityResultContracts.PickVisualMedia.ImageOnly
             VaultCategory.VIDEOS -> ActivityResultContracts.PickVisualMedia.VideoOnly
@@ -346,11 +413,14 @@ fun VaultScreen(
 
         val launched = if (preferFilesExplorer || category == VaultCategory.FILES) {
             when {
-                runCatching { openDocumentLauncher.launch(mimeArray) }.isSuccess -> true
-                runCatching { getContentLauncher.launch(singleMime) }.isSuccess -> true
-                runCatching { legacyIntentLauncher.launch(getContentChooserIntent) }.isSuccess -> true
-                photoPickerAvailable && runCatching {
-                    visualMediaPickerLauncher.launch(PickVisualMediaRequest(photoPickerType))
+                openDocIntent.resolveActivity(pm) != null && runCatching {
+                    openDocumentLauncher.launch(mimeArray)
+                }.isSuccess -> true
+                getContentIntent.resolveActivity(pm) != null && runCatching {
+                    getContentLauncher.launch(singleMime)
+                }.isSuccess -> true
+                mediaPickIntent.resolveActivity(pm) != null && runCatching {
+                    legacyIntentLauncher.launch(mediaPickIntent)
                 }.isSuccess -> true
                 else -> false
             }
@@ -359,23 +429,29 @@ fun VaultScreen(
                 photoPickerAvailable && runCatching {
                     visualMediaPickerLauncher.launch(PickVisualMediaRequest(photoPickerType))
                 }.isSuccess -> true
-                runCatching { openDocumentLauncher.launch(mimeArray) }.isSuccess -> true
-                runCatching { getContentLauncher.launch(singleMime) }.isSuccess -> true
-                runCatching { legacyIntentLauncher.launch(mediaPickIntent) }.isSuccess -> true
-                runCatching { legacyIntentLauncher.launch(getContentChooserIntent) }.isSuccess -> true
+                openDocIntent.resolveActivity(pm) != null && runCatching {
+                    openDocumentLauncher.launch(mimeArray)
+                }.isSuccess -> true
+                mediaPickIntent.resolveActivity(pm) != null && runCatching {
+                    legacyIntentLauncher.launch(mediaPickIntent)
+                }.isSuccess -> true
+                getContentIntent.resolveActivity(pm) != null && runCatching {
+                    getContentLauncher.launch(singleMime)
+                }.isSuccess -> true
                 else -> false
             }
         }
 
         if (!launched) {
             vaultViewModel.endExternalSystemFlow()
-            vaultViewModel.reportStatusError("تعذر فتح معرض أو ملفات الهاتف على هذا الجهاز.")
+            vaultViewModel.reportStatusError("مختار النظام غير متاح على هذا الجهاز — استخدم المتصفح المدمج بالخزنة.")
         }
     }
 
     val launchSafFolderSelection: () -> Unit = {
         vaultViewModel.beginExternalSystemFlow()
 
+        val pm = context.packageManager
         val initialTreeHint = runCatching {
             DocumentsContract.buildDocumentUri(
                 "com.android.externalstorage.documents",
@@ -395,30 +471,28 @@ fun VaultScreen(
             }
         }
 
+        val baseTree = buildBaseTreeIntent()
         val launched = when {
-            runCatching { safFolderLauncher.launch(initialTreeHint) }.isSuccess -> true
-            runCatching { safFolderLauncher.launch(null) }.isSuccess -> true
+            baseTree.resolveActivity(pm) != null && runCatching {
+                safFolderLauncher.launch(initialTreeHint)
+            }.isSuccess -> true
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && runCatching {
                 val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
                 val smIntent = storageManager?.primaryStorageVolume?.createOpenDocumentTreeIntent()?.apply {
                     addFlags(treeIntentFlags)
                 } ?: return@runCatching false
+                if (smIntent.resolveActivity(pm) == null) return@runCatching false
                 safTreeIntentLauncher.launch(smIntent)
                 true
             }.getOrDefault(false) -> true
-            runCatching {
+            buildBaseTreeIntent().setPackage("com.google.android.documentsui").resolveActivity(pm) != null && runCatching {
                 safTreeIntentLauncher.launch(
                     buildBaseTreeIntent().setPackage("com.google.android.documentsui"),
                 )
             }.isSuccess -> true
-            runCatching {
+            buildBaseTreeIntent().setPackage("com.android.documentsui").resolveActivity(pm) != null && runCatching {
                 safTreeIntentLauncher.launch(
                     buildBaseTreeIntent().setPackage("com.android.documentsui"),
-                )
-            }.isSuccess -> true
-            runCatching {
-                safTreeIntentLauncher.launch(
-                    Intent.createChooser(buildBaseTreeIntent(), "Select External Vault Folder"),
                 )
             }.isSuccess -> true
             else -> false
@@ -526,14 +600,18 @@ fun VaultScreen(
         containerColor = ObsidianVoid,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         floatingActionButton = {
-            if (!uiState.isLocked && activeCategory != null && uiState.activePlayback == null) {
+            if (!uiState.isLocked &&
+                activeCategory != null &&
+                uiState.activePlayback == null &&
+                !uiState.devicePicker.isOpen
+            ) {
                 val fabAccent = when (activeCategory) {
                     VaultCategory.PHOTOS -> NeonCyan
                     VaultCategory.VIDEOS -> PlasmaViolet
                     VaultCategory.FILES -> EmeraldPulse
                 }
                 ExtendedFloatingActionButton(
-                    onClick = { launchCategoryPicker(activeCategory, false) },
+                    onClick = { openInAppDevicePicker(activeCategory, activeCategory == VaultCategory.FILES) },
                     containerColor = fabAccent,
                     contentColor = ObsidianVoid,
                     modifier = Modifier
@@ -596,6 +674,7 @@ fun VaultScreen(
                         },
                         onLockNow = vaultViewModel::lockVaultNow,
                         onOpenCategory = { cat -> vaultViewModel.selectCategory(cat) },
+                        onRequestMediaPermission = requestMediaAccessPermission,
                         onRequestAllFilesAccess = requestAllFilesAccess,
                         onSelectPhoneDownloads = { switchToPhoneDownloadsVault(null) },
                         onSelectSafFolder = launchSafFolderSelection,
@@ -610,8 +689,8 @@ fun VaultScreen(
                         uiState = uiState,
                         onBackToCategories = { vaultViewModel.selectCategory(null) },
                         onLockNow = vaultViewModel::lockVaultNow,
-                        onPickFromGallery = { launchCategoryPicker(activeCategory, false) },
-                        onPickFromPhoneFiles = { launchCategoryPicker(activeCategory, true) },
+                        onPickFromGallery = { openInAppDevicePicker(activeCategory, false) },
+                        onPickFromPhoneFiles = { openInAppDevicePicker(activeCategory, true) },
                         onMoveDownloadedVideo = vaultViewModel::moveDownloadedVideoToVault,
                         onCancelTransfer = vaultViewModel::cancelActiveTransfer,
                         onOpenEntry = vaultViewModel::openEntry,
@@ -620,6 +699,29 @@ fun VaultScreen(
                         onDismissStatus = vaultViewModel::dismissStatus,
                     )
                 }
+            }
+
+            if (!uiState.isLocked && uiState.devicePicker.isOpen) {
+                VaultDevicePickerSheet(
+                    pickerState = uiState.devicePicker,
+                    hasMediaAccess = uiState.hasMediaAccess,
+                    hasAllFilesAccess = uiState.hasAllFilesAccess,
+                    onClose = vaultViewModel::closeDevicePicker,
+                    onNavigateUpDirectory = { vaultViewModel.navigateUpDeviceDirectory() },
+                    onOpenDirectory = vaultViewModel::navigateToDeviceDirectory,
+                    onSwitchBrowseMode = vaultViewModel::setDevicePickerBrowseMode,
+                    onToggleSelect = vaultViewModel::togglePickerSelection,
+                    onClearSelection = vaultViewModel::clearPickerSelection,
+                    onConfirmMoveSelected = vaultViewModel::moveSelectedDeviceItemsToVault,
+                    onRequestMediaPermission = requestMediaAccessPermission,
+                    onRequestAllFilesAccess = requestAllFilesAccess,
+                    onOpenSystemPickerFallback = {
+                        launchSystemPickerFallback(
+                            uiState.devicePicker.category,
+                            uiState.devicePicker.browseFoldersMode,
+                        )
+                    },
+                )
             }
 
             uiState.activePlayback?.let { session ->

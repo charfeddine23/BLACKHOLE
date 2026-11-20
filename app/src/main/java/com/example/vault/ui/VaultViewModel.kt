@@ -1,9 +1,12 @@
 package com.example.vault.ui
 
 import android.app.Application
+import android.content.IntentSender
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.vault.data.DeviceMediaBrowser
+import com.example.vault.data.DeviceMediaItem
 import com.example.vault.data.SafVaultRepository
 import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultFileEntry
@@ -38,9 +41,21 @@ data class VaultPlaybackSession(
     val category: VaultCategory,
 )
 
+data class VaultDevicePickerUiState(
+    val isOpen: Boolean = false,
+    val category: VaultCategory = VaultCategory.VIDEOS,
+    val browseFoldersMode: Boolean = false,
+    val isLoading: Boolean = false,
+    val items: List<DeviceMediaItem> = emptyList(),
+    val selectedUris: Set<String> = emptySet(),
+    val currentDirectoryPath: String? = null,
+    val canNavigateUp: Boolean = false,
+)
+
 data class VaultUiState(
     val isLocked: Boolean = true,
     val biometricVerified: Boolean = false,
+    val hasMediaAccess: Boolean = false,
     val hasAllFilesAccess: Boolean = false,
     val selectedCategory: VaultCategory? = null,
     val isExternalSafActive: Boolean = false,
@@ -52,16 +67,20 @@ data class VaultUiState(
     val statusMessage: String? = null,
     val isErrorStatus: Boolean = false,
     val activePlayback: VaultPlaybackSession? = null,
+    val devicePicker: VaultDevicePickerUiState = VaultDevicePickerUiState(),
+    val pendingMediaDeleteSender: IntentSender? = null,
 )
 
 class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = SafVaultRepository(application.applicationContext)
+    private val deviceBrowser = DeviceMediaBrowser(application.applicationContext)
 
     private val _uiState = MutableStateFlow(VaultUiState())
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
 
     private var activeTransferJob: Job? = null
+    private var pickerLoadJob: Job? = null
 
     @Volatile
     private var awaitingExternalSystemFlow: Boolean = false
@@ -94,6 +113,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             refreshStorageAndPermissionState()
             if (!_uiState.value.isLocked) {
                 refreshEntries()
+                if (_uiState.value.devicePicker.isOpen) {
+                    reloadDevicePickerItems()
+                }
             }
         }
     }
@@ -103,6 +125,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         unlock: Boolean = false,
     ) {
         val hasFilesAccess = repository.hasAllFilesAccess()
+        val hasMedia = repository.hasMediaReadAccess()
         val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
         val label = runCatching { repository.getStorageDisplayLabel() }
             .getOrDefault("Private App Vault (Isolated Sandbox)")
@@ -110,6 +133,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 isLocked = if (unlock) false else it.isLocked,
                 biometricVerified = if (unlock) true else it.biometricVerified,
+                hasMediaAccess = hasMedia,
                 hasAllFilesAccess = hasFilesAccess,
                 isExternalSafActive = mode != VaultStorageMode.INTERNAL,
                 storageMode = mode,
@@ -128,6 +152,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         awaitingExternalSystemFlow = false
         activeTransferJob?.cancel()
         activeTransferJob = null
+        pickerLoadJob?.cancel()
+        pickerLoadJob = null
         _uiState.update {
             it.copy(
                 isLocked = true,
@@ -136,6 +162,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 entries = emptyList(),
                 activePlayback = null,
                 transferState = VaultTransferUiState.Idle,
+                devicePicker = VaultDevicePickerUiState(),
+                pendingMediaDeleteSender = null,
             )
         }
     }
@@ -145,6 +173,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             val items = runCatching { repository.listVaultEntries() }.getOrDefault(emptyList())
             val downloadedVideos = runCatching { repository.listBlackholeDownloadedVideos() }.getOrDefault(emptyList())
             val hasFilesAccess = repository.hasAllFilesAccess()
+            val hasMedia = repository.hasMediaReadAccess()
             val mode = runCatching { repository.getActiveStorageMode() }.getOrDefault(VaultStorageMode.INTERNAL)
             val label = runCatching { repository.getStorageDisplayLabel() }
                 .getOrDefault("Private App Vault (Isolated Sandbox)")
@@ -152,6 +181,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 it.copy(
                     entries = items,
                     availableDownloadedVideos = downloadedVideos,
+                    hasMediaAccess = hasMedia,
                     hasAllFilesAccess = hasFilesAccess,
                     isExternalSafActive = mode != VaultStorageMode.INTERNAL,
                     storageMode = mode,
@@ -160,6 +190,267 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    // ---- Built-In In-App Device Media & Files Explorer ----
+
+    fun openDevicePicker(
+        category: VaultCategory,
+        browseFolders: Boolean = false,
+    ) {
+        val rootPath = deviceBrowser.getExternalStorageRoot().absolutePath
+        _uiState.update {
+            it.copy(
+                devicePicker = VaultDevicePickerUiState(
+                    isOpen = true,
+                    category = category,
+                    browseFoldersMode = browseFolders || category == VaultCategory.FILES,
+                    isLoading = true,
+                    items = emptyList(),
+                    selectedUris = emptySet(),
+                    currentDirectoryPath = if (browseFolders || category == VaultCategory.FILES) rootPath else null,
+                    canNavigateUp = false,
+                ),
+            )
+        }
+        reloadDevicePickerItems()
+    }
+
+    fun setDevicePickerBrowseMode(browseFolders: Boolean) {
+        val current = _uiState.value.devicePicker
+        val rootPath = deviceBrowser.getExternalStorageRoot().absolutePath
+        _uiState.update {
+            it.copy(
+                devicePicker = current.copy(
+                    browseFoldersMode = browseFolders,
+                    isLoading = true,
+                    selectedUris = emptySet(),
+                    currentDirectoryPath = if (browseFolders) (current.currentDirectoryPath ?: rootPath) else null,
+                    canNavigateUp = browseFolders && current.currentDirectoryPath != null &&
+                        current.currentDirectoryPath != rootPath,
+                ),
+            )
+        }
+        reloadDevicePickerItems()
+    }
+
+    fun navigateToDeviceDirectory(dirPath: String) {
+        val rootPath = deviceBrowser.getExternalStorageRoot().absolutePath
+        _uiState.update {
+            it.copy(
+                devicePicker = it.devicePicker.copy(
+                    browseFoldersMode = true,
+                    isLoading = true,
+                    currentDirectoryPath = dirPath,
+                    canNavigateUp = dirPath != rootPath,
+                ),
+            )
+        }
+        reloadDevicePickerItems()
+    }
+
+    fun navigateUpDeviceDirectory(): Boolean {
+        val picker = _uiState.value.devicePicker
+        if (!picker.isOpen || !picker.browseFoldersMode) return false
+        val rootPath = deviceBrowser.getExternalStorageRoot().absolutePath
+        val currPath = picker.currentDirectoryPath ?: return false
+        if (currPath == rootPath) return false
+        val parent = File(currPath).parentFile ?: return false
+        val targetPath = if (parent.absolutePath.startsWith(rootPath)) parent.absolutePath else rootPath
+        navigateToDeviceDirectory(targetPath)
+        return true
+    }
+
+    fun reloadDevicePickerItems() {
+        pickerLoadJob?.cancel()
+        pickerLoadJob = viewModelScope.launch {
+            val snapshot = _uiState.value.devicePicker
+            if (!snapshot.isOpen) return@launch
+            _uiState.update {
+                it.copy(
+                    hasMediaAccess = repository.hasMediaReadAccess(),
+                    hasAllFilesAccess = repository.hasAllFilesAccess(),
+                    devicePicker = it.devicePicker.copy(isLoading = true),
+                )
+            }
+            val loadedItems = if (snapshot.browseFoldersMode) {
+                val root = deviceBrowser.getExternalStorageRoot()
+                val dir = snapshot.currentDirectoryPath?.let(::File) ?: root
+                val dirItems = if (repository.hasAllFilesAccess() || dir.canRead()) {
+                    deviceBrowser.listDeviceDirectory(dir)
+                } else {
+                    emptyList()
+                }
+                dirItems.ifEmpty {
+                    // If folder listing isn't permitted yet on scoped storage, fallback to MediaStore documents
+                    if (dir.absolutePath == root.absolutePath && !repository.hasAllFilesAccess()) {
+                        deviceBrowser.queryDeviceMedia(VaultCategory.FILES)
+                    } else {
+                        emptyList()
+                    }
+                }
+            } else {
+                deviceBrowser.queryDeviceMedia(snapshot.category)
+            }
+            _uiState.update {
+                it.copy(
+                    devicePicker = it.devicePicker.copy(
+                        isLoading = false,
+                        items = loadedItems,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun togglePickerSelection(uriString: String) {
+        _uiState.update { state ->
+            val curr = state.devicePicker.selectedUris
+            val next = if (uriString in curr) curr - uriString else curr + uriString
+            state.copy(devicePicker = state.devicePicker.copy(selectedUris = next))
+        }
+    }
+
+    fun clearPickerSelection() {
+        _uiState.update { it.copy(devicePicker = it.devicePicker.copy(selectedUris = emptySet())) }
+    }
+
+    fun closeDevicePicker() {
+        pickerLoadJob?.cancel()
+        pickerLoadJob = null
+        _uiState.update {
+            it.copy(devicePicker = VaultDevicePickerUiState())
+        }
+    }
+
+    fun moveSelectedDeviceItemsToVault() {
+        if (activeTransferJob?.isActive == true) return
+        val picker = _uiState.value.devicePicker
+        val selectedItems = picker.items.filter { !it.isDirectory && it.uriString in picker.selectedUris }
+        if (selectedItems.isEmpty()) return
+
+        _uiState.update {
+            it.copy(devicePicker = it.devicePicker.copy(isOpen = false, selectedUris = emptySet()))
+        }
+
+        activeTransferJob = viewModelScope.launch {
+            var movedCount = 0
+            var originalsDeletedCount = 0
+            val pendingDeleteMediaUris = mutableListOf<Uri>()
+            var lastCategory = picker.category
+
+            try {
+                for ((index, item) in selectedItems.withIndex()) {
+                    val uri = Uri.parse(item.uriString)
+                    var itemDeletedOriginal = false
+                    repository.moveMediaToVault(
+                        sourceUri = uri,
+                        fallbackCategory = item.category,
+                        deleteOriginal = true,
+                    ).collect { progress ->
+                        when (progress.stage) {
+                            VaultTransferStage.COMPLETED -> {
+                                movedCount++
+                                itemDeletedOriginal = progress.originalDeleted
+                                if (itemDeletedOriginal) {
+                                    originalsDeletedCount++
+                                } else {
+                                    pendingDeleteMediaUris.add(uri)
+                                }
+                                lastCategory = SafVaultRepository.classifyCategory(
+                                    progress.metadata.originalName,
+                                    progress.metadata.mimeType,
+                                )
+                            }
+                            else -> {
+                                val stepLabel = if (selectedItems.size > 1) {
+                                    "(${index + 1}/${selectedItems.size}) ${progress.metadata.originalName}"
+                                } else {
+                                    progress.metadata.originalName
+                                }
+                                _uiState.update {
+                                    it.copy(
+                                        transferState = VaultTransferUiState.Running(
+                                            progress = progress.fraction,
+                                            bytesProcessed = progress.bytesProcessed,
+                                            totalBytes = progress.totalBytes,
+                                            stage = progress.stage,
+                                            label = stepLabel,
+                                        ),
+                                        statusMessage = null,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val deleteSender = if (pendingDeleteMediaUris.isNotEmpty()) {
+                    repository.buildMediaStoreDeleteSender(pendingDeleteMediaUris)
+                } else {
+                    null
+                }
+
+                val message = when {
+                    movedCount == 0 -> "لم يتم نقل أي ملف."
+                    originalsDeletedCount == movedCount ->
+                        "تم نقل $movedCount ملف إلى الخزنة وإخفاؤه من المعرض بنجاح."
+                    deleteSender != null ->
+                        "تم نقل $movedCount ملف إلى الخزنة — أكّد حذف النسخة الأصلية من المعرض."
+                    else ->
+                        "تم حفظ $movedCount ملف داخل الخزنة (فعّل صلاحية كل الملفات لحذف الأصل تلقائياً)."
+                }
+
+                _uiState.update {
+                    it.copy(
+                        transferState = VaultTransferUiState.Idle,
+                        selectedCategory = it.selectedCategory ?: lastCategory,
+                        statusMessage = message,
+                        isErrorStatus = false,
+                        pendingMediaDeleteSender = deleteSender,
+                    )
+                }
+                refreshEntries()
+            } catch (_: CancellationException) {
+                _uiState.update {
+                    it.copy(
+                        transferState = VaultTransferUiState.Idle,
+                        statusMessage = if (movedCount > 0) {
+                            "تم نقل $movedCount ملف ثم إلغاء الباقي."
+                        } else {
+                            "تم إلغاء نقل الملفات."
+                        },
+                        isErrorStatus = false,
+                    )
+                }
+                refreshEntries()
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        transferState = VaultTransferUiState.Idle,
+                        statusMessage = t.message ?: "تعذر نقل الملفات المختارة إلى الخزنة.",
+                        isErrorStatus = true,
+                    )
+                }
+                refreshEntries()
+            }
+        }
+    }
+
+    fun consumePendingMediaDeleteSender(deletedBySystem: Boolean) {
+        _uiState.update {
+            it.copy(
+                pendingMediaDeleteSender = null,
+                statusMessage = if (deletedBySystem) {
+                    "تم نقل الملف وحذف النسخة الأصلية من المعرض بنجاح."
+                } else {
+                    it.statusMessage
+                },
+                isErrorStatus = false,
+            )
+        }
+    }
+
+    // ---- External Storage Modes & Single-URI Transfer ----
 
     fun onSafDirectorySelected(treeUri: Uri) {
         viewModelScope.launch {
@@ -238,10 +529,18 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                 progress.metadata.originalName,
                                 progress.metadata.mimeType,
                             )
-                            val msg = if (progress.originalDeleted) {
-                                "تم نقل '$label' إلى الخزنة وحمايته وإخفاؤه من المعرض."
+                            val deleteSender = if (!progress.originalDeleted) {
+                                repository.buildMediaStoreDeleteSender(listOf(sourceUri))
                             } else {
-                                "تم حفظ '$label' في الخزنة (امنح صلاحية ملفات الجهاز لنقل وحذف الأصل تلقائياً)."
+                                null
+                            }
+                            val msg = when {
+                                progress.originalDeleted ->
+                                    "تم نقل '$label' إلى الخزنة وحمايته وإخفاؤه من المعرض."
+                                deleteSender != null ->
+                                    "تم نقل '$label' إلى الخزنة — أكّد حذف الأصل من المعرض."
+                                else ->
+                                    "تم حفظ '$label' في الخزنة (فعّل صلاحية كل الملفات لحذف الأصل تلقائياً)."
                             }
                             _uiState.update {
                                 it.copy(
@@ -249,6 +548,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                     selectedCategory = it.selectedCategory ?: resolvedCategory,
                                     statusMessage = msg,
                                     isErrorStatus = false,
+                                    pendingMediaDeleteSender = deleteSender,
                                 )
                             }
                             refreshEntries()
@@ -368,5 +668,6 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         activeTransferJob?.cancel()
+        pickerLoadJob?.cancel()
     }
 }

@@ -111,6 +111,7 @@ fun VaultHomeCategoriesDashboard(
     onBack: () -> Unit,
     onLockNow: () -> Unit,
     onOpenCategory: (VaultCategory) -> Unit,
+    onRequestMediaPermission: () -> Unit,
     onRequestAllFilesAccess: () -> Unit,
     onSelectPhoneDownloads: () -> Unit,
     onSelectSafFolder: () -> Unit,
@@ -147,8 +148,10 @@ fun VaultHomeCategoriesDashboard(
 
         // Device Files Access Permission Card
         VaultFilesPermissionCard(
+            hasMediaAccess = uiState.hasMediaAccess,
             hasAllFilesAccess = uiState.hasAllFilesAccess,
-            onGrantPermission = onRequestAllFilesAccess,
+            onRequestMediaPermission = onRequestMediaPermission,
+            onGrantAllFilesPermission = onRequestAllFilesAccess,
         )
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -238,14 +241,17 @@ fun VaultHomeCategoriesDashboard(
 
 @Composable
 private fun VaultFilesPermissionCard(
+    hasMediaAccess: Boolean,
     hasAllFilesAccess: Boolean,
-    onGrantPermission: () -> Unit,
+    onRequestMediaPermission: () -> Unit,
+    onGrantAllFilesPermission: () -> Unit,
 ) {
-    val accent = if (hasAllFilesAccess) EmeraldPulse else NeonCyan
+    val fullyGranted = hasMediaAccess && hasAllFilesAccess
+    val accent = if (fullyGranted) EmeraldPulse else NeonCyan
     Surface(
         color = Color(0xFF0E1522),
         shape = RoundedCornerShape(18.dp),
-        border = BorderStroke(0.85.dp, accent.copy(alpha = if (hasAllFilesAccess) 0.48f else 0.55f)),
+        border = BorderStroke(0.85.dp, accent.copy(alpha = if (fullyGranted) 0.48f else 0.55f)),
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp),
@@ -266,7 +272,7 @@ private fun VaultFilesPermissionCard(
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
-                            imageVector = if (hasAllFilesAccess) Icons.Outlined.VerifiedUser else Icons.Outlined.Shield,
+                            imageVector = if (fullyGranted) Icons.Outlined.VerifiedUser else Icons.Outlined.Shield,
                             contentDescription = "صلاحية الوصول إلى ملفات الجهاز",
                             tint = accent,
                             modifier = Modifier.size(20.dp),
@@ -276,19 +282,22 @@ private fun VaultFilesPermissionCard(
                 Spacer(modifier = Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (hasAllFilesAccess) {
-                            "صلاحية الوصول لملفات الجهاز مفعّلة"
-                        } else {
-                            "صلاحية الوصول إلى ملفات الجهاز"
+                        text = when {
+                            fullyGranted -> "صلاحية الوصول الكاملة لملفات الجهاز مفعّلة"
+                            hasMediaAccess -> "صلاحية الوسائط مفعّلة · ينقص الوصول الكامل"
+                            else -> "صلاحية الوصول إلى ملفات الجهاز"
                         },
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                        color = if (hasAllFilesAccess) EmeraldPulse else ChromeSilver,
+                        color = if (fullyGranted) EmeraldPulse else ChromeSilver,
                     )
                     Text(
-                        text = if (hasAllFilesAccess) {
-                            "يمكن نقل وإخفاء الصور والفيديوهات داخل الخزنة مع حذف الأصل تلقائياً."
-                        } else {
-                            "امنح الصلاحية لنقل الملفات مباشرة وإخفائها من المعرض وحذف النسخة الأصلية."
+                        text = when {
+                            fullyGranted ->
+                                "يمكن تصفح جميع المجلدات ونقل وإخفاء الصور والفيديوهات وحذف الأصل تلقائياً."
+                            hasMediaAccess ->
+                                "فعّل الوصول لكل الملفات لتصفح كل مجلدات الهاتف ونقل وحذف الأصل مباشرة."
+                            else ->
+                                "اسمح للتطبيق بالوصول إلى صور وفيديوهات وملفات الهاتف لنقلها وحمايتها داخل الخزنة."
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
@@ -296,10 +305,10 @@ private fun VaultFilesPermissionCard(
                 }
             }
 
-            if (!hasAllFilesAccess) {
+            if (!hasMediaAccess) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Button(
-                    onClick = onGrantPermission,
+                    onClick = onRequestMediaPermission,
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = NeonCyan,
@@ -308,7 +317,7 @@ private fun VaultFilesPermissionCard(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(48.dp)
-                        .testTag("vault_grant_files_permission_button"),
+                        .testTag("vault_grant_media_permission_button"),
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Shield,
@@ -317,8 +326,34 @@ private fun VaultFilesPermissionCard(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "منح صلاحية الوصول للملفات",
+                        text = "السماح بالوصول لصور وفيديوهات الهاتف",
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                    )
+                }
+            }
+
+            if (!hasAllFilesAccess) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onGrantAllFilesPermission,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(0.9.dp, NeonCyan.copy(alpha = 0.65f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("vault_grant_files_permission_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.FolderOpen,
+                        contentDescription = null,
+                        tint = NeonCyan,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "منح صلاحية الوصول لكل ملفات الهاتف",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        color = ChromeSilver,
                     )
                 }
             }
@@ -1476,7 +1511,7 @@ private fun decodePhotoThumbnail(context: Context, entry: VaultFileEntry, maxDim
         return runCatching {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(localFile.absolutePath, bounds)
-            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            val longest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
             var sampleSize = 1
             while (longest / sampleSize > maxDim && sampleSize < 32) {
                 sampleSize *= 2
@@ -1491,7 +1526,7 @@ private fun decodePhotoThumbnail(context: Context, entry: VaultFileEntry, maxDim
         context.contentResolver.openInputStream(uri)?.use { stream ->
             BitmapFactory.decodeStream(stream, null, bounds)
         }
-        val longest = maxOf(bounds.outWidth, bounds.outHeight)
+        val longest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
         var sampleSize = 1
         while (longest / sampleSize > maxDim && sampleSize < 32) {
             sampleSize *= 2
