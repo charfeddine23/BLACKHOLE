@@ -28,13 +28,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -93,6 +96,8 @@ import java.io.File
 fun VaultProtectedVideoPlayer(
     session: VaultPlaybackSession,
     cipher: VaultCipher,
+    onRestore: () -> Unit,
+    onDelete: () -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -127,7 +132,9 @@ fun VaultProtectedVideoPlayer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "فيديو مشفر AES-256 داخل الخزنة · FLAG_SECURE Active",
+                subtitle = "فيديو مشفر AES-256 · FLAG_SECURE",
+                onRestore = onRestore,
+                onDelete = onDelete,
                 onClose = onClose,
             )
 
@@ -162,6 +169,8 @@ fun VaultProtectedVideoPlayer(
 fun VaultProtectedPhotoViewer(
     session: VaultPlaybackSession,
     cipher: VaultCipher,
+    onRestore: () -> Unit,
+    onDelete: () -> Unit,
     onClose: () -> Unit,
 ) {
     val imageBitmap by produceState<ImageBitmap?>(
@@ -187,7 +196,9 @@ fun VaultProtectedPhotoViewer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "صورة مشفرة AES-256 داخل الخزنة · FLAG_SECURE Active",
+                subtitle = "صورة مشفرة AES-256 · FLAG_SECURE",
+                onRestore = onRestore,
+                onDelete = onDelete,
                 onClose = onClose,
             )
 
@@ -475,12 +486,16 @@ fun VaultProtectedFileViewer(
 private fun VaultViewerHeaderBar(
     title: String,
     subtitle: String,
+    onRestore: (() -> Unit)? = null,
+    onDelete: (() -> Unit)? = null,
     onClose: () -> Unit,
 ) {
+    var confirmDelete by remember(title) { mutableStateOf(false) }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
@@ -500,33 +515,86 @@ private fun VaultViewerHeaderBar(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Spacer(modifier = Modifier.width(8.dp))
-        Surface(
-            color = CrimsonAlert.copy(alpha = 0.2f),
-            shape = RoundedCornerShape(50),
-            border = BorderStroke(0.9.dp, CrimsonAlert),
-            modifier = Modifier
-                .clip(RoundedCornerShape(50))
-                .clickable { onClose() }
-                .minimumInteractiveComponentSize()
-                .testTag("vault_close_player_button"),
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        Spacer(modifier = Modifier.width(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (onRestore != null) {
+                IconButton(
+                    onClick = onRestore,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("vault_viewer_restore_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Restore,
+                        contentDescription = "استعادة إلى الجهاز",
+                        tint = NeonCyan,
+                    )
+                }
+            }
+            if (onDelete != null) {
+                if (confirmDelete) {
+                    Surface(
+                        color = CrimsonAlert,
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable {
+                                confirmDelete = false
+                                onDelete()
+                            }
+                            .minimumInteractiveComponentSize()
+                            .testTag("vault_viewer_confirm_delete_button"),
+                    ) {
+                        Text(
+                            text = "تأكيد",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                } else {
+                    IconButton(
+                        onClick = { confirmDelete = true },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("vault_viewer_delete_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = "حذف نهائياً",
+                            tint = CrimsonAlert,
+                        )
+                    }
+                }
+            }
+            Surface(
+                color = CrimsonAlert.copy(alpha = 0.2f),
+                shape = RoundedCornerShape(50),
+                border = BorderStroke(0.9.dp, CrimsonAlert),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable { onClose() }
+                    .minimumInteractiveComponentSize()
+                    .testTag("vault_close_player_button"),
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.Close,
-                    contentDescription = "إغلاق العارض",
-                    tint = CrimsonAlert,
-                    modifier = Modifier.size(16.dp),
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "إغلاق",
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                    color = Color.White,
-                )
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "إغلاق العارض",
+                        tint = CrimsonAlert,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "إغلاق",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = Color.White,
+                    )
+                }
             }
         }
     }

@@ -5,11 +5,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.os.storage.StorageManager
-import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.Settings
 import android.view.WindowManager
@@ -44,11 +41,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.Shield
-import androidx.compose.material.icons.rounded.AddPhotoAlternate
 import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -203,29 +198,6 @@ fun VaultScreen(
         }
     }
 
-    val safFolderLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree(),
-    ) { treeUri: Uri? ->
-        vaultViewModel.endExternalSystemFlow()
-        if (treeUri != null) {
-            vaultViewModel.onSafDirectorySelected(treeUri)
-        }
-    }
-
-    val safTreeIntentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        vaultViewModel.endExternalSystemFlow()
-        val treeUri = if (result.resultCode == Activity.RESULT_OK) {
-            result.data?.data
-        } else {
-            null
-        }
-        if (treeUri != null) {
-            vaultViewModel.onSafDirectorySelected(treeUri)
-        }
-    }
-
     val mediaDeleteRequestLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
@@ -324,45 +296,6 @@ fun VaultScreen(
         }
     }
 
-    var pendingPhoneFallbackNotice by remember { mutableStateOf<String?>(null) }
-
-    val legacyWritePermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { granted: Boolean ->
-        vaultViewModel.endExternalSystemFlow()
-        val notice = pendingPhoneFallbackNotice
-        pendingPhoneFallbackNotice = null
-        if (granted) {
-            vaultViewModel.activatePhoneDownloadsVault(notice)
-        } else {
-            vaultViewModel.reportStatusError(
-                "تم رفض صلاحية الكتابة في الهاتف. سيبقى التخزين الداخلي قيد الاستخدام.",
-            )
-        }
-    }
-
-    val switchToPhoneDownloadsVault: (String?) -> Unit = { autoNotice ->
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (uiState.hasAllFilesAccess) {
-                vaultViewModel.activatePhoneDownloadsVault(autoNotice)
-            } else {
-                requestAllFilesAccess()
-            }
-        } else {
-            val granted = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE,
-            ) == PackageManager.PERMISSION_GRANTED
-            if (granted) {
-                vaultViewModel.activatePhoneDownloadsVault(autoNotice)
-            } else {
-                pendingPhoneFallbackNotice = autoNotice
-                vaultViewModel.beginExternalSystemFlow()
-                legacyWritePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            }
-        }
-    }
-
     // Open reliable built-in Device Media & Files Explorer directly inside the Vault
     val openInAppDevicePicker: (VaultCategory, Boolean) -> Unit = { category, browseFolders ->
         pendingPickCategory = category
@@ -449,64 +382,6 @@ fun VaultScreen(
         if (!launched) {
             vaultViewModel.endExternalSystemFlow()
             vaultViewModel.reportStatusError("مختار النظام غير متاح على هذا الجهاز — استخدم المتصفح المدمج بالخزنة.")
-        }
-    }
-
-    val launchSafFolderSelection: () -> Unit = {
-        vaultViewModel.beginExternalSystemFlow()
-
-        val pm = context.packageManager
-        val initialTreeHint = runCatching {
-            DocumentsContract.buildDocumentUri(
-                "com.android.externalstorage.documents",
-                "primary:Documents",
-            )
-        }.getOrNull()
-
-        val treeIntentFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
-            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
-
-        fun buildBaseTreeIntent(): Intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(treeIntentFlags)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && initialTreeHint != null) {
-                putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialTreeHint)
-            }
-        }
-
-        val baseTree = buildBaseTreeIntent()
-        val launched = when {
-            baseTree.resolveActivity(pm) != null && runCatching {
-                safFolderLauncher.launch(initialTreeHint)
-            }.isSuccess -> true
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && runCatching {
-                val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
-                val smIntent = storageManager?.primaryStorageVolume?.createOpenDocumentTreeIntent()?.apply {
-                    addFlags(treeIntentFlags)
-                } ?: return@runCatching false
-                if (smIntent.resolveActivity(pm) == null) return@runCatching false
-                safTreeIntentLauncher.launch(smIntent)
-                true
-            }.getOrDefault(false) -> true
-            buildBaseTreeIntent().setPackage("com.google.android.documentsui").resolveActivity(pm) != null && runCatching {
-                safTreeIntentLauncher.launch(
-                    buildBaseTreeIntent().setPackage("com.google.android.documentsui"),
-                )
-            }.isSuccess -> true
-            buildBaseTreeIntent().setPackage("com.android.documentsui").resolveActivity(pm) != null && runCatching {
-                safTreeIntentLauncher.launch(
-                    buildBaseTreeIntent().setPackage("com.android.documentsui"),
-                )
-            }.isSuccess -> true
-            else -> false
-        }
-
-        if (!launched) {
-            vaultViewModel.endExternalSystemFlow()
-            switchToPhoneDownloadsVault(
-                "مختار SAF غير متاح — تم تفعيل مجلد الخزنة على الهاتف تلقائياً.",
-            )
         }
     }
 
@@ -603,37 +478,6 @@ fun VaultScreen(
             .testTag("vault_screen"),
         containerColor = ObsidianVoid,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        floatingActionButton = {
-            if (!uiState.isLocked &&
-                activeCategory != null &&
-                uiState.activePlayback == null &&
-                !uiState.devicePicker.isOpen
-            ) {
-                val fabAccent = when (activeCategory) {
-                    VaultCategory.PHOTOS -> NeonCyan
-                    VaultCategory.VIDEOS -> PlasmaViolet
-                    VaultCategory.FILES -> EmeraldPulse
-                }
-                ExtendedFloatingActionButton(
-                    onClick = { openInAppDevicePicker(activeCategory, activeCategory == VaultCategory.FILES) },
-                    containerColor = fabAccent,
-                    contentColor = ObsidianVoid,
-                    modifier = Modifier
-                        .padding(bottom = safeInsets.bottom)
-                        .testTag("vault_add_video_fab"),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.AddPhotoAlternate,
-                        contentDescription = "إضافة من المعرض",
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "إضافة من المعرض",
-                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                    )
-                }
-            }
-        },
     ) { _ ->
         Box(
             modifier = Modifier
@@ -672,20 +516,15 @@ fun VaultScreen(
                 activeCategory == null -> {
                     VaultHomeCategoriesDashboard(
                         uiState = uiState,
-                        cipher = vaultViewModel.getCipher(),
                         onBack = {
                             vaultViewModel.lockVaultNow()
                             onBack()
                         },
                         onLockNow = vaultViewModel::lockVaultNow,
                         onOpenCategory = { cat -> vaultViewModel.selectCategory(cat) },
-                        onRequestMediaPermission = requestMediaAccessPermission,
                         onRequestAllFilesAccess = requestAllFilesAccess,
                         onRetryDeletePendingOriginals = vaultViewModel::retryDeletePendingOriginals,
                         onDismissPendingOriginals = vaultViewModel::dismissPendingUnremovedOriginals,
-                        onSelectPhoneDownloads = { switchToPhoneDownloadsVault(null) },
-                        onSelectSafFolder = launchSafFolderSelection,
-                        onRevertInternalStorage = vaultViewModel::revertToInternalVaultStorage,
                         onCancelTransfer = vaultViewModel::cancelActiveTransfer,
                         onDismissStatus = vaultViewModel::dismissStatus,
                     )
@@ -704,6 +543,8 @@ fun VaultScreen(
                         onOpenEntry = vaultViewModel::openEntry,
                         onRestoreEntry = vaultViewModel::restoreEntry,
                         onDeleteEntry = vaultViewModel::deleteEntry,
+                        onRestoreEntries = vaultViewModel::restoreEntries,
+                        onDeleteEntries = vaultViewModel::deleteEntries,
                         onDismissStatus = vaultViewModel::dismissStatus,
                         onRequestAllFilesAccess = requestAllFilesAccess,
                         onRetryDeletePendingOriginals = vaultViewModel::retryDeletePendingOriginals,
@@ -740,11 +581,15 @@ fun VaultScreen(
                     VaultCategory.PHOTOS -> VaultProtectedPhotoViewer(
                         session = session,
                         cipher = vaultViewModel.getCipher(),
+                        onRestore = vaultViewModel::restoreActivePlayback,
+                        onDelete = vaultViewModel::deleteActivePlayback,
                         onClose = vaultViewModel::closePlayer,
                     )
                     VaultCategory.VIDEOS -> VaultProtectedVideoPlayer(
                         session = session,
                         cipher = vaultViewModel.getCipher(),
+                        onRestore = vaultViewModel::restoreActivePlayback,
+                        onDelete = vaultViewModel::deleteActivePlayback,
                         onClose = vaultViewModel::closePlayer,
                     )
                     VaultCategory.FILES -> VaultProtectedFileViewer(

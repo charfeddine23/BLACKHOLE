@@ -761,37 +761,77 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun restoreEntry(entry: VaultFileEntry) {
+        restoreEntries(listOf(entry))
+    }
+
+    fun deleteEntry(entry: VaultFileEntry) {
+        deleteEntries(listOf(entry))
+    }
+
+    fun restoreEntries(entries: List<VaultFileEntry>) {
+        if (entries.isEmpty()) return
         viewModelScope.launch {
-            val restored = repository.restoreEntryToDevice(entry)
+            var restoredCount = 0
+            for (entry in entries) {
+                if (repository.restoreEntryToDevice(entry)) {
+                    restoredCount++
+                }
+            }
             _uiState.update {
                 it.copy(
-                    statusMessage = if (restored) {
-                        "تم فك تشفير واستعادة '${entry.displayTitle}' إلى ملفات الجهاز."
-                    } else {
-                        "تعذرت استعادة '${entry.displayTitle}'."
+                    statusMessage = when {
+                        restoredCount == entries.size && entries.size == 1 ->
+                            "تم فك تشفير واستعادة '${entries.first().displayTitle}' إلى ملفات الجهاز."
+                        restoredCount > 0 ->
+                            "تم فك تشفير واستعادة $restoredCount عنصر إلى ملفات الجهاز."
+                        else ->
+                            "تعذرت استعادة العناصر المحددة."
                     },
-                    isErrorStatus = !restored,
+                    isErrorStatus = restoredCount == 0,
                 )
             }
             refreshEntries()
         }
     }
 
-    fun deleteEntry(entry: VaultFileEntry) {
+    fun deleteEntries(entries: List<VaultFileEntry>) {
+        if (entries.isEmpty()) return
         viewModelScope.launch {
-            val deleted = repository.deleteEntry(entry)
+            var deletedCount = 0
+            for (entry in entries) {
+                if (repository.deleteEntry(entry)) {
+                    deletedCount++
+                }
+            }
             _uiState.update {
                 it.copy(
-                    statusMessage = if (deleted) {
-                        "تم حذف '${entry.displayTitle}' نهائياً من الخزنة."
-                    } else {
-                        "تعذر حذف '${entry.displayTitle}'."
+                    statusMessage = when {
+                        deletedCount == entries.size && entries.size == 1 ->
+                            "تم حذف '${entries.first().displayTitle}' نهائياً من الخزنة."
+                        deletedCount > 0 ->
+                            "تم حذف $deletedCount عنصر نهائياً من الخزنة."
+                        else ->
+                            "تعذر حذف العناصر المحددة."
                     },
-                    isErrorStatus = !deleted,
+                    isErrorStatus = deletedCount == 0,
                 )
             }
             refreshEntries()
         }
+    }
+
+    fun restoreActivePlayback() {
+        val active = _uiState.value.activePlayback ?: return
+        val matched = _uiState.value.entries.firstOrNull { it.uriString == active.uriString } ?: return
+        closePlayer()
+        restoreEntry(matched)
+    }
+
+    fun deleteActivePlayback() {
+        val active = _uiState.value.activePlayback ?: return
+        val matched = _uiState.value.entries.firstOrNull { it.uriString == active.uriString } ?: return
+        closePlayer()
+        deleteEntry(matched)
     }
 
     fun cancelActiveTransfer() {
