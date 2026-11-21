@@ -95,6 +95,8 @@ import com.example.ui.theme.PlasmaViolet
 import com.example.util.formatByteSize
 import com.example.util.formatShortDate
 import com.example.vault.data.VaultCategory
+import com.example.vault.data.VaultCipher
+import com.example.vault.data.VaultEncryptedMediaDataSource
 import com.example.vault.data.VaultFileEntry
 import com.example.vault.data.VaultStorageMode
 import com.example.vault.data.VaultTransferStage
@@ -108,11 +110,14 @@ import java.util.Locale
 @Composable
 fun VaultHomeCategoriesDashboard(
     uiState: VaultUiState,
+    cipher: VaultCipher,
     onBack: () -> Unit,
     onLockNow: () -> Unit,
     onOpenCategory: (VaultCategory) -> Unit,
     onRequestMediaPermission: () -> Unit,
     onRequestAllFilesAccess: () -> Unit,
+    onRetryDeletePendingOriginals: () -> Unit,
+    onDismissPendingOriginals: () -> Unit,
     onSelectPhoneDownloads: () -> Unit,
     onSelectSafFolder: () -> Unit,
     onRevertInternalStorage: () -> Unit,
@@ -140,7 +145,7 @@ fun VaultHomeCategoriesDashboard(
     ) {
         VaultTopHeaderBar(
             title = "BLACKHOLE VAULT",
-            subtitle = "حماية بالبصمة · .nomedia · ${uiState.entries.size} عنصر محفوظ",
+            subtitle = "تشفير AES-256 · .nomedia · ${uiState.entries.size} عنصر محفوظ",
             subtitleColor = NeonCyan,
             onBack = onBack,
             onLockNow = onLockNow,
@@ -169,6 +174,9 @@ fun VaultHomeCategoriesDashboard(
             uiState = uiState,
             onCancelTransfer = onCancelTransfer,
             onDismissStatus = onDismissStatus,
+            onRequestAllFilesAccess = onRequestAllFilesAccess,
+            onRetryDeletePendingOriginals = onRetryDeletePendingOriginals,
+            onDismissPendingOriginals = onDismissPendingOriginals,
         )
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -365,6 +373,7 @@ private fun VaultFilesPermissionCard(
 fun VaultCategoryDetailScreen(
     category: VaultCategory,
     uiState: VaultUiState,
+    cipher: VaultCipher,
     onBackToCategories: () -> Unit,
     onLockNow: () -> Unit,
     onPickFromGallery: () -> Unit,
@@ -375,6 +384,9 @@ fun VaultCategoryDetailScreen(
     onRestoreEntry: (VaultFileEntry) -> Unit,
     onDeleteEntry: (VaultFileEntry) -> Unit,
     onDismissStatus: () -> Unit,
+    onRequestAllFilesAccess: () -> Unit,
+    onRetryDeletePendingOriginals: () -> Unit,
+    onDismissPendingOriginals: () -> Unit,
 ) {
     val categoryEntries = remember(uiState.entries, category) {
         uiState.entries.filter { it.category == category }
@@ -468,6 +480,9 @@ fun VaultCategoryDetailScreen(
             uiState = uiState,
             onCancelTransfer = onCancelTransfer,
             onDismissStatus = onDismissStatus,
+            onRequestAllFilesAccess = onRequestAllFilesAccess,
+            onRetryDeletePendingOriginals = onRetryDeletePendingOriginals,
+            onDismissPendingOriginals = onDismissPendingOriginals,
         )
 
         if (category == VaultCategory.VIDEOS &&
@@ -601,6 +616,7 @@ fun VaultCategoryDetailScreen(
                 items(categoryEntries, key = { it.uriString }) { item ->
                     VaultPhotoGridCard(
                         entry = item,
+                        cipher = cipher,
                         onOpen = { onOpenEntry(item) },
                         onRestore = { onRestoreEntry(item) },
                         onDelete = { onDeleteEntry(item) },
@@ -618,6 +634,7 @@ fun VaultCategoryDetailScreen(
                 items(categoryEntries, key = { it.uriString }) { item ->
                     VaultProtectedFileCard(
                         entry = item,
+                        cipher = cipher,
                         accent = categoryAccent,
                         onOpen = { onOpenEntry(item) },
                         onRestore = { onRestoreEntry(item) },
@@ -745,15 +762,11 @@ private fun VaultStorageModeCard(
                     Text(
                         text = when (uiState.storageMode) {
                             VaultStorageMode.PHONE_DOWNLOADS ->
-                                if (uiState.hasAllFilesAccess) {
-                                    "محفوظة ومخفية داخل مجلد .BlackholeVault على الهاتف."
-                                } else {
-                                    "محفوظة في مجلد Download/BlackholeVault على الهاتف."
-                                }
+                                "مشفرة ومخفية داخل مجلد .BlackholeVault (.bhlock) على الهاتف."
                             VaultStorageMode.SAF_EXTERNAL ->
-                                "مجلد خارجي مختار (.nomedia) — يبقى حتى بعد حذف التطبيق."
+                                "مجلد خارجي مختار ومشفر (.bhlock) — يبقى حتى بعد حذف التطبيق."
                             VaultStorageMode.INTERNAL ->
-                                "التخزين الداخلي المعزول للتطبيق — مخفي عن المعرض والملفات."
+                                "خزنة معزولة ومشفرة AES-256 — مخفية تماماً عن المعرض والملفات."
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = MutedSlate,
@@ -1008,11 +1021,11 @@ private fun VaultWideCategoryTile(
 @Composable
 private fun VaultPhotoGridCard(
     entry: VaultFileEntry,
+    cipher: VaultCipher,
     onOpen: () -> Unit,
     onRestore: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    val context = LocalContext.current
     var confirmDelete by remember(entry.uriString) { mutableStateOf(false) }
 
     val thumbnailBitmap by produceState<ImageBitmap?>(
@@ -1021,7 +1034,7 @@ private fun VaultPhotoGridCard(
         entry.localFilePath,
     ) {
         value = withContext(Dispatchers.IO) {
-            decodePhotoThumbnail(context, entry, maxDim = 420)
+            decodePhotoThumbnail(cipher, entry, maxDim = 420)
         }
     }
 
@@ -1169,6 +1182,7 @@ private fun VaultPhotoGridCard(
 @Composable
 private fun VaultProtectedFileCard(
     entry: VaultFileEntry,
+    cipher: VaultCipher,
     accent: Color,
     onOpen: () -> Unit,
     onRestore: () -> Unit,
@@ -1185,7 +1199,7 @@ private fun VaultProtectedFileCard(
     ) {
         value = if (entry.category == VaultCategory.VIDEOS) {
             withContext(Dispatchers.IO) {
-                decodeVideoThumbnail(context, entry)
+                decodeVideoThumbnail(context, cipher, entry)
             }
         } else {
             null
@@ -1352,6 +1366,9 @@ private fun VaultTransferAndStatusSection(
     uiState: VaultUiState,
     onCancelTransfer: () -> Unit,
     onDismissStatus: () -> Unit,
+    onRequestAllFilesAccess: () -> Unit,
+    onRetryDeletePendingOriginals: () -> Unit,
+    onDismissPendingOriginals: () -> Unit,
 ) {
     val transfer = uiState.transferState
     if (transfer is VaultTransferUiState.Running) {
@@ -1372,9 +1389,9 @@ private fun VaultTransferAndStatusSection(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     val actionTitle = when (transfer.stage) {
-                        VaultTransferStage.PREPARING -> "تجهيز الملف للنقل..."
-                        VaultTransferStage.MOVING -> "جاري النقل إلى الخزنة: ${transfer.label}"
-                        VaultTransferStage.FINALIZING, VaultTransferStage.COMPLETED -> "تأمين الملف وإخفاء الأصل..."
+                        VaultTransferStage.PREPARING -> "تجهيز الملف للتشفير..."
+                        VaultTransferStage.MOVING -> "جاري تشفير ونقل: ${transfer.label}"
+                        VaultTransferStage.FINALIZING, VaultTransferStage.COMPLETED -> "تأمين التشفير وحذف الأصل من الهاتف..."
                     }
                     Text(
                         text = actionTitle,
@@ -1466,6 +1483,82 @@ private fun VaultTransferAndStatusSection(
             }
         }
     }
+
+    if (uiState.pendingUnremovedOriginals.isNotEmpty()) {
+        Surface(
+            color = CrimsonAlert.copy(alpha = 0.14f),
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(0.95.dp, CrimsonAlert.copy(alpha = 0.65f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .testTag("vault_pending_originals_card"),
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "نسخ أصلية ما زالت على الهاتف (${uiState.pendingUnremovedOriginals.size})",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        color = CrimsonAlert,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(
+                        onClick = onDismissPendingOriginals,
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "تجاهل",
+                            tint = MutedSlate,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (!uiState.hasAllFilesAccess) {
+                        "لتشفير وحذف الأصل من الهاتف كلياً، فعّل صلاحية \"كل الملفات\" وسيتم الحذف تلقائياً فور عودتك."
+                    } else {
+                        "الصلاحية مفعّلة الآن — اضغط لحذف النسخ الأصلية المتبقية من الهاتف نهائياً."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ChromeSilver,
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        if (!uiState.hasAllFilesAccess) {
+                            onRequestAllFilesAccess()
+                        } else {
+                            onRetryDeletePendingOriginals()
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CrimsonAlert,
+                        contentColor = Color.White,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("vault_fix_pending_originals_button"),
+                ) {
+                    Text(
+                        text = if (!uiState.hasAllFilesAccess) {
+                            "تفعيل صلاحية كل الملفات وحذف الأصل الآن"
+                        } else {
+                            "حذف النسخ الأصلية من الهاتف الآن"
+                        },
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1505,25 +1598,18 @@ private fun VaultStorageChip(
     }
 }
 
-private fun decodePhotoThumbnail(context: Context, entry: VaultFileEntry, maxDim: Int): ImageBitmap? {
+private fun decodePhotoThumbnail(cipher: VaultCipher, entry: VaultFileEntry, maxDim: Int): ImageBitmap? {
     val localFile = entry.localFilePath?.let(::File)?.takeIf { it.exists() }
-    if (localFile != null) {
-        return runCatching {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(localFile.absolutePath, bounds)
-            val longest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
-            var sampleSize = 1
-            while (longest / sampleSize > maxDim && sampleSize < 32) {
-                sampleSize *= 2
-            }
-            val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            BitmapFactory.decodeFile(localFile.absolutePath, opts)?.asImageBitmap()
-        }.getOrNull()
-    }
     val uri = Uri.parse(entry.uriString)
+    fun openStream() = if (localFile != null) {
+        cipher.openDecryptedInputStream(localFile)
+    } else {
+        cipher.openDecryptedInputStream(uri)
+    }
+
     return runCatching {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(uri)?.use { stream ->
+        openStream().use { stream ->
             BitmapFactory.decodeStream(stream, null, bounds)
         }
         val longest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
@@ -1532,21 +1618,27 @@ private fun decodePhotoThumbnail(context: Context, entry: VaultFileEntry, maxDim
             sampleSize *= 2
         }
         val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-        context.contentResolver.openInputStream(uri)?.use { stream ->
+        openStream().use { stream ->
             BitmapFactory.decodeStream(stream, null, opts)?.asImageBitmap()
         }
     }.getOrNull()
 }
 
-private fun decodeVideoThumbnail(context: Context, entry: VaultFileEntry): ImageBitmap? {
+private fun decodeVideoThumbnail(
+    context: Context,
+    cipher: VaultCipher,
+    entry: VaultFileEntry,
+): ImageBitmap? {
     val retriever = MediaMetadataRetriever()
     return try {
-        val localPath = entry.localFilePath?.takeIf { File(it).exists() }
-        if (localPath != null) {
-            retriever.setDataSource(localPath)
-        } else {
-            retriever.setDataSource(context, Uri.parse(entry.uriString))
-        }
+        val localFile = entry.localFilePath?.let(::File)?.takeIf { it.exists() }
+        val dataSource = VaultEncryptedMediaDataSource(
+            context = context.applicationContext,
+            cipher = cipher,
+            localFile = localFile,
+            uri = Uri.parse(entry.uriString),
+        )
+        retriever.setDataSource(dataSource)
         val frame = retriever.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
             ?: retriever.getFrameAtTime(0L)
         frame?.asImageBitmap()

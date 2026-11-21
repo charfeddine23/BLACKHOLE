@@ -342,8 +342,12 @@ fun VaultScreen(
     }
 
     val switchToPhoneDownloadsVault: (String?) -> Unit = { autoNotice ->
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            vaultViewModel.activatePhoneDownloadsVault(autoNotice)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (uiState.hasAllFilesAccess) {
+                vaultViewModel.activatePhoneDownloadsVault(autoNotice)
+            } else {
+                requestAllFilesAccess()
+            }
         } else {
             val granted = ContextCompat.checkSelfPermission(
                 context,
@@ -668,6 +672,7 @@ fun VaultScreen(
                 activeCategory == null -> {
                     VaultHomeCategoriesDashboard(
                         uiState = uiState,
+                        cipher = vaultViewModel.getCipher(),
                         onBack = {
                             vaultViewModel.lockVaultNow()
                             onBack()
@@ -676,6 +681,8 @@ fun VaultScreen(
                         onOpenCategory = { cat -> vaultViewModel.selectCategory(cat) },
                         onRequestMediaPermission = requestMediaAccessPermission,
                         onRequestAllFilesAccess = requestAllFilesAccess,
+                        onRetryDeletePendingOriginals = vaultViewModel::retryDeletePendingOriginals,
+                        onDismissPendingOriginals = vaultViewModel::dismissPendingUnremovedOriginals,
                         onSelectPhoneDownloads = { switchToPhoneDownloadsVault(null) },
                         onSelectSafFolder = launchSafFolderSelection,
                         onRevertInternalStorage = vaultViewModel::revertToInternalVaultStorage,
@@ -687,6 +694,7 @@ fun VaultScreen(
                     VaultCategoryDetailScreen(
                         category = activeCategory,
                         uiState = uiState,
+                        cipher = vaultViewModel.getCipher(),
                         onBackToCategories = { vaultViewModel.selectCategory(null) },
                         onLockNow = vaultViewModel::lockVaultNow,
                         onPickFromGallery = { openInAppDevicePicker(activeCategory, false) },
@@ -697,6 +705,9 @@ fun VaultScreen(
                         onRestoreEntry = vaultViewModel::restoreEntry,
                         onDeleteEntry = vaultViewModel::deleteEntry,
                         onDismissStatus = vaultViewModel::dismissStatus,
+                        onRequestAllFilesAccess = requestAllFilesAccess,
+                        onRetryDeletePendingOriginals = vaultViewModel::retryDeletePendingOriginals,
+                        onDismissPendingOriginals = vaultViewModel::dismissPendingUnremovedOriginals,
                     )
                 }
             }
@@ -728,14 +739,17 @@ fun VaultScreen(
                 when (session.category) {
                     VaultCategory.PHOTOS -> VaultProtectedPhotoViewer(
                         session = session,
+                        cipher = vaultViewModel.getCipher(),
                         onClose = vaultViewModel::closePlayer,
                     )
                     VaultCategory.VIDEOS -> VaultProtectedVideoPlayer(
                         session = session,
+                        cipher = vaultViewModel.getCipher(),
                         onClose = vaultViewModel::closePlayer,
                     )
                     VaultCategory.FILES -> VaultProtectedFileViewer(
                         session = session,
+                        cipher = vaultViewModel.getCipher(),
                         onBeforeExternalOpen = vaultViewModel::beginExternalSystemFlow,
                         onReportOpenError = vaultViewModel::reportStatusError,
                         onClose = vaultViewModel::closePlayer,

@@ -235,7 +235,7 @@ fun VaultDevicePickerSheet(
             }
 
             // Permission Banner if missing
-            if (!hasMediaAccess || (!hasAllFilesAccess && pickerState.browseFoldersMode)) {
+            if (!hasMediaAccess || !hasAllFilesAccess) {
                 Surface(
                     color = Color(0xFF101928),
                     shape = RoundedCornerShape(16.dp),
@@ -257,7 +257,7 @@ fun VaultDevicePickerSheet(
                                 text = if (!hasMediaAccess) {
                                     "السماح بالوصول إلى صور وفيديوهات وملفات الهاتف لعرضها هنا."
                                 } else {
-                                    "فعّل صلاحية كل الملفات لتصفح جميع المجلدات وحذف الأصل تلقائياً."
+                                    "فعّل صلاحية كل الملفات ليُشفّر الملف ويختفي من الهاتف نهائياً فور نقله."
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ChromeSilver,
@@ -282,7 +282,7 @@ fun VaultDevicePickerSheet(
                                 text = if (!hasMediaAccess) {
                                     "السماح بالوصول لملفات الهاتف"
                                 } else {
-                                    "تفعيل الوصول لكل المجلدات"
+                                    "تفعيل صلاحية كل الملفات (حذف الأصل تلقائياً)"
                                 },
                                 style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
                             )

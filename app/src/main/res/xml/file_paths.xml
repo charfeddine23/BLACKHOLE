@@ -5,4 +5,5 @@
     <files-path name="blackhole_vault" path="blackhole_vault/" />
     <external-files-path name="external_movies" path="Movies/" />
     <external-path name="external_vault" path=".BlackholeVault/" />
+    <cache-path name="vault_export_temp" path="vault_export_temp/" />
 </paths>

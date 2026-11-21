@@ -145,7 +145,9 @@ class DeviceMediaBrowser(context: Context) {
                 file.isFile &&
                     file.length() > 0L &&
                     !file.name.startsWith(".") &&
-                    !file.name.equals(".nomedia", ignoreCase = true)
+                    !file.name.equals(".nomedia", ignoreCase = true) &&
+                    !file.name.endsWith(VaultCipher.ENCRYPTED_VAULT_EXT, ignoreCase = true) &&
+                    !file.name.endsWith(".tmp", ignoreCase = true)
             }
             .sortedByDescending { it.lastModified() }
             .map { file ->
@@ -383,6 +385,7 @@ class DeviceMediaBrowser(context: Context) {
     private fun isInsideVaultPath(path: String): Boolean {
         return path.contains("/.BlackholeVault/", ignoreCase = true) ||
             path.contains("/BlackholeVault/", ignoreCase = true) ||
-            path.contains("/blackhole_vault/", ignoreCase = true)
+            path.contains("/blackhole_vault/", ignoreCase = true) ||
+            path.endsWith(VaultCipher.ENCRYPTED_VAULT_EXT, ignoreCase = true)
     }
 }
