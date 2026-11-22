@@ -4,7 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
-import android.os.Environment
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.tween
@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -38,6 +40,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -63,13 +66,20 @@ import com.example.ui.screens.BlackholeScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.VaultScreen
 import com.example.ui.screens.buildAllFilesAccessSettingIntents
+import com.example.ui.screens.buildAppDetailsSettingIntents
 import com.example.ui.screens.launchSystemSettingsCandidates
+import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ChromeSilver
+import com.example.ui.theme.EmeraldPulse
 import com.example.ui.theme.GlassStrokeBright
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.viewmodel.BlackholeViewModel
+import com.example.util.buildMediaPermissionsForSdk
+import com.example.util.hasAnyMissingPermissionRationale
+import com.example.util.hasStoragePermission
+import com.example.util.hasStrictMediaPermission
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -90,17 +100,53 @@ fun BlackholeNavGraph(
     val appPrefs = remember(context) { AppPreferences.getInstance(context) }
     val navController = rememberNavController()
 
-    var showAllFilesStartupPrompt by remember { mutableStateOf(false) }
+    var hasMediaAccess by remember { mutableStateOf(hasStrictMediaPermission(context)) }
+    var hasStorageAccess by remember { mutableStateOf(hasStoragePermission(context)) }
+    var showMediaStoragePrompt by remember { mutableStateOf(false) }
+    var lastMediaPromptMs by remember { mutableLongStateOf(0L) }
+
+    val refreshPermissionsState = {
+        hasMediaAccess = hasStrictMediaPermission(context)
+        hasStorageAccess = hasStoragePermission(context)
+        if (hasMediaAccess && hasStorageAccess) {
+            appPrefs.markMediaStorageSetupPrompted()
+            showMediaStoragePrompt = false
+        }
+    }
+
+    val mediaOnlyPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        refreshPermissionsState()
+        if (!hasMediaAccess) {
+            val elapsed = SystemClock.elapsedRealtime() - lastMediaPromptMs
+            val mediaPerms = buildMediaPermissionsForSdk()
+            val canShowRationale = hasAnyMissingPermissionRationale(context, mediaPerms)
+            if (elapsed in 0L..450L || !canShowRationale) {
+                launchSystemSettingsCandidates(
+                    context,
+                    buildAppDetailsSettingIntents(context.packageName),
+                )
+            }
+        } else if (!hasStorageAccess && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            launchSystemSettingsCandidates(
+                context,
+                buildAllFilesAccessSettingIntents(context.packageName),
+            )
+        }
+    }
 
     val startupPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
     ) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            showAllFilesStartupPrompt = true
+        refreshPermissionsState()
+        if (!hasMediaAccess || !hasStorageAccess) {
+            showMediaStoragePrompt = true
         }
     }
 
     LaunchedEffect(Unit) {
+        refreshPermissionsState()
         if (!appPrefs.hasRequestedStartupPermissions()) {
             appPrefs.markStartupPermissionsRequested()
             val missing = buildMissingStartupRuntimePermissions(context)
@@ -109,22 +155,21 @@ fun BlackholeNavGraph(
                     startupPermissionsLauncher.launch(missing)
                     true
                 }.getOrDefault(false)
-                if (!launched && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-                    showAllFilesStartupPrompt = true
+                if (!launched && (!hasMediaAccess || !hasStorageAccess)) {
+                    showMediaStoragePrompt = true
                 }
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-                showAllFilesStartupPrompt = true
+            } else if (!hasMediaAccess || !hasStorageAccess) {
+                showMediaStoragePrompt = true
             }
+        } else if ((!hasMediaAccess || !hasStorageAccess) && !appPrefs.hasPromptedMediaStorageSetup()) {
+            showMediaStoragePrompt = true
         }
     }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME &&
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                Environment.isExternalStorageManager()
-            ) {
-                showAllFilesStartupPrompt = false
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshPermissionsState()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -176,7 +221,7 @@ fun BlackholeNavGraph(
             }
         }
 
-        if (showAllFilesStartupPrompt) {
+        if (showMediaStoragePrompt && (!hasMediaAccess || !hasStorageAccess)) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -206,7 +251,7 @@ fun BlackholeNavGraph(
                             Box(contentAlignment = Alignment.Center) {
                                 Icon(
                                     imageVector = Icons.Outlined.Shield,
-                                    contentDescription = "صلاحيات التشغيل",
+                                    contentDescription = "صلاحيات الوسائط والتخزين",
                                     tint = NeonCyan,
                                     modifier = Modifier.size(28.dp),
                                 )
@@ -214,25 +259,40 @@ fun BlackholeNavGraph(
                         }
                         Spacer(modifier = Modifier.height(14.dp))
                         Text(
-                            text = "تفعيل صلاحية إدارة كل الملفات",
+                            text = "منح صلاحية Media & Storage",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = ChromeSilver,
                             textAlign = TextAlign.Center,
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "مطلوبة لتشغيل الخزنة، وحفظ التنزيلات، وإخفاء الفيديوهات والصور من الهاتف بسلاسة.",
+                            text = "مطلوبة لتشغيل الخزنة، وحفظ الفيديوهات في المعرض، وإخفاء الملفات من الهاتف بسلاسة.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MutedSlate,
                             textAlign = TextAlign.Center,
                         )
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        StartupPermissionStatusPill(
+                            label = "صلاحية الوسائط (Media)",
+                            granted = hasMediaAccess,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        StartupPermissionStatusPill(
+                            label = "صلاحية التخزين وإدارة كل الملفات (Storage)",
+                            granted = hasStorageAccess,
+                        )
+
                         Spacer(modifier = Modifier.height(18.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
                             OutlinedButton(
-                                onClick = { showAllFilesStartupPrompt = false },
+                                onClick = {
+                                    appPrefs.markMediaStorageSetupPrompted()
+                                    showMediaStoragePrompt = false
+                                },
                                 shape = RoundedCornerShape(14.dp),
                                 border = BorderStroke(0.85.dp, GlassStrokeBright.copy(alpha = 0.35f)),
                                 modifier = Modifier
@@ -244,11 +304,30 @@ fun BlackholeNavGraph(
                             }
                             Button(
                                 onClick = {
-                                    showAllFilesStartupPrompt = false
-                                    launchSystemSettingsCandidates(
-                                        context,
-                                        buildAllFilesAccessSettingIntents(context.packageName),
-                                    )
+                                    appPrefs.markMediaStorageSetupPrompted()
+                                    if (!hasMediaAccess) {
+                                        lastMediaPromptMs = SystemClock.elapsedRealtime()
+                                        val launched = runCatching {
+                                            mediaOnlyPermissionLauncher.launch(buildMediaPermissionsForSdk())
+                                            true
+                                        }.getOrDefault(false)
+                                        if (!launched) {
+                                            launchSystemSettingsCandidates(
+                                                context,
+                                                buildAppDetailsSettingIntents(context.packageName),
+                                            )
+                                        }
+                                    } else if (!hasStorageAccess) {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                            launchSystemSettingsCandidates(
+                                                context,
+                                                buildAllFilesAccessSettingIntents(context.packageName),
+                                            )
+                                        } else {
+                                            lastMediaPromptMs = SystemClock.elapsedRealtime()
+                                            mediaOnlyPermissionLauncher.launch(buildMediaPermissionsForSdk())
+                                        }
+                                    }
                                 },
                                 shape = RoundedCornerShape(14.dp),
                                 colors = ButtonDefaults.buttonColors(
@@ -261,7 +340,7 @@ fun BlackholeNavGraph(
                                     .testTag("startup_all_files_grant_button"),
                             ) {
                                 Text(
-                                    text = "تفعيل الآن",
+                                    text = if (!hasMediaAccess) "منح Media الآن" else "تفعيل Storage",
                                     style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
                                 )
                             }
@@ -273,30 +352,54 @@ fun BlackholeNavGraph(
     }
 }
 
+@Composable
+private fun StartupPermissionStatusPill(
+    label: String,
+    granted: Boolean,
+) {
+    val accent = if (granted) EmeraldPulse else AmberWarning
+    Surface(
+        color = accent.copy(alpha = 0.1f),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(0.75.dp, accent.copy(alpha = 0.4f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = ChromeSilver,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = if (granted) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                    contentDescription = if (granted) "مفعّلة" else "غير مفعّلة",
+                    tint = accent,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = if (granted) "مفعّلة" else "مطلوبة",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = accent,
+                )
+            }
+        }
+    }
+}
+
 internal fun buildMissingStartupRuntimePermissions(context: Context): Array<String> {
     val required = mutableListOf<String>()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         required += Manifest.permission.POST_NOTIFICATIONS
     }
-    when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> {
-            required += Manifest.permission.READ_MEDIA_IMAGES
-            required += Manifest.permission.READ_MEDIA_VIDEO
-            required += Manifest.permission.READ_MEDIA_AUDIO
-            required += Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
-        }
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
-            required += Manifest.permission.READ_MEDIA_IMAGES
-            required += Manifest.permission.READ_MEDIA_VIDEO
-            required += Manifest.permission.READ_MEDIA_AUDIO
-        }
-        else -> {
-            required += Manifest.permission.READ_EXTERNAL_STORAGE
-            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
-                required += Manifest.permission.WRITE_EXTERNAL_STORAGE
-            }
-        }
-    }
+    required += buildMediaPermissionsForSdk()
     return required.filter { perm ->
         ContextCompat.checkSelfPermission(context, perm) != PackageManager.PERMISSION_GRANTED
     }.toTypedArray()

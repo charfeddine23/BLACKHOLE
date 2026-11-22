@@ -20,11 +20,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
-import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.NoPhotography
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.ScreenshotMonitor
-import androidx.compose.material.icons.outlined.SdStorage
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Lock
@@ -58,7 +56,6 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
-import com.example.vault.data.VaultStorageMode
 import com.example.vault.ui.VaultUiState
 
 @Composable
@@ -70,8 +67,6 @@ fun VaultSettingsOverlay(
     onRequestMediaPermission: () -> Unit,
     onRequestAllFilesAccess: () -> Unit,
     onSelectInternalStorage: () -> Unit,
-    onSelectPhoneHiddenStorage: () -> Unit,
-    onSelectExternalSafStorage: () -> Unit,
     onDismissStatus: () -> Unit,
     onClose: () -> Unit,
 ) {
@@ -353,29 +348,9 @@ fun VaultSettingsOverlay(
                     subtitle = "مخفية كلياً داخل مساحة التطبيق ومشفرة بـ AES-256.",
                     icon = Icons.Rounded.Lock,
                     accent = NeonCyan,
-                    selected = uiState.storageMode == VaultStorageMode.INTERNAL,
+                    selected = true,
                     onClick = onSelectInternalStorage,
                     testTag = "vault_storage_internal",
-                )
-
-                VaultStorageOptionCard(
-                    title = "مجلد الهاتف المخفي (.BlackholeVault)",
-                    subtitle = "مجلد مخفي في وحدة التخزين (يتطلب صلاحية كل الملفات).",
-                    icon = Icons.Outlined.SdStorage,
-                    accent = PlasmaViolet,
-                    selected = uiState.storageMode == VaultStorageMode.PHONE_DOWNLOADS,
-                    onClick = onSelectPhoneHiddenStorage,
-                    testTag = "vault_storage_phone_hidden",
-                )
-
-                VaultStorageOptionCard(
-                    title = "مجلد خارجي مخصص (SAF)",
-                    subtitle = "تبقى الملفات المشفرة (.bhlock) حتى بعد إلغاء تثبيت التطبيق.",
-                    icon = Icons.Outlined.FolderOpen,
-                    accent = EmeraldPulse,
-                    selected = uiState.storageMode == VaultStorageMode.SAF_EXTERNAL,
-                    onClick = onSelectExternalSafStorage,
-                    testTag = "vault_storage_external_saf",
                 )
 
                 Spacer(modifier = Modifier.height(20.dp))

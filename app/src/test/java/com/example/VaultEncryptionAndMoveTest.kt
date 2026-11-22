@@ -264,5 +264,30 @@ class VaultEncryptionAndMoveTest {
 
         appPrefs.markStartupPermissionsRequested()
         assertTrue(appPrefs.hasRequestedStartupPermissions())
+
+        assertFalse(appPrefs.hasPromptedMediaStorageSetup())
+        appPrefs.markMediaStorageSetupPrompted()
+        assertTrue(appPrefs.hasPromptedMediaStorageSetup())
+    }
+
+    @Test
+    fun `media and storage permission helpers reflect granted permissions accurately`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val perms = com.example.util.buildMediaPermissionsForSdk().toSet()
+        assertTrue(perms.contains(Manifest.permission.READ_MEDIA_IMAGES))
+        assertTrue(perms.contains(Manifest.permission.READ_MEDIA_VIDEO))
+        assertTrue(perms.contains(Manifest.permission.READ_MEDIA_AUDIO))
+        assertTrue(perms.contains(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED))
+
+        assertFalse(com.example.util.hasStrictMediaPermission(context))
+        assertFalse(com.example.util.hasAllMediaAndStoragePermissions(context))
+
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        shadowApp.grantPermissions(
+            Manifest.permission.READ_MEDIA_IMAGES,
+            Manifest.permission.READ_MEDIA_VIDEO,
+        )
+        assertTrue(com.example.util.hasStrictMediaPermission(context))
     }
 }

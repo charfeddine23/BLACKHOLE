@@ -1,6 +1,10 @@
 package com.example.ui.screens
 
+import android.os.Build
+import android.os.SystemClock
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -22,13 +26,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.NoPhotography
+import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.ScreenshotMonitor
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -36,6 +45,12 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,9 +58,14 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.BuildConfig
 import com.example.ui.components.rememberSafeScreenInsets
 import com.example.ui.theme.AmberWarning
@@ -56,6 +76,10 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
+import com.example.util.buildMediaPermissionsForSdk
+import com.example.util.hasAnyMissingPermissionRationale
+import com.example.util.hasStoragePermission
+import com.example.util.hasStrictMediaPermission
 
 @Composable
 fun SettingsScreen(
@@ -65,6 +89,70 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     BackHandler(onBack = onBack)
+
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var hasMediaAccess by remember { mutableStateOf(hasStrictMediaPermission(context)) }
+    var hasStorageAccess by remember { mutableStateOf(hasStoragePermission(context)) }
+    var lastPermissionPromptMs by remember { mutableLongStateOf(0L) }
+
+    val refreshPermissions = {
+        hasMediaAccess = hasStrictMediaPermission(context)
+        hasStorageAccess = hasStoragePermission(context)
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshPermissions()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val mediaPermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        refreshPermissions()
+        if (!hasMediaAccess) {
+            val elapsed = SystemClock.elapsedRealtime() - lastPermissionPromptMs
+            val perms = buildMediaPermissionsForSdk()
+            val canShowRationale = hasAnyMissingPermissionRationale(context, perms)
+            if (elapsed in 0L..500L || !canShowRationale) {
+                launchSystemSettingsCandidates(
+                    context,
+                    buildAppDetailsSettingIntents(context.packageName),
+                )
+            }
+        }
+    }
+
+    val requestMediaPermission: () -> Unit = {
+        lastPermissionPromptMs = SystemClock.elapsedRealtime()
+        val perms = buildMediaPermissionsForSdk()
+        val launched = runCatching {
+            mediaPermissionsLauncher.launch(perms)
+            true
+        }.getOrDefault(false)
+        if (!launched) {
+            launchSystemSettingsCandidates(
+                context,
+                buildAppDetailsSettingIntents(context.packageName),
+            )
+        }
+    }
+
+    val requestStoragePermission: () -> Unit = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            launchSystemSettingsCandidates(
+                context,
+                buildAllFilesAccessSettingIntents(context.packageName),
+            )
+        } else {
+            requestMediaPermission()
+        }
+    }
 
     val safeInsets = rememberSafeScreenInsets(cutoutExtraTop = 8.dp, minTop = 36.dp, minBottom = 16.dp)
 
@@ -128,7 +216,7 @@ fun SettingsScreen(
                             color = ChromeSilver,
                         )
                         Text(
-                            text = "إعدادات الخصوصية والحماية",
+                            text = "إعدادات الخصوصية والصلاحيات",
                             style = MaterialTheme.typography.labelSmall,
                             color = NeonCyan,
                         )
@@ -143,6 +231,43 @@ fun SettingsScreen(
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
+                    Text(
+                        text = "صلاحيات الوسائط والتخزين (Media & Storage)",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        color = MutedSlate,
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+
+                    SettingsPermissionCard(
+                        title = "صلاحية الوسائط (Media)",
+                        description = if (hasMediaAccess) {
+                            "مفعّلة — وصول كامل للصور والفيديوهات والصوتيات."
+                        } else {
+                            "مطلوبة لعرض واستيراد الصور والفيديوهات من المعرض."
+                        },
+                        icon = Icons.Outlined.PhotoLibrary,
+                        granted = hasMediaAccess,
+                        actionLabel = if (hasMediaAccess) "مفعّلة" else "منح الصلاحية",
+                        onAction = requestMediaPermission,
+                        testTag = "settings_media_permission_card",
+                    )
+
+                    SettingsPermissionCard(
+                        title = "صلاحية التخزين (Storage)",
+                        description = if (hasStorageAccess) {
+                            "مفعّلة — حفظ التنزيلات وإدارة الملفات وإخفاء الأصل من الهاتف."
+                        } else {
+                            "مطلوبة لإدارة الملفات وإخفاء الأصل من الهاتف تلقائياً."
+                        },
+                        icon = Icons.Outlined.FolderOpen,
+                        granted = hasStorageAccess,
+                        actionLabel = if (hasStorageAccess) "إدارة" else "تفعيل",
+                        onAction = requestStoragePermission,
+                        testTag = "settings_storage_permission_card",
+                    )
+
+                    Spacer(modifier = Modifier.height(2.dp))
+
                     Text(
                         text = "الحماية والخصوصية",
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
@@ -286,6 +411,100 @@ fun SettingsScreen(
                             color = MutedSlate,
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsPermissionCard(
+    title: String,
+    description: String,
+    icon: ImageVector,
+    granted: Boolean,
+    actionLabel: String,
+    onAction: () -> Unit,
+    testTag: String,
+) {
+    val accent = if (granted) EmeraldPulse else AmberWarning
+    Surface(
+        color = Color(0xFF0E1522),
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(0.9.dp, accent.copy(alpha = 0.42f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(testTag),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f),
+            ) {
+                Surface(
+                    color = accent.copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(0.8.dp, accent.copy(alpha = 0.5f)),
+                    modifier = Modifier.size(44.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = title,
+                            tint = accent,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = ChromeSilver,
+                    )
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        text = description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MutedSlate,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            if (granted) {
+                OutlinedButton(
+                    onClick = onAction,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(0.85.dp, EmeraldPulse.copy(alpha = 0.55f)),
+                    modifier = Modifier.minimumInteractiveComponentSize(),
+                ) {
+                    Text(
+                        text = actionLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = EmeraldPulse,
+                    )
+                }
+            } else {
+                Button(
+                    onClick = onAction,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = AmberWarning,
+                        contentColor = ObsidianVoid,
+                    ),
+                    modifier = Modifier.minimumInteractiveComponentSize(),
+                ) {
+                    Text(
+                        text = actionLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    )
                 }
             }
         }

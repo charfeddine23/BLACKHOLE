@@ -34,10 +34,19 @@ class AppPreferences private constructor(context: Context) {
         prefs.edit().putBoolean(KEY_STARTUP_PERMISSIONS_REQUESTED, true).apply()
     }
 
+    fun hasPromptedMediaStorageSetup(): Boolean {
+        return prefs.getBoolean(KEY_MEDIA_STORAGE_SETUP_PROMPTED, false)
+    }
+
+    fun markMediaStorageSetupPrompted() {
+        prefs.edit().putBoolean(KEY_MEDIA_STORAGE_SETUP_PROMPTED, true).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "blackhole_app_settings"
         private const val KEY_NO_SCREENSHOT_ENABLED = "no_screenshot_enabled"
         private const val KEY_STARTUP_PERMISSIONS_REQUESTED = "startup_permissions_requested"
+        private const val KEY_MEDIA_STORAGE_SETUP_PROMPTED = "media_storage_setup_prompted_v2"
 
         @Volatile
         private var instance: AppPreferences? = null

@@ -1,6 +1,5 @@
 package com.example.ui.screens
 
-import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
@@ -166,15 +165,6 @@ fun VaultScreen(
 
     var pendingPickCategory by remember { mutableStateOf(VaultCategory.VIDEOS) }
 
-    val safFolderLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree(),
-    ) { treeUri: Uri? ->
-        vaultViewModel.endExternalSystemFlow()
-        if (treeUri != null) {
-            vaultViewModel.onSafDirectorySelected(treeUri)
-        }
-    }
-
     val openDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { selectedUri: Uri? ->
@@ -258,7 +248,9 @@ fun VaultScreen(
         val anyGranted = grants.values.any { it }
         if (!anyGranted && !uiState.hasAllFilesAccess) {
             val elapsed = android.os.SystemClock.elapsedRealtime() - lastPermissionPromptMs
-            if (elapsed in 0L..350L) {
+            val perms = com.example.util.buildMediaPermissionsForSdk()
+            val canShowRationale = com.example.util.hasAnyMissingPermissionRationale(context, perms)
+            if (elapsed in 0L..500L || !canShowRationale) {
                 // OS suppressed permission dialog ("Don't ask again") -> open App Settings directly
                 openAppPermissionDetails()
             } else {
@@ -270,23 +262,7 @@ fun VaultScreen(
     val requestMediaAccessPermission: () -> Unit = {
         vaultViewModel.beginExternalSystemFlow()
         lastPermissionPromptMs = android.os.SystemClock.elapsedRealtime()
-        val perms = when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> arrayOf(
-                Manifest.permission.READ_MEDIA_IMAGES,
-                Manifest.permission.READ_MEDIA_VIDEO,
-                Manifest.permission.READ_MEDIA_AUDIO,
-                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
-            )
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
-                Manifest.permission.READ_MEDIA_IMAGES,
-                Manifest.permission.READ_MEDIA_VIDEO,
-                Manifest.permission.READ_MEDIA_AUDIO,
-            )
-            else -> arrayOf(
-                Manifest.permission.READ_EXTERNAL_STORAGE,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE,
-            )
-        }
+        val perms = com.example.util.buildMediaPermissionsForSdk()
         val launched = runCatching {
             runtimeMediaPermissionsLauncher.launch(perms)
             true
@@ -587,20 +563,6 @@ fun VaultScreen(
                     onRequestMediaPermission = requestMediaAccessPermission,
                     onRequestAllFilesAccess = requestAllFilesAccess,
                     onSelectInternalStorage = vaultViewModel::revertToInternalVaultStorage,
-                    onSelectPhoneHiddenStorage = {
-                        vaultViewModel.activatePhoneDownloadsVault()
-                    },
-                    onSelectExternalSafStorage = {
-                        vaultViewModel.beginExternalSystemFlow()
-                        val launched = runCatching {
-                            safFolderLauncher.launch(null)
-                            true
-                        }.getOrDefault(false)
-                        if (!launched) {
-                            vaultViewModel.endExternalSystemFlow()
-                            vaultViewModel.reportStatusError("مختار المجلدات غير متاح على هذا الجهاز.")
-                        }
-                    },
                     onDismissStatus = vaultViewModel::dismissStatus,
                     onClose = { showVaultSettings = false },
                 )

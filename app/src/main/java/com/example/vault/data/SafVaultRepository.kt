@@ -260,19 +260,6 @@ class SafVaultRepository(
     }
 
     private fun getActiveStorageModeBlocking(): VaultStorageMode {
-        val savedMode = getPrefs().getString(KEY_STORAGE_MODE, null)
-        if (savedMode == VaultStorageMode.PHONE_DOWNLOADS.name && hasAllFilesAccess()) {
-            return VaultStorageMode.PHONE_DOWNLOADS
-        }
-        if (savedMode == VaultStorageMode.SAF_EXTERNAL.name && getSafTreeUriBlocking() != null) {
-            return VaultStorageMode.SAF_EXTERNAL
-        }
-        if (savedMode == VaultStorageMode.INTERNAL.name) {
-            return VaultStorageMode.INTERNAL
-        }
-        if (savedMode == null && getSafTreeUriBlocking() != null) {
-            return VaultStorageMode.SAF_EXTERNAL
-        }
         return VaultStorageMode.INTERNAL
     }
 

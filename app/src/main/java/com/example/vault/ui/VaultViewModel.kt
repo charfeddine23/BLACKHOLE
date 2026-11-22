@@ -586,42 +586,13 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---- External Storage Modes & Single-URI Transfer ----
-
-    fun onSafDirectorySelected(treeUri: Uri) {
-        viewModelScope.launch {
-            val persisted = runCatching { repository.persistSafTreeUri(treeUri) }.getOrDefault(false)
-            refreshStorageAndPermissionState(
-                noticeMessage = if (persisted) {
-                    "تم ربط المجلد الخارجي المشفر (.bhlock) لاستمرار ملفاتك المحمية حتى بعد حذف التطبيق."
-                } else {
-                    "المجلد المختار غير قابل للكتابة. تم الإبقاء على التخزين السابق."
-                },
-            )
-            _uiState.update { it.copy(isErrorStatus = !persisted) }
-            refreshEntries()
-        }
-    }
-
-    fun activatePhoneDownloadsVault(autoFallbackNotice: String? = null) {
-        viewModelScope.launch {
-            val activated = runCatching { repository.activatePhoneDownloadsVault() }.getOrDefault(false)
-            val msg = when {
-                activated && !autoFallbackNotice.isNullOrBlank() -> autoFallbackNotice
-                activated -> "تم تفعيل خزنة الهاتف المخفية المشفرة (.BlackholeVault)."
-                else -> "فعّل صلاحية الوصول إلى كل ملفات الهاتف أولاً لاستخدام المجلد المخفي .BlackholeVault."
-            }
-            refreshStorageAndPermissionState(noticeMessage = msg)
-            _uiState.update { it.copy(isErrorStatus = !activated) }
-            refreshEntries()
-        }
-    }
+    // ---- Internal Vault Storage Mode ----
 
     fun revertToInternalVaultStorage() {
         viewModelScope.launch {
             runCatching { repository.revertToInternalVaultStorage() }
             refreshStorageAndPermissionState(
-                noticeMessage = "تم التحويل إلى الخزنة الداخلية المعزولة المشفرة (AES-256).",
+                noticeMessage = "تم تفعيل الخزنة الداخلية المعزولة المشفرة (AES-256).",
             )
             _uiState.update { it.copy(isErrorStatus = false) }
             refreshEntries()
