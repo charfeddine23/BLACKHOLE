@@ -233,8 +233,8 @@ fun VaultDevicePickerSheet(
                 )
             }
 
-            // Permission Banner if missing
-            if (!hasMediaAccess || !hasAllFilesAccess) {
+            // Media Permission Banner only when media read permission is not yet granted
+            if (!hasMediaAccess) {
                 Surface(
                     color = Color(0xFF101928),
                     shape = RoundedCornerShape(16.dp),
@@ -253,20 +253,14 @@ fun VaultDevicePickerSheet(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = if (!hasMediaAccess) {
-                                    "السماح بالوصول إلى صور وفيديوهات وملفات الهاتف لعرضها هنا."
-                                } else {
-                                    "فعّل صلاحية كل الملفات ليُشفّر الملف ويختفي من الهاتف نهائياً فور نقله."
-                                },
+                                text = "السماح بالوصول إلى صور وفيديوهات وملفات الهاتف لعرضها هنا.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ChromeSilver,
                             )
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                         Button(
-                            onClick = {
-                                if (!hasMediaAccess) onRequestMediaPermission() else onRequestAllFilesAccess()
-                            },
+                            onClick = onRequestMediaPermission,
                             shape = RoundedCornerShape(12.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = accent,
@@ -278,11 +272,7 @@ fun VaultDevicePickerSheet(
                                 .testTag("vault_picker_grant_permission_button"),
                         ) {
                             Text(
-                                text = if (!hasMediaAccess) {
-                                    "السماح بالوصول لملفات الهاتف"
-                                } else {
-                                    "تفعيل صلاحية كل الملفات (حذف الأصل تلقائياً)"
-                                },
+                                text = "السماح بالوصول لملفات الهاتف",
                                 style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
                             )
                         }

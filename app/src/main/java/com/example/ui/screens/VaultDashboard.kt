@@ -260,136 +260,172 @@ fun VaultCategoryDetailScreen(
         VaultCategory.FILES -> "إضافة ملف من الهاتف"
     }
 
+    val isMediaGalleryOnly = category == VaultCategory.VIDEOS || category == VaultCategory.PHOTOS
+
     Column(modifier = Modifier.fillMaxSize()) {
-        VaultTopHeaderBar(
-            title = categoryTitle,
-            subtitle = if (isSelectionActive) {
-                "تم تحديد ${selectedUris.size} عنصر"
-            } else {
-                "${categoryEntries.size} عنصر مشفر"
-            },
-            subtitleColor = categoryAccent,
-            onBack = {
-                if (isSelectionActive) {
-                    selectedUris = emptySet()
-                } else {
-                    onBackToCategories()
-                }
-            },
-            onOpenSettings = onOpenSettings,
-        )
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Button(
-                onClick = onPickFromGallery,
-                shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = categoryAccent,
-                    contentColor = ObsidianVoid,
-                ),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+        if (isMediaGalleryOnly) {
+            // Ultra-clean Gallery Top Bar: ONLY Back button, title, and "Add from Gallery" button
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .height(48.dp)
-                    .testTag("vault_add_from_gallery_button"),
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.AddPhotoAlternate,
-                    contentDescription = addFromGalleryLabel,
-                    modifier = Modifier.size(19.dp),
-                )
-                Spacer(modifier = Modifier.width(7.dp))
-                Text(
-                    text = "إضافة من المعرض",
-                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
-            OutlinedButton(
-                onClick = onPickFromPhoneFiles,
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(0.9.dp, categoryAccent.copy(alpha = 0.6f)),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                modifier = Modifier
-                    .height(48.dp)
-                    .testTag("vault_add_from_phone_files_button"),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.FolderOpen,
-                    contentDescription = "تصفح ملفات الهاتف",
-                    tint = categoryAccent,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "ملفات الهاتف",
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                    color = ChromeSilver,
-                    maxLines = 1,
-                )
-            }
-        }
-
-        VaultTransferAndStatusSection(
-            uiState = uiState,
-            onCancelTransfer = onCancelTransfer,
-            onDismissStatus = onDismissStatus,
-            onRequestAllFilesAccess = onRequestAllFilesAccess,
-            onRetryDeletePendingOriginals = onRetryDeletePendingOriginals,
-            onDismissPendingOriginals = onDismissPendingOriginals,
-        )
-
-        if (category == VaultCategory.VIDEOS &&
-            uiState.availableDownloadedVideos.isNotEmpty() &&
-            uiState.transferState is VaultTransferUiState.Idle
-        ) {
-            Spacer(modifier = Modifier.height(6.dp))
-            LazyRow(
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(uiState.availableDownloadedVideos.take(10), key = { it.absolutePath }) { file ->
-                    Surface(
-                        color = Color(0xFF101928),
-                        shape = RoundedCornerShape(14.dp),
-                        border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.45f)),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    IconButton(
+                        onClick = {
+                            if (isSelectionActive) {
+                                selectedUris = emptySet()
+                            } else {
+                                onBackToCategories()
+                            }
+                        },
                         modifier = Modifier
-                            .clip(RoundedCornerShape(14.dp))
-                            .clickable { onMoveDownloadedVideo(file) }
                             .minimumInteractiveComponentSize()
-                            .testTag("vault_import_download_${file.name}"),
+                            .testTag("vault_back_button"),
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Rounded.DriveFileMove,
-                                contentDescription = "نقل ${file.name} إلى الخزنة",
-                                tint = NeonCyan,
-                                modifier = Modifier.size(15.dp),
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = file.nameWithoutExtension,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ChromeSilver,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.widthIn(max = 160.dp),
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                            contentDescription = "العودة",
+                            tint = ChromeSilver,
+                        )
                     }
+                    Text(
+                        text = if (isSelectionActive) "تم تحديد ${selectedUris.size}" else categoryTitle,
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                        color = ChromeSilver,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                Button(
+                    onClick = onPickFromGallery,
+                    shape = RoundedCornerShape(50),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = categoryAccent,
+                        contentColor = ObsidianVoid,
+                    ),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("vault_add_from_gallery_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.AddPhotoAlternate,
+                        contentDescription = addFromGalleryLabel,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "إضافة من المعرض",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                        maxLines = 1,
+                    )
                 }
             }
+
+            val runningTransfer = uiState.transferState as? VaultTransferUiState.Running
+            if (runningTransfer != null) {
+                LinearProgressIndicator(
+                    progress = { runningTransfer.progress.coerceIn(0f, 1f) },
+                    color = categoryAccent,
+                    trackColor = GlassStrokeBright.copy(alpha = 0.2f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp),
+                )
+            }
+        } else {
+            VaultTopHeaderBar(
+                title = categoryTitle,
+                subtitle = if (isSelectionActive) {
+                    "تم تحديد ${selectedUris.size} عنصر"
+                } else {
+                    "${categoryEntries.size} عنصر مشفر"
+                },
+                subtitleColor = categoryAccent,
+                onBack = {
+                    if (isSelectionActive) {
+                        selectedUris = emptySet()
+                    } else {
+                        onBackToCategories()
+                    }
+                },
+                onOpenSettings = onOpenSettings,
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Button(
+                    onClick = onPickFromGallery,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = categoryAccent,
+                        contentColor = ObsidianVoid,
+                    ),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("vault_add_from_gallery_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.AddPhotoAlternate,
+                        contentDescription = addFromGalleryLabel,
+                        modifier = Modifier.size(19.dp),
+                    )
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text(
+                        text = "إضافة من المعرض",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onPickFromPhoneFiles,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(0.9.dp, categoryAccent.copy(alpha = 0.6f)),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("vault_add_from_phone_files_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.FolderOpen,
+                        contentDescription = "تصفح ملفات الهاتف",
+                        tint = categoryAccent,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "ملفات الهاتف",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                        color = ChromeSilver,
+                        maxLines = 1,
+                    )
+                }
+            }
+
+            VaultTransferAndStatusSection(
+                uiState = uiState,
+                onCancelTransfer = onCancelTransfer,
+                onDismissStatus = onDismissStatus,
+                onRequestAllFilesAccess = onRequestAllFilesAccess,
+                onRetryDeletePendingOriginals = onRetryDeletePendingOriginals,
+                onDismissPendingOriginals = onDismissPendingOriginals,
+            )
         }
 
         if (categoryEntries.isEmpty()) {
@@ -400,70 +436,79 @@ fun VaultCategoryDetailScreen(
                     .padding(28.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Surface(
-                        color = categoryAccent.copy(alpha = 0.14f),
-                        shape = CircleShape,
-                        border = BorderStroke(0.9.dp, categoryAccent.copy(alpha = 0.45f)),
-                        modifier = Modifier.size(72.dp),
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = when (category) {
-                                    VaultCategory.PHOTOS -> Icons.Outlined.PhotoLibrary
-                                    VaultCategory.VIDEOS -> Icons.Outlined.VideoLibrary
-                                    VaultCategory.FILES -> Icons.Rounded.FolderCopy
-                                },
-                                contentDescription = null,
-                                tint = categoryAccent,
-                                modifier = Modifier.size(34.dp),
-                            )
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(14.dp))
+                if (isMediaGalleryOnly) {
                     Text(
-                        text = "لا توجد $categoryTitle محفوظة بعد",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                        color = ChromeSilver,
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "اضغط على زر \"إضافة من المعرض\" لاختيار ونقل الملفات لتشفيرها وإخفائها من الهاتف كلياً.",
-                        style = MaterialTheme.typography.bodySmall,
+                        text = if (category == VaultCategory.VIDEOS) "لا توجد فيديوهات" else "لا توجد صور",
+                        style = MaterialTheme.typography.bodyMedium,
                         color = MutedSlate,
                         textAlign = TextAlign.Center,
                     )
-                    Spacer(modifier = Modifier.height(18.dp))
-                    Button(
-                        onClick = onPickFromGallery,
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = categoryAccent,
-                            contentColor = ObsidianVoid,
-                        ),
-                        modifier = Modifier
-                            .height(48.dp)
-                            .testTag("vault_empty_add_from_gallery_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.AddPhotoAlternate,
-                            contentDescription = null,
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
+                } else {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            color = categoryAccent.copy(alpha = 0.14f),
+                            shape = CircleShape,
+                            border = BorderStroke(0.9.dp, categoryAccent.copy(alpha = 0.45f)),
+                            modifier = Modifier.size(72.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Rounded.FolderCopy,
+                                    contentDescription = null,
+                                    tint = categoryAccent,
+                                    modifier = Modifier.size(34.dp),
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(14.dp))
                         Text(
-                            text = addFromGalleryLabel,
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            text = "لا توجد $categoryTitle محفوظة بعد",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = ChromeSilver,
                         )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "اضغط على زر \"إضافة من المعرض\" لاختيار ونقل الملفات لتشفيرها وإخفائها من الهاتف كلياً.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MutedSlate,
+                            textAlign = TextAlign.Center,
+                        )
+                        Spacer(modifier = Modifier.height(18.dp))
+                        Button(
+                            onClick = onPickFromGallery,
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = categoryAccent,
+                                contentColor = ObsidianVoid,
+                            ),
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("vault_empty_add_from_gallery_button"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.AddPhotoAlternate,
+                                contentDescription = null,
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = addFromGalleryLabel,
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            )
+                        }
                     }
                 }
             }
         } else {
-            // Unified Adaptive Grid Layout for Encrypted Photos, Videos, and Files (3 columns on phones)
+            // Pure 3-column Gallery Grid for Videos & Photos; adaptive tile grid for Files
             LazyVerticalGrid(
-                columns = GridCells.Adaptive(minSize = 100.dp),
-                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                columns = if (isMediaGalleryOnly) GridCells.Fixed(3) else GridCells.Adaptive(minSize = 100.dp),
+                contentPadding = if (isMediaGalleryOnly) {
+                    PaddingValues(start = 4.dp, end = 4.dp, top = 4.dp, bottom = 16.dp)
+                } else {
+                    PaddingValues(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 24.dp)
+                },
+                verticalArrangement = Arrangement.spacedBy(if (isMediaGalleryOnly) 3.dp else 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (isMediaGalleryOnly) 3.dp else 8.dp),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
@@ -804,15 +849,12 @@ private fun VaultGalleryMediaTile(
 
     Surface(
         color = Color(0xFF0E1420),
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(
-            width = if (isSelected) 2.2.dp else 0.75.dp,
-            color = if (isSelected) accent else GlassStrokeBright.copy(alpha = 0.18f),
-        ),
+        shape = RoundedCornerShape(6.dp),
+        border = if (isSelected) BorderStroke(2.2.dp, accent) else null,
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(1f)
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(6.dp))
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick,
@@ -863,45 +905,21 @@ private fun VaultGalleryMediaTile(
                 }
             }
 
-            if (isVideo) {
-                Surface(
-                    color = ObsidianVoid.copy(alpha = 0.76f),
-                    shape = RoundedCornerShape(6.dp),
+            if (isSelectionMode) {
+                Box(
                     modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(5.dp),
+                        .align(Alignment.TopEnd)
+                        .padding(5.dp)
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(ObsidianVoid.copy(alpha = 0.72f)),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text(
-                        text = formatByteSize(entry.sizeBytes),
-                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
-                    )
-                }
-            }
-
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(5.dp)
-                    .size(22.dp)
-                    .clip(CircleShape)
-                    .background(ObsidianVoid.copy(alpha = 0.68f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (isSelectionMode) {
                     Icon(
                         imageVector = if (isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
                         contentDescription = if (isSelected) "محدد" else "تحديد",
                         tint = if (isSelected) accent else ChromeSilver,
                         modifier = Modifier.size(18.dp),
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Rounded.Lock,
-                        contentDescription = "مشفر",
-                        tint = EmeraldPulse,
-                        modifier = Modifier.size(12.dp),
                     )
                 }
             }

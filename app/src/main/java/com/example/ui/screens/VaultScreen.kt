@@ -240,26 +240,11 @@ fun VaultScreen(
         }
     }
 
-    val allFilesSettingsLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult(),
-    ) {
-        vaultViewModel.endExternalSystemFlow()
-        vaultViewModel.refreshPermissionAndEntries()
-    }
-
     val openAppPermissionDetails: () -> Unit = {
         vaultViewModel.beginExternalSystemFlow()
-        val detailsIntent = Intent(
-            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-            Uri.fromParts("package", context.packageName, null),
-        )
-        val launched = runCatching {
-            allFilesSettingsLauncher.launch(detailsIntent)
-            true
-        }.getOrDefault(false)
-        if (!launched) {
+        val detailsCandidates = buildAppDetailsSettingIntents(context.packageName)
+        if (!launchSystemSettingsCandidates(context, detailsCandidates)) {
             vaultViewModel.endExternalSystemFlow()
-            vaultViewModel.reportStatusError("تعذر فتح إعدادات صلاحيات التطبيق على هذا الجهاز.")
         }
     }
 
@@ -315,26 +300,9 @@ fun VaultScreen(
     val requestAllFilesAccess: () -> Unit = {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             vaultViewModel.beginExternalSystemFlow()
-            val packageUri = Uri.fromParts("package", context.packageName, null)
-            val candidateIntents = listOf(
-                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, packageUri),
-                Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
-                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri),
-            )
-            var launched = false
-            for (intent in candidateIntents) {
-                val ok = runCatching {
-                    allFilesSettingsLauncher.launch(intent)
-                    true
-                }.getOrDefault(false)
-                if (ok) {
-                    launched = true
-                    break
-                }
-            }
-            if (!launched) {
+            val candidateIntents = buildAllFilesAccessSettingIntents(context.packageName)
+            if (!launchSystemSettingsCandidates(context, candidateIntents)) {
                 vaultViewModel.endExternalSystemFlow()
-                vaultViewModel.reportStatusError("تعذر فتح صفحة صلاحية كل الملفات — افتح إعدادات التطبيق ومنح الصلاحية يدوياً.")
             }
         } else {
             if (uiState.hasMediaAccess && !uiState.hasAllFilesAccess) {
@@ -848,33 +816,63 @@ private fun VaultLockedGate(
                     )
                 }
 
-                AnimatedVisibility(visible = !uiState.statusMessage.isNullOrBlank()) {
-                    uiState.statusMessage?.let { msg ->
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Surface(
-                            color = (if (uiState.isErrorStatus) CrimsonAlert else EmeraldPulse).copy(alpha = 0.14f),
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(
-                                0.8.dp,
-                                (if (uiState.isErrorStatus) CrimsonAlert else EmeraldPulse).copy(alpha = 0.55f),
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onDismissStatus() },
-                        ) {
-                            Text(
-                                text = msg,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (uiState.isErrorStatus) CrimsonAlert else EmeraldPulse,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(12.dp),
-                            )
-                        }
-                    }
-                }
             }
         }
     }
+}
+
+internal fun buildAllFilesAccessSettingIntents(packageName: String): List<Intent> {
+    val packageUri = Uri.parse("package:$packageName")
+    val fromPartsUri = Uri.fromParts("package", packageName, null)
+    val list = mutableListOf<Intent>()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        list += Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, packageUri)
+        list += Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = fromPartsUri
+        }
+        list += Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+        list += Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+    }
+    list += buildAppDetailsSettingIntents(packageName)
+    return list
+}
+
+internal fun buildAppDetailsSettingIntents(packageName: String): List<Intent> {
+    val packageUri = Uri.parse("package:$packageName")
+    return listOf(
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri),
+        Intent("miui.intent.action.APP_PERM_EDITOR").apply {
+            putExtra("extra_pkgname", packageName)
+        },
+        Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS),
+        Intent(Settings.ACTION_SETTINGS),
+    )
+}
+
+internal fun launchSystemSettingsCandidates(
+    context: Context,
+    candidates: List<Intent>,
+): Boolean {
+    val activity = context.findActivity()
+    val appContext = context.applicationContext ?: context
+    for (candidate in candidates) {
+        val launchedFromActivity = if (activity != null) {
+            runCatching {
+                activity.startActivity(Intent(candidate))
+                true
+            }.getOrDefault(false)
+        } else {
+            false
+        }
+        if (launchedFromActivity) return true
+
+        val launchedNewTask = runCatching {
+            appContext.startActivity(Intent(candidate).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        }.getOrDefault(false)
+        if (launchedNewTask) return true
+    }
+    return false
 }
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {

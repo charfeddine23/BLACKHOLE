@@ -63,12 +63,23 @@
         </intent>
         <intent>
             <action android:name="android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION" />
+            <data android:scheme="package" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION" />
         </intent>
         <intent>
             <action android:name="android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION" />
         </intent>
         <intent>
             <action android:name="android.settings.APPLICATION_DETAILS_SETTINGS" />
+            <data android:scheme="package" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.MANAGE_APPLICATIONS_SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.SETTINGS" />
         </intent>
         <package android:name="com.google.android.documentsui" />
         <package android:name="com.android.documentsui" />

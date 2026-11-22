@@ -1,11 +1,18 @@
 package com.example
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.local.AppPreferences
 import com.example.data.local.BrowserPreferencesStore
 import com.example.data.local.BrowserSearchEngine
 import com.example.engine.network.DnsPacketCodec
+import com.example.ui.navigation.buildMissingStartupRuntimePermissions
+import com.example.ui.screens.buildAllFilesAccessSettingIntents
+import com.example.ui.screens.launchSystemSettingsCandidates
 import com.example.vault.data.FileVaultRandomAccessReader
 import com.example.vault.data.SafVaultRepository
 import com.example.vault.data.VaultCategory
@@ -220,5 +227,42 @@ class VaultEncryptionAndMoveTest {
 
         store.clearHistory()
         assertTrue(store.history.value.isEmpty())
+    }
+
+    @Test
+    fun `all files settings intent chain includes per-app, global, and app-details fallbacks`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val intents = buildAllFilesAccessSettingIntents(context.packageName)
+        val actions = intents.mapNotNull { it.action }
+        assertTrue(actions.contains(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION))
+        assertTrue(actions.contains(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+        assertTrue(actions.contains(Settings.ACTION_APPLICATION_DETAILS_SETTINGS))
+        assertTrue(actions.contains(Settings.ACTION_SETTINGS))
+
+        val perAppIntent = intents.first { it.action == Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION }
+        assertEquals("package:${context.packageName}", perAppIntent.data.toString())
+
+        // Verify Robolectric Application context can launch the candidate list with FLAG_ACTIVITY_NEW_TASK fallback
+        assertTrue(launchSystemSettingsCandidates(context, intents))
+
+        // Verify empty candidate list cleanly returns false
+        assertFalse(launchSystemSettingsCandidates(context, emptyList<Intent>()))
+    }
+
+    @Test
+    fun `first launch startup permissions collect notifications and media permissions`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val appPrefs = AppPreferences.getInstance(context)
+        assertFalse(appPrefs.hasRequestedStartupPermissions())
+
+        val missing = buildMissingStartupRuntimePermissions(context).toSet()
+        assertTrue(missing.contains(Manifest.permission.POST_NOTIFICATIONS))
+        assertTrue(missing.contains(Manifest.permission.READ_MEDIA_IMAGES))
+        assertTrue(missing.contains(Manifest.permission.READ_MEDIA_VIDEO))
+        assertTrue(missing.contains(Manifest.permission.READ_MEDIA_AUDIO))
+        assertTrue(missing.contains(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED))
+
+        appPrefs.markStartupPermissionsRequested()
+        assertTrue(appPrefs.hasRequestedStartupPermissions())
     }
 }

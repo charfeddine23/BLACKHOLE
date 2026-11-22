@@ -26,9 +26,18 @@ class AppPreferences private constructor(context: Context) {
         _noScreenshotEnabled.value = enabled
     }
 
+    fun hasRequestedStartupPermissions(): Boolean {
+        return prefs.getBoolean(KEY_STARTUP_PERMISSIONS_REQUESTED, false)
+    }
+
+    fun markStartupPermissionsRequested() {
+        prefs.edit().putBoolean(KEY_STARTUP_PERMISSIONS_REQUESTED, true).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "blackhole_app_settings"
         private const val KEY_NO_SCREENSHOT_ENABLED = "no_screenshot_enabled"
+        private const val KEY_STARTUP_PERMISSIONS_REQUESTED = "startup_permissions_requested"
 
         @Volatile
         private var instance: AppPreferences? = null
