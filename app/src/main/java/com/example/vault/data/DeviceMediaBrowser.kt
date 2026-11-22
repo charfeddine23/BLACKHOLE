@@ -208,6 +208,7 @@ class DeviceMediaBrowser(context: Context) {
                 while (cursor.moveToNext() && results.size < limit) {
                     val path = if (dataIdx >= 0) cursor.getString(dataIdx) else null
                     if (!path.isNullOrBlank() && isInsideVaultPath(path)) continue
+                    if (!path.isNullOrBlank() && isConfirmedMissingOnDisk(path)) continue
                     val id = cursor.getLong(idIdx)
                     val uri = ContentUris.withAppendedId(collection, id)
                     val name = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)
@@ -281,6 +282,7 @@ class DeviceMediaBrowser(context: Context) {
                 while (cursor.moveToNext() && results.size < limit) {
                     val path = if (dataIdx >= 0) cursor.getString(dataIdx) else null
                     if (!path.isNullOrBlank() && isInsideVaultPath(path)) continue
+                    if (!path.isNullOrBlank() && isConfirmedMissingOnDisk(path)) continue
                     val id = cursor.getLong(idIdx)
                     val uri = ContentUris.withAppendedId(collection, id)
                     val name = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)
@@ -387,5 +389,11 @@ class DeviceMediaBrowser(context: Context) {
             path.contains("/BlackholeVault/", ignoreCase = true) ||
             path.contains("/blackhole_vault/", ignoreCase = true) ||
             path.endsWith(VaultCipher.ENCRYPTED_VAULT_EXT, ignoreCase = true)
+    }
+
+    private fun isConfirmedMissingOnDisk(path: String): Boolean {
+        val file = File(path)
+        val parent = file.parentFile ?: return false
+        return parent.canRead() && !file.exists()
     }
 }

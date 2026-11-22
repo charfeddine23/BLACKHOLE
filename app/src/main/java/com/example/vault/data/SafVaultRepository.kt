@@ -18,6 +18,8 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
+import com.example.data.local.BlackholeDatabase
+import com.example.data.local.DownloadedVideoEntity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -31,6 +33,8 @@ import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 enum class VaultStorageMode {
     INTERNAL,
@@ -66,6 +70,7 @@ data class VaultTransferProgress(
     val originalDeleted: Boolean = false,
     val recoverableDeleteSender: IntentSender? = null,
     val resolvedOriginalPath: String? = null,
+    val resolvedMediaUris: List<String> = emptyList(),
 )
 
 data class VaultFileEntry(
@@ -87,12 +92,14 @@ data class PendingOriginalDeletion(
     val filePath: String?,
     val displayName: String,
     val category: VaultCategory,
+    val resolvedMediaUris: List<String> = emptyList(),
 )
 
 private data class OriginalDeleteResult(
     val deleted: Boolean,
     val recoverableSender: IntentSender? = null,
     val resolvedPath: String? = null,
+    val resolvedMediaUris: List<Uri> = emptyList(),
 )
 
 class SafVaultRepository(
@@ -138,6 +145,15 @@ class SafVaultRepository(
 
     fun hasMediaReadAccess(): Boolean {
         if (hasAllFilesAccess()) return true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            if (ContextCompat.checkSelfPermission(
+                    appContext,
+                    Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                return true
+            }
+        }
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(
                 appContext,
@@ -157,9 +173,10 @@ class SafVaultRepository(
 
     fun buildMediaStoreDeleteSender(uris: List<Uri>): IntentSender? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
-        val canonicalMediaUris = uris.mapNotNull { uri ->
+        val canonicalMediaUris = uris.flatMap { uri ->
             val resolvedFile = resolveLocalFileFromUri(uri)
-            resolveDeletableMediaStoreUri(uri, resolvedFile)
+            val meta = runCatching { resolveSourceMetadata(uri, VaultCategory.VIDEOS) }.getOrNull()
+            resolveDeletableMediaStoreUris(uri, resolvedFile, meta)
         }.distinct()
 
         if (canonicalMediaUris.isEmpty()) return null
@@ -173,18 +190,48 @@ class SafVaultRepository(
             val uri = Uri.parse(item.uriString)
             val resolvedFile = item.filePath?.let(::File)?.takeIf { it.exists() }
                 ?: resolveLocalFileFromUri(uri)
-            deleteOriginalSource(uri, resolvedFile).deleted
+            val extraMeta = VaultMediaMetadata(
+                originalName = item.displayName,
+                mimeType = inferMimeFromFileName(item.displayName) ?: "video/mp4",
+                originalSizeBytes = resolvedFile?.length() ?: 0L,
+            )
+            deleteOriginalSource(uri, resolvedFile, extraMeta).deleted
         }
 
     suspend fun cleanupMediaStoreAfterSystemDelete(uris: List<Uri>) = withContext(Dispatchers.IO) {
+        val pathsToClean = LinkedHashSet<String>()
         for (uri in uris) {
             val resolvedFile = resolveLocalFileFromUri(uri)
-            if (resolvedFile != null && !resolvedFile.exists()) {
-                deleteMediaStoreRowsByPath(resolvedFile.absolutePath)
-                scanDeletedPath(resolvedFile.absolutePath)
+            if (resolvedFile != null) {
+                expandPathAliases(resolvedFile.absolutePath).forEach { pathsToClean.add(it) }
+            }
+            cleanupMatchingBlackholeDownloads(uri, resolvedFile, null)
+        }
+        for (path in pathsToClean) {
+            if (!File(path).exists()) {
+                deleteMediaStoreRowsByPath(path)
             }
         }
+        val missingPaths = pathsToClean.filter { !File(it).exists() }
+        if (missingPaths.isNotEmpty()) {
+            scanDeletedPathsAndWait(missingPaths)
+        }
+        notifyMediaStoreChanged()
     }
+
+    suspend fun isMediaOriginalGone(uriString: String, filePath: String?): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!filePath.isNullOrBlank() && File(filePath).exists()) {
+                return@withContext false
+            }
+            val uri = Uri.parse(uriString)
+            val resolvedFile = resolveLocalFileFromUri(uri)
+            if (resolvedFile != null && resolvedFile.exists()) {
+                return@withContext false
+            }
+            val canonicalUris = resolveDeletableMediaStoreUris(uri, resolvedFile, null)
+            !hasRemainingMediaStoreEntry(canonicalUris, filePath ?: resolvedFile?.absolutePath)
+        }
 
     private fun ensureProtectedDir(dir: File) {
         if (!dir.exists()) {
@@ -583,8 +630,9 @@ class SafVaultRepository(
             commitAction(bytesEncrypted)
             committed = true
 
+            val normalizedMeta = meta.copy(originalName = sanitizedOriginalName)
             val deleteResult = if (deleteOriginal) {
-                deleteOriginalSource(sourceUri, sourceFile)
+                deleteOriginalSource(sourceUri, sourceFile, normalizedMeta)
             } else {
                 OriginalDeleteResult(deleted = false, resolvedPath = sourceFile?.absolutePath)
             }
@@ -595,10 +643,11 @@ class SafVaultRepository(
                     bytesProcessed = bytesEncrypted,
                     totalBytes = bytesEncrypted.coerceAtLeast(totalBytes),
                     stage = VaultTransferStage.COMPLETED,
-                    metadata = meta.copy(originalName = sanitizedOriginalName),
+                    metadata = normalizedMeta,
                     originalDeleted = deleteResult.deleted,
                     recoverableDeleteSender = deleteResult.recoverableSender,
                     resolvedOriginalPath = deleteResult.resolvedPath ?: sourceFile?.absolutePath,
+                    resolvedMediaUris = deleteResult.resolvedMediaUris.map { it.toString() },
                 ),
             )
         } catch (t: Throwable) {
@@ -729,74 +778,83 @@ class SafVaultRepository(
             .sortedByDescending { it.lastModified() }
     }
 
-    private fun deleteOriginalSource(sourceUri: Uri, resolvedFile: File?): OriginalDeleteResult {
-        val resolvedPath = resolvedFile?.absolutePath
-        var physicalFileDeleted = false
+    private suspend fun deleteOriginalSource(
+        sourceUri: Uri,
+        resolvedFile: File?,
+        metadata: VaultMediaMetadata?,
+    ): OriginalDeleteResult {
+        val resolvedPath = resolvedFile?.absolutePath ?: queryDataColumnPath(sourceUri)
+
+        // Step 0: Always purge any linked Blackhole downloaded video record + exported MediaStore copy
+        val linkedGalleryUris = cleanupMatchingBlackholeDownloads(sourceUri, resolvedFile, metadata)
+
+        // Collect all canonical MediaStore URIs BEFORE deleting the physical file so we can verify & purge them
+        val preDeleteCanonicalUris = (resolveDeletableMediaStoreUris(sourceUri, resolvedFile, metadata) + linkedGalleryUris)
+            .distinct()
 
         // Step 1: Attempt direct physical deletion (succeeds whenever All Files Access or app-owned storage applies)
+        var physicalFileDeleted = false
         if (resolvedFile != null) {
             if (!resolvedFile.exists()) {
                 physicalFileDeleted = true
             } else {
-                val attemptDelete = runCatching { resolvedFile.delete() }.getOrDefault(false)
-                physicalFileDeleted = attemptDelete || !resolvedFile.exists()
-            }
-            if (physicalFileDeleted && resolvedPath != null) {
-                deleteMediaStoreRowsByPath(resolvedPath)
-                scanDeletedPath(resolvedPath)
+                runCatching { resolvedFile.delete() }
+                physicalFileDeleted = !resolvedFile.exists()
             }
         }
 
-        // Step 2: If physical file was deleted, ensure the original URI row is also gone and return true
-        if (resolvedFile != null && physicalFileDeleted) {
-            tryDeleteMediaStoreRow(sourceUri)
-            return OriginalDeleteResult(deleted = true, resolvedPath = resolvedPath)
-        }
-
-        // Step 3: Scoped Storage fallback — attempt MediaStore row deletion (captures RecoverableSecurityException on API 29)
+        // Step 2: Attempt direct ContentResolver deletion on every canonical MediaStore URI & path aliases
         var capturedRecoverableSender: IntentSender? = null
-        val targetContentUri = resolveDeletableMediaStoreUri(sourceUri, resolvedFile) ?: sourceUri
-        if (targetContentUri.scheme.equals("content", ignoreCase = true)) {
-            val rowOutcome = tryDeleteMediaStoreRowWithRecovery(targetContentUri)
-            if (rowOutcome.first) {
-                val fileActuallyGone = resolvedFile?.exists() != true
-                if (fileActuallyGone) {
-                    if (resolvedPath != null) {
-                        deleteMediaStoreRowsByPath(resolvedPath)
-                        scanDeletedPath(resolvedPath)
-                    }
-                    return OriginalDeleteResult(deleted = true, resolvedPath = resolvedPath)
-                }
-            }
-            if (rowOutcome.second != null) {
-                capturedRecoverableSender = rowOutcome.second
+        for (targetUri in preDeleteCanonicalUris) {
+            val (_, sender) = tryDeleteMediaStoreRowWithRecovery(targetUri)
+            if (capturedRecoverableSender == null && sender != null) {
+                capturedRecoverableSender = sender
             }
         }
 
-        // Step 4: Attempt SAF DocumentsContract deletion for document provider URIs
-        if (DocumentsContract.isDocumentUri(appContext, sourceUri)) {
-            val docDeleted = runCatching {
+        if (sourceUri.scheme.equals("content", ignoreCase = true) && sourceUri !in preDeleteCanonicalUris) {
+            val (_, sender) = tryDeleteMediaStoreRowWithRecovery(sourceUri)
+            if (capturedRecoverableSender == null && sender != null) {
+                capturedRecoverableSender = sender
+            }
+        }
+
+        if (resolvedPath != null && (physicalFileDeleted || resolvedFile == null)) {
+            deleteMediaStoreRowsByPath(resolvedPath)
+        }
+
+        // Step 3: Attempt SAF DocumentsContract deletion for document provider URIs if file still present
+        if (!physicalFileDeleted && DocumentsContract.isDocumentUri(appContext, sourceUri)) {
+            runCatching {
                 DocumentsContract.deleteDocument(appContext.contentResolver, sourceUri)
-            }.getOrDefault(false)
-            if (docDeleted) {
-                val fileActuallyGone = resolvedFile?.exists() != true
-                if (fileActuallyGone) {
-                    if (resolvedPath != null) {
-                        deleteMediaStoreRowsByPath(resolvedPath)
-                        scanDeletedPath(resolvedPath)
-                    }
-                    return OriginalDeleteResult(deleted = true, resolvedPath = resolvedPath)
+            }
+            if (resolvedFile != null && !resolvedFile.exists()) {
+                physicalFileDeleted = true
+                if (resolvedPath != null) {
+                    deleteMediaStoreRowsByPath(resolvedPath)
                 }
             }
         }
 
-        // Final verification: did the content URI disappear?
-        if (resolvedFile == null && sourceUri.scheme.equals("content", ignoreCase = true)) {
-            val stillAccessible = runCatching {
-                appContext.contentResolver.openAssetFileDescriptor(sourceUri, "r")?.use { true } ?: false
-            }.getOrDefault(false)
-            if (!stillAccessible) {
-                return OriginalDeleteResult(deleted = true, resolvedPath = resolvedPath)
+        // Step 4: If physical file was deleted, synchronously ask MediaScanner to drop ONLY the deleted file paths
+        if (resolvedPath != null && (resolvedFile == null || !resolvedFile.exists())) {
+            val aliases = expandPathAliases(resolvedPath)
+            scanDeletedPathsAndWait(aliases)
+            notifyMediaStoreChanged()
+        }
+
+        // Step 5: Verify BOTH physical disk AND MediaStore Gallery index are truly clean
+        val fileStillOnDisk = resolvedFile?.exists() == true
+        val mediaRowStillExists = hasRemainingMediaStoreEntry(preDeleteCanonicalUris, resolvedPath)
+
+        if (!fileStillOnDisk && !mediaRowStillExists) {
+            // Confirm for content:// URIs without a resolvedFile that the stream is no longer readable
+            if (resolvedFile != null || preDeleteCanonicalUris.isNotEmpty() || !isContentUriReadable(sourceUri)) {
+                return OriginalDeleteResult(
+                    deleted = true,
+                    resolvedPath = resolvedPath,
+                    resolvedMediaUris = preDeleteCanonicalUris,
+                )
             }
         }
 
@@ -804,14 +862,103 @@ class SafVaultRepository(
             deleted = false,
             recoverableSender = capturedRecoverableSender,
             resolvedPath = resolvedPath,
+            resolvedMediaUris = preDeleteCanonicalUris,
         )
     }
 
-    private fun tryDeleteMediaStoreRow(uri: Uri): Boolean {
+    private suspend fun cleanupMatchingBlackholeDownloads(
+        sourceUri: Uri,
+        resolvedFile: File?,
+        metadata: VaultMediaMetadata?,
+    ): List<Uri> {
+        val discoveredGalleryUris = mutableListOf<Uri>()
+        runCatching {
+            val dao = BlackholeDatabase.getInstance(appContext).downloadedVideoDao()
+            val allVideos: List<DownloadedVideoEntity> = dao.getAllVideosSnapshot()
+            val sourceUriStr = sourceUri.toString()
+            val sourceAliases = resolvedFile?.absolutePath?.let { expandPathAliases(it) }.orEmpty().toSet()
+            val sourceName = resolvedFile?.name ?: metadata?.originalName
+            val sourceSize = resolvedFile?.takeIf { it.exists() }?.length() ?: metadata?.originalSizeBytes ?: 0L
+
+            for (entity in allVideos) {
+                val entityFileAliases = entity.filePath.takeIf { it.isNotBlank() }?.let { expandPathAliases(it) }.orEmpty()
+                val pathMatches = sourceAliases.isNotEmpty() && entityFileAliases.any { it in sourceAliases }
+                val uriMatches = entity.contentUri == sourceUriStr
+                val downloadedPairMatches = !sourceName.isNullOrBlank() &&
+                    (entity.filePath.endsWith("/$sourceName") ||
+                        (sourceAliases.any { it.contains("/Movies/Blackhole/", ignoreCase = true) } &&
+                            File(entity.filePath).name == sourceName &&
+                            (sourceSize <= 0L || entity.fileSizeBytes == sourceSize)))
+
+                if (pathMatches || uriMatches || downloadedPairMatches) {
+                    val galleryUri = runCatching { Uri.parse(entity.contentUri) }.getOrNull()
+                    if (galleryUri != null && galleryUri.scheme.equals("content", ignoreCase = true)) {
+                        discoveredGalleryUris.add(galleryUri)
+                        val deletedGallery = runCatching {
+                            appContext.contentResolver.delete(galleryUri, null, null) > 0
+                        }.getOrDefault(false)
+                        if (!deletedGallery) {
+                            queryDataColumnPath(galleryUri)?.let { exportedPath ->
+                                runCatching { File(exportedPath).delete() }
+                                deleteMediaStoreRowsByPath(exportedPath)
+                                scanDeletedPathsAndWait(expandPathAliases(exportedPath))
+                            }
+                        }
+                    }
+                    if (entity.filePath.isNotBlank()) {
+                        runCatching { File(entity.filePath).delete() }
+                    }
+                    if (!entity.thumbnailPath.isNullOrBlank()) {
+                        runCatching { File(entity.thumbnailPath).delete() }
+                    }
+                    dao.deleteVideoById(entity.id)
+                }
+            }
+        }
+        return discoveredGalleryUris
+    }
+
+    private fun isContentUriReadable(uri: Uri): Boolean {
         if (!uri.scheme.equals("content", ignoreCase = true)) return false
         return runCatching {
-            appContext.contentResolver.delete(uri, null, null) > 0
+            appContext.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
         }.getOrDefault(false)
+    }
+
+    private fun hasRemainingMediaStoreEntry(
+        canonicalUris: List<Uri>,
+        resolvedPath: String?,
+    ): Boolean {
+        val resolver = appContext.contentResolver
+        for (uri in canonicalUris) {
+            val exists = runCatching {
+                resolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)?.use { c ->
+                    c.moveToFirst()
+                } ?: false
+            }.getOrDefault(false)
+            if (exists) return true
+        }
+        if (!resolvedPath.isNullOrBlank()) {
+            val aliases = expandPathAliases(resolvedPath)
+            val placeholders = aliases.joinToString(",") { "?" }
+            @Suppress("DEPRECATION")
+            val selection = "${MediaStore.MediaColumns.DATA} IN ($placeholders)"
+            val args = aliases.toTypedArray()
+            val mediaTables = listOf(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            )
+            for (table in mediaTables) {
+                val found = runCatching {
+                    resolver.query(table, arrayOf(MediaStore.MediaColumns._ID), selection, args, null)?.use { c ->
+                        c.moveToFirst()
+                    } ?: false
+                }.getOrDefault(false)
+                if (found) return true
+            }
+        }
+        return false
     }
 
     private fun tryDeleteMediaStoreRowWithRecovery(uri: Uri): Pair<Boolean, IntentSender?> {
@@ -835,12 +982,14 @@ class SafVaultRepository(
 
     private fun deleteMediaStoreRowsByPath(path: String) {
         val resolver = appContext.contentResolver
+        val aliases = expandPathAliases(path)
+        val placeholders = aliases.joinToString(",") { "?" }
         @Suppress("DEPRECATION")
-        val selection = "${MediaStore.MediaColumns.DATA} = ?"
-        val args = arrayOf(path)
+        val selection = "${MediaStore.MediaColumns.DATA} IN ($placeholders)"
+        val args = aliases.toTypedArray()
         val collections = buildList {
-            add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
             add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
             add(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
             add(MediaStore.Files.getContentUri("external"))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -852,15 +1001,34 @@ class SafVaultRepository(
         }
     }
 
-    private fun resolveDeletableMediaStoreUri(uri: Uri, resolvedFile: File?): Uri? {
+    private fun resolveDeletableMediaStoreUris(
+        uri: Uri,
+        resolvedFile: File?,
+        metadata: VaultMediaMetadata?,
+    ): List<Uri> {
+        val found = LinkedHashSet<Uri>()
+
+        // 1. Direct canonical MediaStore URI
         if (uri.scheme.equals("content", ignoreCase = true) && uri.authority == MediaStore.AUTHORITY) {
             val pathSegs = uri.pathSegments
             val isStandardMediaCollection = pathSegs.any { it == "images" || it == "video" || it == "audio" }
             if (isStandardMediaCollection) {
-                return uri
+                found.add(uri)
             }
         }
 
+        // 2. Android 13+ Photo Picker & Document URI unwrapping via MediaStore.getMediaUri
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            uri.scheme.equals("content", ignoreCase = true)
+        ) {
+            runCatching { MediaStore.getMediaUri(appContext, uri) }.getOrNull()?.let { unwrapped ->
+                if (unwrapped.authority == MediaStore.AUTHORITY) {
+                    found.add(unwrapped)
+                }
+            }
+        }
+
+        // 3. com.android.providers.media.documents ("video:123", "image:123", "audio:123")
         if (DocumentsContract.isDocumentUri(appContext, uri) &&
             uri.authority == "com.android.providers.media.documents"
         ) {
@@ -868,47 +1036,130 @@ class SafVaultRepository(
             val mediaType = docId.substringBefore(":")
             val idNum = docId.substringAfter(":").toLongOrNull()
             if (idNum != null) {
-                return when (mediaType) {
-                    "image" -> ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, idNum)
-                    "video" -> ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, idNum)
-                    "audio" -> ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, idNum)
-                    else -> null
+                when (mediaType) {
+                    "image" -> found.add(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, idNum))
+                    "video" -> found.add(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, idNum))
+                    "audio" -> found.add(ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, idNum))
                 }
             }
         }
 
-        // Resolve via exact file path across Images/Video/Audio MediaStore tables
+        // 4. com.android.providers.downloads.documents ("msf:123")
+        if (DocumentsContract.isDocumentUri(appContext, uri) &&
+            uri.authority == "com.android.providers.downloads.documents"
+        ) {
+            val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull().orEmpty()
+            if (docId.startsWith("msf:")) {
+                val idNum = docId.removePrefix("msf:").toLongOrNull()
+                if (idNum != null) {
+                    val candidateTables = listOf(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    )
+                    for (table in candidateTables) {
+                        val candidate = ContentUris.withAppendedId(table, idNum)
+                        val exists = runCatching {
+                            appContext.contentResolver.query(
+                                candidate,
+                                arrayOf(MediaStore.MediaColumns._ID),
+                                null,
+                                null,
+                                null,
+                            )?.use { it.moveToFirst() } ?: false
+                        }.getOrDefault(false)
+                        if (exists) found.add(candidate)
+                    }
+                }
+            }
+        }
+
+        // 5. Path-based lookup using all path aliases (/storage/emulated/0 vs /sdcard vs canonical)
         val filePath = resolvedFile?.absolutePath ?: queryDataColumnPath(uri)
+        val mediaTables = listOf(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+        )
         if (!filePath.isNullOrBlank()) {
             val resolver = appContext.contentResolver
+            val aliases = expandPathAliases(filePath)
+            val placeholders = aliases.joinToString(",") { "?" }
             @Suppress("DEPRECATION")
-            val selection = "${MediaStore.MediaColumns.DATA} = ?"
-            val args = arrayOf(filePath)
-            val mediaTables = listOf(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-            )
+            val selection = "${MediaStore.MediaColumns.DATA} IN ($placeholders)"
+            val args = aliases.toTypedArray()
             for (table in mediaTables) {
-                val foundId = runCatching {
+                runCatching {
                     resolver.query(table, arrayOf(MediaStore.MediaColumns._ID), selection, args, null)?.use { c ->
-                        if (c.moveToFirst()) c.getLong(0) else null
+                        while (c.moveToNext()) {
+                            found.add(ContentUris.withAppendedId(table, c.getLong(0)))
+                        }
                     }
-                }.getOrNull()
-                if (foundId != null) {
-                    return ContentUris.withAppendedId(table, foundId)
                 }
             }
         }
-        return null
+
+        // 6. Metadata fallback (DISPLAY_NAME + SIZE) for Photo Picker / redacted-path URIs on Android 11/12
+        if (found.isEmpty() && metadata != null && metadata.originalName.isNotBlank() && metadata.originalSizeBytes > 0L) {
+            val resolver = appContext.contentResolver
+            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.SIZE} = ?"
+            val args = arrayOf(metadata.originalName, metadata.originalSizeBytes.toString())
+            val preferredTables = when (classifyCategory(metadata.originalName, metadata.mimeType)) {
+                VaultCategory.VIDEOS -> listOf(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                VaultCategory.PHOTOS -> listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+                VaultCategory.FILES -> mediaTables
+            }
+            for (table in preferredTables) {
+                runCatching {
+                    resolver.query(table, arrayOf(MediaStore.MediaColumns._ID), selection, args, null)?.use { c ->
+                        if (c.count == 1 && c.moveToFirst()) {
+                            found.add(ContentUris.withAppendedId(table, c.getLong(0)))
+                        }
+                    }
+                }
+            }
+        }
+
+        return found.toList()
     }
 
-    private fun scanDeletedPath(path: String) {
-        val parentPath = File(path).parent
-        val pathsToScan = if (!parentPath.isNullOrBlank()) arrayOf(path, parentPath) else arrayOf(path)
+    private fun scanDeletedPathsAndWait(paths: List<String>) {
+        if (paths.isEmpty()) return
+        val latch = CountDownLatch(paths.size)
         runCatching {
-            MediaScannerConnection.scanFile(appContext, pathsToScan, null, null)
+            MediaScannerConnection.scanFile(
+                appContext,
+                paths.toTypedArray(),
+                null,
+            ) { _, _ ->
+                latch.countDown()
+            }
+            latch.await(600L, TimeUnit.MILLISECONDS)
         }
+    }
+
+    private fun notifyMediaStoreChanged() {
+        val resolver = appContext.contentResolver
+        runCatching { resolver.notifyChange(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, null) }
+        runCatching { resolver.notifyChange(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null) }
+        runCatching { resolver.notifyChange(MediaStore.Files.getContentUri("external"), null) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { resolver.notifyChange(MediaStore.Downloads.EXTERNAL_CONTENT_URI, null) }
+        }
+    }
+
+    private fun expandPathAliases(path: String): List<String> {
+        val out = LinkedHashSet<String>()
+        out.add(path)
+        runCatching { File(path).canonicalPath }.getOrNull()?.let { out.add(it) }
+        val sdcardPrefix = "/sdcard/"
+        val emulatedPrefix = "/storage/emulated/0/"
+        if (path.startsWith(sdcardPrefix)) {
+            out.add(emulatedPrefix + path.removePrefix(sdcardPrefix))
+        } else if (path.startsWith(emulatedPrefix)) {
+            out.add(sdcardPrefix + path.removePrefix(emulatedPrefix))
+        }
+        return out.toList()
     }
 
     private fun resolveLocalFileFromUri(uri: Uri): File? {
@@ -929,9 +1180,26 @@ class SafVaultRepository(
                     val candidate = File(Environment.getExternalStorageDirectory(), relPath)
                     if (candidate.exists()) return candidate
                 }
-            } else if (authority == "com.android.providers.downloads.documents" && docId.startsWith("raw:")) {
-                val candidate = File(docId.removePrefix("raw:"))
-                if (candidate.exists()) return candidate
+            } else if (authority == "com.android.providers.downloads.documents") {
+                if (docId.startsWith("raw:")) {
+                    val candidate = File(docId.removePrefix("raw:"))
+                    if (candidate.exists()) return candidate
+                } else if (docId.startsWith("msf:")) {
+                    val idNum = docId.removePrefix("msf:").toLongOrNull()
+                    if (idNum != null) {
+                        val tables = buildList {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                add(MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+                            }
+                            add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                            add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+                            add(MediaStore.Files.getContentUri("external"))
+                        }
+                        for (table in tables) {
+                            queryDataColumnFile(ContentUris.withAppendedId(table, idNum))?.let { return it }
+                        }
+                    }
+                }
             } else if (authority == "com.android.providers.media.documents" && docId.contains(":")) {
                 val mediaType = docId.substringBefore(":")
                 val idNum = docId.substringAfter(":").toLongOrNull()
@@ -940,14 +1208,21 @@ class SafVaultRepository(
                         "image" -> ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, idNum)
                         "video" -> ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, idNum)
                         "audio" -> ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, idNum)
-                        else -> null
+                        else -> ContentUris.withAppendedId(MediaStore.Files.getContentUri("external"), idNum)
                     }
-                    contentUri?.let { queryDataColumnFile(it) }?.let { return it }
+                    queryDataColumnFile(contentUri)?.let { return it }
                 }
             }
         }
 
-        // 2. Direct MediaStore / PhotoPicker _data lookup
+        // 2. Android 13+ PhotoPicker URI unwrapping via MediaStore.getMediaUri
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            runCatching { MediaStore.getMediaUri(appContext, uri) }.getOrNull()?.let { unwrapped ->
+                queryDataColumnFile(unwrapped)?.let { return it }
+            }
+        }
+
+        // 3. Direct MediaStore / PhotoPicker _data lookup
         return queryDataColumnFile(uri)
     }
 

@@ -3,6 +3,9 @@ package com.example
 import android.content.Context
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.local.BrowserPreferencesStore
+import com.example.data.local.BrowserSearchEngine
+import com.example.engine.network.DnsPacketCodec
 import com.example.vault.data.FileVaultRandomAccessReader
 import com.example.vault.data.SafVaultRepository
 import com.example.vault.data.VaultCategory
@@ -16,6 +19,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -93,8 +97,9 @@ class VaultEncryptionAndMoveTest {
             originalFile.writeBytes(payload)
             assertTrue(originalFile.exists())
 
+            val sourceUri = Uri.fromFile(originalFile)
             val events = repo.moveMediaToVault(
-                sourceUri = Uri.fromFile(originalFile),
+                sourceUri = sourceUri,
                 fallbackCategory = VaultCategory.PHOTOS,
                 deleteOriginal = true,
             ).toList()
@@ -103,6 +108,7 @@ class VaultEncryptionAndMoveTest {
             assertNotNull(completed)
             assertTrue("Expected original file to be deleted", completed!!.originalDeleted)
             assertFalse("Original file must disappear from phone", originalFile.exists())
+            assertTrue("Expected isMediaOriginalGone to confirm removal", repo.isMediaOriginalGone(sourceUri.toString(), originalFile.absolutePath))
 
             val entries = repo.listVaultEntries()
             assertEquals(1, entries.size)
@@ -126,5 +132,93 @@ class VaultEncryptionAndMoveTest {
             repo.deleteEntry(stored)
             sourceDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `dns packet codec parses ipv4 udp dns query and builds valid swapped response`() {
+        val dnsQuery = byteArrayOf(
+            0x12, 0x34, // Transaction ID
+            0x01, 0x00, // Standard query
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, 'e'.code.toByte(), 'x'.code.toByte(), 'a'.code.toByte(), 'm'.code.toByte(),
+            'p'.code.toByte(), 'l'.code.toByte(), 'e'.code.toByte(),
+            0x03, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(),
+            0x00,
+            0x00, 0x01, 0x00, 0x01,
+        )
+        val totalLen = 20 + 8 + dnsQuery.size
+        val queryPacket = ByteArray(totalLen)
+        queryPacket[0] = 0x45.toByte()
+        queryPacket[2] = ((totalLen ushr 8) and 0xFF).toByte()
+        queryPacket[3] = (totalLen and 0xFF).toByte()
+        queryPacket[8] = 64.toByte()
+        queryPacket[9] = 17.toByte() // UDP
+        // Src IP: 10.111.111.1 -> Dst IP: 1.1.1.1
+        queryPacket[12] = 10; queryPacket[13] = 111; queryPacket[14] = 111; queryPacket[15] = 1
+        queryPacket[16] = 1; queryPacket[17] = 1; queryPacket[18] = 1; queryPacket[19] = 1
+        // UDP SrcPort: 54321 -> DstPort: 53
+        queryPacket[20] = (54321 ushr 8).toByte(); queryPacket[21] = (54321 and 0xFF).toByte()
+        queryPacket[22] = 0; queryPacket[23] = 53
+        val udpLen = 8 + dnsQuery.size
+        queryPacket[24] = (udpLen ushr 8).toByte(); queryPacket[25] = (udpLen and 0xFF).toByte()
+        System.arraycopy(dnsQuery, 0, queryPacket, 28, dnsQuery.size)
+
+        val parsed = DnsPacketCodec.parseIpv4UdpDnsPacket(queryPacket, queryPacket.size)
+        assertNotNull(parsed)
+        assertEquals(54321, parsed!!.srcPort)
+        assertEquals(53, parsed.dstPort)
+        assertArrayEquals(byteArrayOf(10, 111, 111, 1), parsed.srcIp)
+        assertArrayEquals(byteArrayOf(1, 1, 1, 1), parsed.dstIp)
+        assertArrayEquals(dnsQuery, parsed.dnsPayload)
+
+        val dnsResp = dnsQuery.copyOf().also { it[2] = 0x81.toByte(); it[3] = 0x80.toByte() }
+        val responsePacket = DnsPacketCodec.buildIpv4UdpDnsResponse(parsed, dnsResp)
+        assertEquals(20 + 8 + dnsResp.size, responsePacket.size)
+        // Src IP should now be 1.1.1.1, Dst IP 10.111.111.1
+        assertArrayEquals(byteArrayOf(1, 1, 1, 1), responsePacket.copyOfRange(12, 16))
+        assertArrayEquals(byteArrayOf(10, 111, 111, 1), responsePacket.copyOfRange(16, 20))
+        // Src Port = 53, Dst Port = 54321
+        assertEquals(53, ((responsePacket[20].toInt() and 0xFF) shl 8) or (responsePacket[21].toInt() and 0xFF))
+        assertEquals(54321, ((responsePacket[22].toInt() and 0xFF) shl 8) or (responsePacket[23].toInt() and 0xFF))
+        // IPv4 Header checksum verification (sum of header including checksum == 0)
+        assertEquals(0, DnsPacketCodec.computeChecksum(responsePacket, 0, 20))
+        // Non-DNS traffic must be ignored
+        val nonDnsPacket = queryPacket.copyOf().also { it[23] = 80 }
+        assertNull(DnsPacketCodec.parseIpv4UdpDnsPacket(nonDnsPacket, nonDnsPacket.size))
+    }
+
+    @Test
+    fun `browser preferences store persists bookmarks, history, adblock, and search engine`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val store = BrowserPreferencesStore.getInstance(context)
+        store.clearHistory()
+
+        assertTrue(store.adBlockEnabled.value)
+        store.setAdBlockEnabled(false)
+        assertFalse(store.adBlockEnabled.value)
+        store.setAdBlockEnabled(true)
+
+        val initialEngine = store.searchEngine.value
+        val nextEngine = store.cycleSearchEngine()
+        assertEquals(
+            BrowserSearchEngine.entries[(BrowserSearchEngine.entries.indexOf(initialEngine) + 1) % BrowserSearchEngine.entries.size],
+            nextEngine,
+        )
+
+        val url = "https://example.org/watch?v=42"
+        assertTrue(store.toggleBookmark(url, "Example Watch"))
+        assertTrue(store.isBookmarked(url))
+        assertFalse(store.toggleBookmark(url, "Example Watch"))
+        assertFalse(store.isBookmarked(url))
+
+        store.recordHistory("https://kotlinlang.org/", "Kotlin")
+        store.recordHistory("https://developer.android.com/", "Android Developers")
+        store.recordHistory("https://kotlinlang.org/", "Kotlin Updated")
+        assertEquals(2, store.history.value.size)
+        assertEquals("https://kotlinlang.org/", store.history.value.first().url)
+
+        store.clearHistory()
+        assertTrue(store.history.value.isEmpty())
     }
 }

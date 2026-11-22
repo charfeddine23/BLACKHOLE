@@ -8,13 +8,17 @@ import android.os.Build
 import android.os.SystemClock
 import com.example.BuildConfig
 import com.example.engine.extractor.VideoStreamExtractor
+import com.example.engine.media.TurboHttpDownloader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.util.concurrent.TimeUnit
 
 data class GitHubReleaseInfo(
     val versionName: String,
@@ -44,7 +48,7 @@ sealed class InAppInstallOutcome {
 }
 
 class AppUpdateManager(
-    private val client: OkHttpClient = VideoStreamExtractor.defaultOkHttpClient(),
+    private val client: OkHttpClient = buildHighSpeedUpdateClient(),
 ) {
 
     suspend fun checkLatestRelease(
@@ -152,59 +156,51 @@ class AppUpdateManager(
         val partFile = File(updatesDir, "$safeName.part")
         if (partFile.exists()) partFile.delete()
 
-        val request = Request.Builder()
-            .url(downloadUrl)
-            .header("Accept", "application/octet-stream")
-            .header("User-Agent", "Blackhole-Pulse-Android/${BuildConfig.VERSION_NAME}")
-            .build()
+        val headers = mapOf(
+            "Accept" to "application/octet-stream",
+            "User-Agent" to "Blackhole-Pulse-Android/${BuildConfig.VERSION_NAME}",
+            "Accept-Encoding" to "identity",
+        )
+        var lastEmitMs = 0L
 
-        runCatching {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@withContext null
-                val body = response.body ?: return@withContext null
-                val totalBytes = body.contentLength().takeIf { it > 0L }
-                    ?: release.apkSizeBytes.takeIf { it > 0L }
-                    ?: -1L
-
-                body.byteStream().use { input ->
-                    partFile.outputStream().use { output ->
-                        val buffer = ByteArray(16 * 1024)
-                        var downloaded = 0L
-                        var lastEmitMs = 0L
-
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            output.write(buffer, 0, read)
-                            downloaded += read
-
-                            val now = SystemClock.elapsedRealtime()
-                            if (now - lastEmitMs >= 60L) {
-                                val fraction = if (totalBytes > 0L) {
-                                    (downloaded.toFloat() / totalBytes.toFloat()).coerceIn(0.02f, 0.99f)
-                                } else {
-                                    // Smooth progressive arc if Content-Length header is absent
-                                    (1f - 1f / (1f + downloaded / (8f * 1024f * 1024f))).coerceIn(0.05f, 0.95f)
-                                }
-                                onProgress(fraction)
-                                lastEmitMs = now
-                            }
+        val success = runCatching {
+            TurboHttpDownloader.downloadToFile(
+                client = client,
+                url = downloadUrl,
+                headers = headers,
+                destination = partFile,
+                isCancelled = { false },
+                onBytes = { downloaded, reportedTotal ->
+                    val totalBytes = reportedTotal.takeIf { it > 0L }
+                        ?: release.apkSizeBytes.takeIf { it > 0L }
+                        ?: -1L
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastEmitMs >= 50L || (totalBytes > 0L && downloaded >= totalBytes)) {
+                        val fraction = if (totalBytes > 0L) {
+                            (downloaded.toFloat() / totalBytes.toFloat()).coerceIn(0.02f, 0.99f)
+                        } else {
+                            (1f - 1f / (1f + downloaded / (8f * 1024f * 1024f))).coerceIn(0.05f, 0.95f)
                         }
-                        output.flush()
+                        onProgress(fraction)
+                        lastEmitMs = now
                     }
-                }
-            }
+                },
+            )
+        }.getOrDefault(false)
 
-            if (partFile.exists() && partFile.length() > 100_000L) {
-                if (targetFile.exists()) targetFile.delete()
-                partFile.renameTo(targetFile)
+        val sizeMatches = release.apkSizeBytes <= 0L || partFile.length() == release.apkSizeBytes
+        if (success && partFile.exists() && partFile.length() > 100_000L && sizeMatches) {
+            if (targetFile.exists()) targetFile.delete()
+            if (partFile.renameTo(targetFile)) {
                 onProgress(1f)
                 targetFile
             } else {
+                partFile.copyTo(targetFile, overwrite = true)
                 partFile.delete()
-                null
+                onProgress(1f)
+                targetFile
             }
-        }.getOrElse {
+        } else {
             partFile.delete()
             null
         }
@@ -311,5 +307,22 @@ class AppUpdateManager(
         const val REPO_RELEASES_FALLBACK_URL = "https://github.com/charfeddine23/BLACKHOLE/releases/latest"
         private const val LATEST_RELEASE_API =
             "https://api.github.com/repos/charfeddine23/BLACKHOLE/releases/latest"
+
+        fun buildHighSpeedUpdateClient(): OkHttpClient {
+            val dispatcher = Dispatcher().apply {
+                maxRequests = 32
+                maxRequestsPerHost = 16
+            }
+            return VideoStreamExtractor.defaultOkHttpClient().newBuilder()
+                .dispatcher(dispatcher)
+                .connectionPool(ConnectionPool(16, 2, TimeUnit.MINUTES))
+                .connectTimeout(12, TimeUnit.SECONDS)
+                .readTimeout(25, TimeUnit.SECONDS)
+                .writeTimeout(25, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+        }
     }
 }

@@ -227,11 +227,11 @@ fun VaultScreen(
         vaultViewModel.consumePendingMediaDeleteSender(result.resultCode == Activity.RESULT_OK)
     }
 
-    LaunchedEffect(uiState.pendingMediaDeleteSender) {
-        val sender = uiState.pendingMediaDeleteSender ?: return@LaunchedEffect
+    LaunchedEffect(uiState.pendingDeleteRequest?.id) {
+        val req = uiState.pendingDeleteRequest ?: return@LaunchedEffect
         vaultViewModel.beginExternalSystemFlow()
         val launched = runCatching {
-            mediaDeleteRequestLauncher.launch(IntentSenderRequest.Builder(sender).build())
+            mediaDeleteRequestLauncher.launch(IntentSenderRequest.Builder(req.sender).build())
             true
         }.getOrDefault(false)
         if (!launched) {
@@ -247,6 +247,24 @@ fun VaultScreen(
         vaultViewModel.refreshPermissionAndEntries()
     }
 
+    val openAppPermissionDetails: () -> Unit = {
+        vaultViewModel.beginExternalSystemFlow()
+        val detailsIntent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.fromParts("package", context.packageName, null),
+        )
+        val launched = runCatching {
+            allFilesSettingsLauncher.launch(detailsIntent)
+            true
+        }.getOrDefault(false)
+        if (!launched) {
+            vaultViewModel.endExternalSystemFlow()
+            vaultViewModel.reportStatusError("تعذر فتح إعدادات صلاحيات التطبيق على هذا الجهاز.")
+        }
+    }
+
+    var lastPermissionPromptMs by remember { mutableStateOf(0L) }
+
     val runtimeMediaPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
@@ -254,20 +272,32 @@ fun VaultScreen(
         vaultViewModel.refreshPermissionAndEntries()
         val anyGranted = grants.values.any { it }
         if (!anyGranted && !uiState.hasAllFilesAccess) {
-            vaultViewModel.reportStatusError("يرجى منح صلاحية الوصول إلى ملفات وصور الهاتف للمتابعة.")
+            val elapsed = android.os.SystemClock.elapsedRealtime() - lastPermissionPromptMs
+            if (elapsed in 0L..350L) {
+                // OS suppressed permission dialog ("Don't ask again") -> open App Settings directly
+                openAppPermissionDetails()
+            } else {
+                vaultViewModel.reportStatusError("يرجى منح صلاحية الوصول إلى ملفات وصور الهاتف للمتابعة.")
+            }
         }
     }
 
     val requestMediaAccessPermission: () -> Unit = {
         vaultViewModel.beginExternalSystemFlow()
-        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(
+        lastPermissionPromptMs = android.os.SystemClock.elapsedRealtime()
+        val perms = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+            )
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
                 Manifest.permission.READ_MEDIA_IMAGES,
                 Manifest.permission.READ_MEDIA_VIDEO,
                 Manifest.permission.READ_MEDIA_AUDIO,
             )
-        } else {
-            arrayOf(
+            else -> arrayOf(
                 Manifest.permission.READ_EXTERNAL_STORAGE,
                 Manifest.permission.WRITE_EXTERNAL_STORAGE,
             )
@@ -278,34 +308,40 @@ fun VaultScreen(
         }.getOrDefault(false)
         if (!launched) {
             vaultViewModel.endExternalSystemFlow()
+            openAppPermissionDetails()
         }
     }
 
     val requestAllFilesAccess: () -> Unit = {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             vaultViewModel.beginExternalSystemFlow()
-            val appSettingsIntent = Intent(
-                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                Uri.parse("package:${context.packageName}"),
+            val packageUri = Uri.fromParts("package", context.packageName, null)
+            val candidateIntents = listOf(
+                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, packageUri),
+                Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri),
             )
-            val fallbackSettingsIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-            val launched = when {
-                appSettingsIntent.resolveActivity(context.packageManager) != null && runCatching {
-                    allFilesSettingsLauncher.launch(appSettingsIntent)
+            var launched = false
+            for (intent in candidateIntents) {
+                val ok = runCatching {
+                    allFilesSettingsLauncher.launch(intent)
                     true
-                }.getOrDefault(false) -> true
-                fallbackSettingsIntent.resolveActivity(context.packageManager) != null && runCatching {
-                    allFilesSettingsLauncher.launch(fallbackSettingsIntent)
-                    true
-                }.getOrDefault(false) -> true
-                else -> false
+                }.getOrDefault(false)
+                if (ok) {
+                    launched = true
+                    break
+                }
             }
             if (!launched) {
                 vaultViewModel.endExternalSystemFlow()
-                requestMediaAccessPermission()
+                vaultViewModel.reportStatusError("تعذر فتح صفحة صلاحية كل الملفات — افتح إعدادات التطبيق ومنح الصلاحية يدوياً.")
             }
         } else {
-            requestMediaAccessPermission()
+            if (uiState.hasMediaAccess && !uiState.hasAllFilesAccess) {
+                openAppPermissionDetails()
+            } else {
+                requestMediaAccessPermission()
+            }
         }
     }
 

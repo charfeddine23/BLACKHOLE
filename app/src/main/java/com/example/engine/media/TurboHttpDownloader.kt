@@ -23,10 +23,10 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object TurboHttpDownloader {
 
-    private const val READ_BUFFER_BYTES = 128 * 1024
-    private const val FILE_BUFFER_BYTES = 256 * 1024
-    private const val PARALLEL_THRESHOLD_BYTES = 1_500_000L // 1.5 MB
-    private const val PROGRESS_EMIT_STEP_BYTES = 48 * 1024L
+    private const val READ_BUFFER_BYTES = 256 * 1024
+    private const val FILE_BUFFER_BYTES = 512 * 1024
+    private const val PARALLEL_THRESHOLD_BYTES = 1_000_000L // 1 MB
+    private const val PROGRESS_EMIT_STEP_BYTES = 64 * 1024L
 
     suspend fun downloadToFile(
         client: OkHttpClient,
@@ -121,8 +121,8 @@ object TurboHttpDownloader {
         onBytes: (downloaded: Long, contentLength: Long) -> Unit,
     ): Boolean = coroutineScope {
         val workerCount = when {
-            totalBytes >= 12_000_000L -> 6
-            totalBytes >= 4_000_000L -> 5
+            totalBytes >= 10_000_000L -> 8
+            totalBytes >= 4_000_000L -> 6
             else -> 4
         }
 

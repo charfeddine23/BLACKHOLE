@@ -1,15 +1,31 @@
 package com.example.ui.components
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.DownloadManager
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.net.VpnService
+import android.os.Environment
+import android.os.Message
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -34,6 +50,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -46,6 +63,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.BookmarkBorder
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Lock
@@ -53,15 +71,26 @@ import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowDownward
+import androidx.compose.material.icons.rounded.Block
+import androidx.compose.material.icons.rounded.Bookmark
+import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DesktopWindows
+import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.VerifiedUser
+import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.VpnLock
 import androidx.compose.material.icons.rounded.ZoomIn
 import androidx.compose.material.icons.rounded.ZoomOut
 import androidx.compose.material3.HorizontalDivider
@@ -95,6 +124,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -104,7 +134,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.local.BrowserPreferencesStore
+import com.example.data.local.BrowserSearchEngine
 import com.example.engine.network.ClientSpoofer
+import com.example.engine.network.CloudflareDnsVpnService
 import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ChromeSilver
@@ -117,9 +151,18 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
+import kotlinx.coroutines.delay
+import java.io.ByteArrayInputStream
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val HOME_TAB_URL = "about:blackhole-home"
+
+private enum class BrowserSubTray {
+    BOOKMARKS,
+    HISTORY,
+    FIND,
+}
 
 private data class BrowserTabState(
     val id: String = UUID.randomUUID().toString(),
@@ -128,6 +171,7 @@ private data class BrowserTabState(
     val progress: Int = 0,
     val canGoBack: Boolean = false,
     val canGoForward: Boolean = false,
+    val isIncognito: Boolean = false,
 ) {
     val isHome: Boolean get() = url == HOME_TAB_URL
 }
@@ -219,6 +263,14 @@ fun DownloadedVideosBrowserPanel(
     onBindWebViewRef: (WebView?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
+    val browserPrefs = remember(context) { BrowserPreferencesStore.getInstance(context) }
+    val bookmarks by browserPrefs.bookmarks.collectAsStateWithLifecycle()
+    val historyEntries by browserPrefs.history.collectAsStateWithLifecycle()
+    val adBlockEnabled by browserPrefs.adBlockEnabled.collectAsStateWithLifecycle()
+    val searchEngine by browserPrefs.searchEngine.collectAsStateWithLifecycle()
+    val isVpnActive by CloudflareDnsVpnService.isVpnActive.collectAsStateWithLifecycle()
+
     val tabs = remember { mutableStateListOf(BrowserTabState()) }
     var activeTabIndex by remember { mutableIntStateOf(0) }
     val activeTab = tabs.getOrElse(activeTabIndex) { tabs.first() }
@@ -229,14 +281,61 @@ fun DownloadedVideosBrowserPanel(
     var showPromoBanner by remember { mutableStateOf(true) }
     var showToolsBar by remember { mutableStateOf(false) }
     var showTabsBarTray by remember { mutableStateOf(false) }
+    var activeSubTray by remember { mutableStateOf<BrowserSubTray?>(null) }
     var isDesktopMode by remember { mutableStateOf(false) }
     var confirmClearCookies by remember { mutableStateOf(false) }
+    var confirmClearHistory by remember { mutableStateOf(false) }
+    var localStatusBanner by remember { mutableStateOf<String?>(null) }
+
+    val blockedAdsCounter = remember { AtomicInteger(0) }
+    var blockedAdsCount by remember { mutableIntStateOf(0) }
+
+    var findQuery by remember { mutableStateOf("") }
+    var findMatchIndex by remember { mutableIntStateOf(0) }
+    var findTotalMatches by remember { mutableIntStateOf(0) }
+
+    var customFullscreenView by remember { mutableStateOf<View?>(null) }
+    var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
     var zoomPercent by remember { mutableIntStateOf(100) }
     var cssFallbackZoom by remember { mutableIntStateOf(100) }
     var baseScale by remember { mutableStateOf<Float?>(null) }
 
     val activeWebView = webViews[activeTab.id]
+    val isCurrentBookmarked = !activeTab.isHome && browserPrefs.isBookmarked(activeTab.url)
+
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            CloudflareDnsVpnService.start(context)
+            localStatusBanner = "1.1.1.1 Cloudflare DNS VPN active"
+        } else {
+            localStatusBanner = "1.1.1.1 VPN permission was declined"
+        }
+    }
+
+    fun toggleCloudflareVpn() {
+        if (isVpnActive) {
+            CloudflareDnsVpnService.stop(context)
+            localStatusBanner = "1.1.1.1 VPN disconnected"
+            return
+        }
+        val prepareIntent = runCatching { VpnService.prepare(context) }.getOrNull()
+        if (prepareIntent != null) {
+            vpnPermissionLauncher.launch(prepareIntent)
+        } else {
+            CloudflareDnsVpnService.start(context)
+            localStatusBanner = "1.1.1.1 Cloudflare DNS VPN active"
+        }
+    }
+
+    LaunchedEffect(localStatusBanner) {
+        if (!localStatusBanner.isNullOrBlank()) {
+            delay(3200L)
+            localStatusBanner = null
+        }
+    }
 
     // Ensure AES-256 permanently saved cookies are injected into WebView CookieManager on entry
     LaunchedEffect(Unit) {
@@ -248,15 +347,24 @@ fun DownloadedVideosBrowserPanel(
         if (!isUrlFocused) {
             addressText = if (activeTab.isHome) "" else activeTab.url
         }
+        if (activeTab.isHome && activeSubTray == BrowserSubTray.FIND) {
+            activeSubTray = null
+        }
     }
 
     DisposableEffect(Unit) {
         onDispose {
-            val currentUrl = webViews[activeTab.id]?.url ?: activeTab.url
-            if (currentUrl.startsWith("http", ignoreCase = true)) {
-                onAutoSyncCookies(currentUrl)
-            } else {
-                onAutoSyncCookies("https://www.instagram.com/")
+            runCatching { customViewCallback?.onCustomViewHidden() }
+            customFullscreenView = null
+            customViewCallback = null
+            val currentTab = tabs.getOrNull(activeTabIndex)
+            if (currentTab != null && !currentTab.isIncognito) {
+                val currentUrl = webViews[currentTab.id]?.url ?: currentTab.url
+                if (currentUrl.startsWith("http", ignoreCase = true)) {
+                    onAutoSyncCookies(currentUrl)
+                } else {
+                    onAutoSyncCookies("https://www.instagram.com/")
+                }
             }
             onBindWebViewRef(null)
             webViews.values.forEach { wv ->
@@ -269,6 +377,32 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
+    fun exitFullscreenVideo() {
+        runCatching { customViewCallback?.onCustomViewHidden() }
+        customFullscreenView = null
+        customViewCallback = null
+    }
+
+    BackHandler(
+        enabled = customFullscreenView != null ||
+            activeSubTray != null ||
+            (!activeTab.isHome && activeTab.canGoBack),
+    ) {
+        when {
+            customFullscreenView != null -> exitFullscreenVideo()
+            activeSubTray != null -> {
+                if (activeSubTray == BrowserSubTray.FIND) {
+                    webViews[activeTab.id]?.clearMatches()
+                    findQuery = ""
+                    findMatchIndex = 0
+                    findTotalMatches = 0
+                }
+                activeSubTray = null
+            }
+            !activeTab.isHome && activeTab.canGoBack -> webViews[activeTab.id]?.goBack()
+        }
+    }
+
     fun updateTabById(tabId: String, transform: (BrowserTabState) -> BrowserTabState) {
         val idx = tabs.indexOfFirst { it.id == tabId }
         if (idx >= 0) {
@@ -276,18 +410,18 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
-    fun normalizeInputToUrl(raw: String): String {
+    fun normalizeInputToUrl(raw: String, engine: BrowserSearchEngine = searchEngine): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return HOME_TAB_URL
         return when {
             trimmed.startsWith("http://", ignoreCase = true) ||
                 trimmed.startsWith("https://", ignoreCase = true) -> trimmed
             trimmed.contains(".") && !trimmed.contains(" ") -> "https://$trimmed"
-            else -> "https://www.google.com/search?q=${trimmed.replace(" ", "+")}"
+            else -> "${engine.searchTemplate}${Uri.encode(trimmed)}"
         }
     }
 
-    fun resolveNativeMobileUserAgent(ctx: android.content.Context): String {
+    fun resolveNativeMobileUserAgent(ctx: Context): String {
         return runCatching {
             WebSettings.getDefaultUserAgent(ctx)
                 .replace(Regex(";\\s*wv\\b"), "")
@@ -337,7 +471,7 @@ fun DownloadedVideosBrowserPanel(
     }
 
     fun openUrlInActiveTab(raw: String) {
-        val rawNormalized = normalizeInputToUrl(raw)
+        val rawNormalized = normalizeInputToUrl(raw, searchEngine)
         if (rawNormalized == HOME_TAB_URL) {
             updateTabById(activeTab.id) {
                 it.copy(title = "New tab", url = HOME_TAB_URL, progress = 0, canGoBack = false, canGoForward = false)
@@ -361,10 +495,15 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
-    fun openNewTab(initialUrl: String = HOME_TAB_URL) {
+    fun openNewTab(initialUrl: String = HOME_TAB_URL, incognito: Boolean = false) {
         val tab = BrowserTabState(
-            title = if (initialUrl == HOME_TAB_URL) "New tab" else deriveHostLabel(initialUrl),
+            title = if (initialUrl == HOME_TAB_URL) {
+                if (incognito) "Private" else "New tab"
+            } else {
+                deriveHostLabel(initialUrl)
+            },
             url = initialUrl,
+            isIncognito = incognito,
         )
         tabs.add(tab)
         activeTabIndex = tabs.lastIndex
@@ -372,6 +511,9 @@ fun DownloadedVideosBrowserPanel(
         zoomPercent = 100
         cssFallbackZoom = 100
         showTabsBarTray = false
+        if (incognito && initialUrl == HOME_TAB_URL) {
+            localStatusBanner = "Private tab opened — history not saved"
+        }
     }
 
     fun closeTab(index: Int) {
@@ -429,6 +571,41 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
+    fun runFindInPage(query: String) {
+        findQuery = query
+        val wv = webViews[activeTab.id] ?: return
+        if (query.isBlank()) {
+            wv.clearMatches()
+            findMatchIndex = 0
+            findTotalMatches = 0
+        } else {
+            wv.findAllAsync(query)
+        }
+    }
+
+    fun shareActiveUrl() {
+        val target = webViews[activeTab.id]?.url ?: activeTab.url
+        if (target == HOME_TAB_URL || target.isBlank()) return
+        runCatching {
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, activeTab.title)
+                putExtra(Intent.EXTRA_TEXT, target)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Share link"))
+        }
+    }
+
+    fun copyActiveUrl() {
+        val target = webViews[activeTab.id]?.url ?: activeTab.url
+        if (target == HOME_TAB_URL || target.isBlank()) return
+        runCatching {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("URL", target))
+            localStatusBanner = "Link copied"
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -460,12 +637,17 @@ fun DownloadedVideosBrowserPanel(
                 ) {
                     tabs.forEachIndexed { index, tab ->
                         val isSelected = index == activeTabIndex
+                        val selectedAccent = if (tab.isIncognito) PlasmaViolet else NeonCyan
                         Surface(
                             color = if (isSelected) NightTabSelected else NightTabInactive,
                             shape = RoundedCornerShape(50),
                             border = BorderStroke(
                                 width = 0.7.dp,
-                                color = if (isSelected) NeonCyan.copy(alpha = 0.45f) else NightHairline,
+                                color = when {
+                                    isSelected -> selectedAccent.copy(alpha = 0.5f)
+                                    tab.isIncognito -> PlasmaViolet.copy(alpha = 0.35f)
+                                    else -> NightHairline
+                                },
                             ),
                             modifier = Modifier
                                 .height(26.dp)
@@ -478,14 +660,14 @@ fun DownloadedVideosBrowserPanel(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Icon(
-                                    imageVector = Icons.Outlined.Public,
-                                    contentDescription = null,
-                                    tint = if (isSelected) NeonCyan else MutedSlate,
+                                    imageVector = if (tab.isIncognito) Icons.Rounded.VisibilityOff else Icons.Outlined.Public,
+                                    contentDescription = if (tab.isIncognito) "Private tab" else null,
+                                    tint = if (isSelected) selectedAccent else if (tab.isIncognito) PlasmaViolet.copy(alpha = 0.8f) else MutedSlate,
                                     modifier = Modifier.size(12.dp),
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = tab.title.ifBlank { "New tab" },
+                                    text = tab.title.ifBlank { if (tab.isIncognito) "Private" else "New tab" },
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         fontSize = 11.sp,
                                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
@@ -659,6 +841,40 @@ fun DownloadedVideosBrowserPanel(
                         }
                     }
 
+                    if (isVpnActive) {
+                        Surface(
+                            color = EmeraldPulse.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(6.dp),
+                            border = BorderStroke(0.6.dp, EmeraldPulse.copy(alpha = 0.55f)),
+                            modifier = Modifier
+                                .padding(end = 4.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { toggleCloudflareVpn() }
+                                .testTag("browser_address_vpn_pill"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.VpnLock,
+                                    contentDescription = "1.1.1.1 VPN active",
+                                    tint = EmeraldPulse,
+                                    modifier = Modifier.size(10.dp),
+                                )
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Text(
+                                    text = "1.1.1.1",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = 8.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                    ),
+                                    color = EmeraldPulse,
+                                )
+                            }
+                        }
+                    }
+
                     if (isDesktopMode) {
                         Surface(
                             color = NeonCyan.copy(alpha = 0.14f),
@@ -704,17 +920,21 @@ fun DownloadedVideosBrowserPanel(
                                     .padding(horizontal = 5.dp, vertical = 1.dp),
                             )
                         }
+                        val isLoadingPage = activeTab.progress in 1..99
                         Box(
                             modifier = Modifier
                                 .size(26.dp)
                                 .clip(CircleShape)
-                                .clickable { webViews[activeTab.id]?.reload() }
+                                .clickable {
+                                    val wv = webViews[activeTab.id]
+                                    if (isLoadingPage) wv?.stopLoading() else wv?.reload()
+                                }
                                 .testTag("browser_url_reload_button"),
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.Refresh,
-                                contentDescription = "Reload page",
+                                imageVector = if (isLoadingPage) Icons.Rounded.Close else Icons.Rounded.Refresh,
+                                contentDescription = if (isLoadingPage) "Stop loading" else "Reload page",
                                 tint = ChromeSilver.copy(alpha = 0.85f),
                                 modifier = Modifier.size(15.dp),
                             )
@@ -777,10 +997,15 @@ fun DownloadedVideosBrowserPanel(
                                 settings.apply {
                                     javaScriptEnabled = true
                                     javaScriptCanOpenWindowsAutomatically = true
-                                    setSupportMultipleWindows(false)
+                                    setSupportMultipleWindows(true)
                                     domStorageEnabled = true
-                                    databaseEnabled = true
-                                    cacheMode = WebSettings.LOAD_DEFAULT
+                                    databaseEnabled = !activeTab.isIncognito
+                                    saveFormData = !activeTab.isIncognito
+                                    cacheMode = if (activeTab.isIncognito) {
+                                        WebSettings.LOAD_NO_CACHE
+                                    } else {
+                                        WebSettings.LOAD_DEFAULT
+                                    }
                                     useWideViewPort = true
                                     loadWithOverviewMode = true
                                     setSupportZoom(true)
@@ -795,23 +1020,98 @@ fun DownloadedVideosBrowserPanel(
                                     }
                                 }
 
+                                setFindListener { activeMatchOrdinal, numberOfMatches, _ ->
+                                    if (tabId == tabs.getOrNull(activeTabIndex)?.id) {
+                                        findMatchIndex = if (numberOfMatches > 0) activeMatchOrdinal + 1 else 0
+                                        findTotalMatches = numberOfMatches
+                                    }
+                                }
+
+                                setDownloadListener { dlUrl, userAgent, contentDisposition, mimetype, _ ->
+                                    if (dlUrl.isNullOrBlank()) return@setDownloadListener
+                                    val fileName = URLUtil.guessFileName(dlUrl, contentDisposition, mimetype)
+                                        .ifBlank { "download.bin" }
+                                    val queued = runCatching {
+                                        val req = DownloadManager.Request(Uri.parse(dlUrl)).apply {
+                                            setTitle(fileName)
+                                            setMimeType(mimetype)
+                                            if (!userAgent.isNullOrBlank()) {
+                                                addRequestHeader("User-Agent", userAgent)
+                                            }
+                                            CookieManager.getInstance().getCookie(dlUrl)?.let { cookie ->
+                                                addRequestHeader("Cookie", cookie)
+                                            }
+                                            setNotificationVisibility(
+                                                DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
+                                            )
+                                            setDestinationInExternalPublicDir(
+                                                Environment.DIRECTORY_DOWNLOADS,
+                                                fileName,
+                                            )
+                                        }
+                                        val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                        dm.enqueue(req)
+                                        true
+                                    }.getOrDefault(false)
+                                    localStatusBanner = if (queued) {
+                                        "Downloading: $fileName"
+                                    } else {
+                                        "Unable to start download"
+                                    }
+                                }
+
                                 webViewClient = object : WebViewClient() {
+                                    override fun shouldInterceptRequest(
+                                        view: WebView?,
+                                        request: WebResourceRequest?,
+                                    ): WebResourceResponse? {
+                                        if (adBlockEnabled && isAdOrTrackerRequest(request)) {
+                                            val updated = blockedAdsCounter.incrementAndGet()
+                                            view?.post { blockedAdsCount = updated }
+                                            return WebResourceResponse(
+                                                "text/plain",
+                                                "utf-8",
+                                                ByteArrayInputStream(ByteArray(0)),
+                                            )
+                                        }
+                                        return super.shouldInterceptRequest(view, request)
+                                    }
+
                                     override fun shouldOverrideUrlLoading(
                                         view: WebView?,
                                         request: WebResourceRequest?,
                                     ): Boolean {
                                         val nextUrl = request?.url?.toString().orEmpty()
-                                        return nextUrl.isNotBlank() &&
-                                            !nextUrl.startsWith("http://", ignoreCase = true) &&
-                                            !nextUrl.startsWith("https://", ignoreCase = true)
-                                    }
-
-                                    override fun onPageStarted(
-                                        view: WebView?,
-                                        url: String?,
-                                        favicon: android.graphics.Bitmap?,
-                                    ) {
-                                        super.onPageStarted(view, url, favicon)
+                                        if (nextUrl.isBlank()) return false
+                                        if (nextUrl.startsWith("http://", ignoreCase = true) ||
+                                            nextUrl.startsWith("https://", ignoreCase = true)
+                                        ) {
+                                            return false
+                                        }
+                                        if (nextUrl.startsWith("mailto:", ignoreCase = true) ||
+                                            nextUrl.startsWith("tel:", ignoreCase = true)
+                                        ) {
+                                            runCatching {
+                                                ctx.startActivity(
+                                                    Intent(Intent.ACTION_VIEW, Uri.parse(nextUrl)).apply {
+                                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    },
+                                                )
+                                            }
+                                            return true
+                                        }
+                                        if (nextUrl.startsWith("intent://", ignoreCase = true)) {
+                                            runCatching {
+                                                val parsed = Intent.parseUri(nextUrl, Intent.URI_INTENT_SCHEME).apply {
+                                                    addCategory(Intent.CATEGORY_BROWSABLE)
+                                                    component = null
+                                                    selector = null
+                                                }
+                                                ctx.startActivity(parsed)
+                                            }
+                                            return true
+                                        }
+                                        return true
                                     }
 
                                     override fun onScaleChanged(
@@ -833,6 +1133,7 @@ fun DownloadedVideosBrowserPanel(
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
+                                        val isPrivate = tabs.firstOrNull { it.id == tabId }?.isIncognito == true
                                         val cm = CookieManager.getInstance()
                                         cm.setAcceptCookie(true)
                                         view?.let { cm.setAcceptThirdPartyCookies(it, true) }
@@ -869,13 +1170,16 @@ fun DownloadedVideosBrowserPanel(
                                             if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
                                                 addressText = loaded
                                             }
-                                            val lowerLoaded = loaded.lowercase()
-                                            val midGoogleAuth = lowerLoaded.contains("accounts.google.") ||
-                                                lowerLoaded.contains("accounts.youtube.") ||
-                                                lowerLoaded.contains("consent.google.") ||
-                                                lowerLoaded.contains("consent.youtube.")
-                                            if (!midGoogleAuth) {
-                                                onAutoSyncCookies(loaded)
+                                            if (!isPrivate) {
+                                                browserPrefs.recordHistory(loaded, pageTitle)
+                                                val lowerLoaded = loaded.lowercase()
+                                                val midGoogleAuth = lowerLoaded.contains("accounts.google.") ||
+                                                    lowerLoaded.contains("accounts.youtube.") ||
+                                                    lowerLoaded.contains("consent.google.") ||
+                                                    lowerLoaded.contains("consent.youtube.")
+                                                if (!midGoogleAuth) {
+                                                    onAutoSyncCookies(loaded)
+                                                }
                                             }
                                         }
                                         view?.evaluateJavascript(
@@ -894,6 +1198,54 @@ fun DownloadedVideosBrowserPanel(
                                                 canGoForward = view?.canGoForward() == true,
                                             )
                                         }
+                                    }
+
+                                    override fun onReceivedTitle(view: WebView?, title: String?) {
+                                        if (!title.isNullOrBlank()) {
+                                            updateTabById(tabId) { it.copy(title = title) }
+                                        }
+                                    }
+
+                                    override fun onCreateWindow(
+                                        view: WebView?,
+                                        isDialog: Boolean,
+                                        isUserGesture: Boolean,
+                                        resultMsg: Message?,
+                                    ): Boolean {
+                                        val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                                        val isPrivate = tabs.firstOrNull { it.id == tabId }?.isIncognito == true
+                                        val popupCatcher = WebView(ctx)
+                                        popupCatcher.webViewClient = object : WebViewClient() {
+                                            override fun shouldOverrideUrlLoading(
+                                                v: WebView?,
+                                                request: WebResourceRequest?,
+                                            ): Boolean {
+                                                val target = request?.url?.toString().orEmpty()
+                                                if (target.startsWith("http", ignoreCase = true)) {
+                                                    openNewTab(initialUrl = target, incognito = isPrivate)
+                                                }
+                                                runCatching { popupCatcher.destroy() }
+                                                return true
+                                            }
+                                        }
+                                        transport.webView = popupCatcher
+                                        resultMsg.sendToTarget()
+                                        return true
+                                    }
+
+                                    override fun onShowCustomView(
+                                        view: View?,
+                                        callback: CustomViewCallback?,
+                                    ) {
+                                        if (view == null) return
+                                        customViewCallback?.onCustomViewHidden()
+                                        customFullscreenView = view
+                                        customViewCallback = callback
+                                    }
+
+                                    override fun onHideCustomView() {
+                                        customFullscreenView = null
+                                        customViewCallback = null
                                     }
                                 }
 
@@ -917,15 +1269,37 @@ fun DownloadedVideosBrowserPanel(
                     )
                 }
             }
+
+            // Fullscreen HTML5 Video Overlay
+            val fsView = customFullscreenView
+            if (fsView != null) {
+                AndroidView(
+                    factory = { ctx ->
+                        FrameLayout(ctx).apply {
+                            setBackgroundColor(android.graphics.Color.BLACK)
+                            (fsView.parent as? ViewGroup)?.removeView(fsView)
+                            addView(
+                                fsView,
+                                FrameLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                ),
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
         }
 
-        // 4. Inline Cookie Status Toast (Zero Dialog — Nocturnal)
+        // 4. Inline Cookie & Browser Status Toast (Zero Dialog — Nocturnal)
+        val combinedStatus = statusMessage ?: localStatusBanner
         AnimatedVisibility(
-            visible = !statusMessage.isNullOrBlank(),
+            visible = !combinedStatus.isNullOrBlank(),
             enter = expandVertically() + fadeIn(),
             exit = shrinkVertically() + fadeOut(),
         ) {
-            statusMessage?.let { msg ->
+            combinedStatus?.let { msg ->
                 Surface(
                     color = Color(0xFF0C1320),
                     border = BorderStroke(0.6.dp, NeonCyan.copy(alpha = 0.25f)),
@@ -950,7 +1324,10 @@ fun DownloadedVideosBrowserPanel(
                             modifier = Modifier
                                 .size(26.dp)
                                 .clip(CircleShape)
-                                .clickable { onDismissStatus() },
+                                .clickable {
+                                    localStatusBanner = null
+                                    onDismissStatus()
+                                },
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
@@ -960,6 +1337,272 @@ fun DownloadedVideosBrowserPanel(
                                 modifier = Modifier.size(15.dp),
                             )
                         }
+                    }
+                }
+            }
+        }
+
+        // 4b. Inline Browser Sub-Trays (Find-in-Page, Bookmarks, History — Nocturnal Obsidian)
+        AnimatedVisibility(
+            visible = activeSubTray != null,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+        ) {
+            Surface(
+                color = NightChromeSurface,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
+                    when (activeSubTray) {
+                        BrowserSubTray.FIND -> {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Surface(
+                                    color = NightAddressPill,
+                                    shape = RoundedCornerShape(14.dp),
+                                    border = BorderStroke(0.75.dp, NeonCyan.copy(alpha = 0.45f)),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(34.dp),
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Search,
+                                            contentDescription = null,
+                                            tint = NeonCyan,
+                                            modifier = Modifier.size(15.dp),
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        BasicTextField(
+                                            value = findQuery,
+                                            onValueChange = { runFindInPage(it) },
+                                            singleLine = true,
+                                            textStyle = MaterialTheme.typography.bodySmall.copy(
+                                                fontSize = 12.sp,
+                                                color = ChromeSilver,
+                                            ),
+                                            cursorBrush = SolidColor(NeonCyan),
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("browser_find_input"),
+                                        ) { inner ->
+                                            if (findQuery.isEmpty()) {
+                                                Text(
+                                                    text = "Find in page...",
+                                                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
+                                                    color = MutedSlate,
+                                                )
+                                            } else {
+                                                inner()
+                                            }
+                                        }
+                                        if (findQuery.isNotEmpty()) {
+                                            Text(
+                                                text = "$findMatchIndex/$findTotalMatches",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                                color = if (findTotalMatches > 0) NeonCyan else MutedSlate,
+                                            )
+                                        }
+                                    }
+                                }
+                                IconButton(
+                                    onClick = { webViews[activeTab.id]?.findNext(false) },
+                                    enabled = findTotalMatches > 0,
+                                    modifier = Modifier.size(34.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.KeyboardArrowUp,
+                                        contentDescription = "Previous match",
+                                        tint = if (findTotalMatches > 0) ChromeSilver else DimSlate,
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { webViews[activeTab.id]?.findNext(true) },
+                                    enabled = findTotalMatches > 0,
+                                    modifier = Modifier.size(34.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.KeyboardArrowDown,
+                                        contentDescription = "Next match",
+                                        tint = if (findTotalMatches > 0) ChromeSilver else DimSlate,
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        webViews[activeTab.id]?.clearMatches()
+                                        findQuery = ""
+                                        findMatchIndex = 0
+                                        findTotalMatches = 0
+                                        activeSubTray = null
+                                    },
+                                    modifier = Modifier.size(34.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Close,
+                                        contentDescription = "Close find",
+                                        tint = MutedSlate,
+                                    )
+                                }
+                            }
+                        }
+
+                        BrowserSubTray.BOOKMARKS -> {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                if (bookmarks.isEmpty()) {
+                                    Text(
+                                        text = "No bookmarks saved yet",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MutedSlate,
+                                        modifier = Modifier.padding(vertical = 4.dp),
+                                    )
+                                } else {
+                                    bookmarks.forEach { bm ->
+                                        Surface(
+                                            color = NightTrayPill,
+                                            shape = RoundedCornerShape(50),
+                                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.22f)),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(50))
+                                                .clickable {
+                                                    openUrlInActiveTab(bm.url)
+                                                    activeSubTray = null
+                                                    showToolsBar = false
+                                                },
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Bookmark,
+                                                    contentDescription = null,
+                                                    tint = NeonCyan,
+                                                    modifier = Modifier.size(13.dp),
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                                Text(
+                                                    text = bm.title,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = ChromeSilver,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.widthIn(max = 140.dp),
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Icon(
+                                                    imageVector = Icons.Rounded.Close,
+                                                    contentDescription = "Remove bookmark",
+                                                    tint = MutedSlate,
+                                                    modifier = Modifier
+                                                        .size(13.dp)
+                                                        .clickable { browserPrefs.removeBookmark(bm.url) },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        BrowserSubTray.HISTORY -> {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                if (historyEntries.isNotEmpty()) {
+                                    Surface(
+                                        color = if (confirmClearHistory) CrimsonAlert else CrimsonAlert.copy(alpha = 0.14f),
+                                        shape = RoundedCornerShape(50),
+                                        border = BorderStroke(0.75.dp, CrimsonAlert.copy(alpha = 0.6f)),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .clickable {
+                                                if (confirmClearHistory) {
+                                                    confirmClearHistory = false
+                                                    browserPrefs.clearHistory()
+                                                } else {
+                                                    confirmClearHistory = true
+                                                }
+                                            },
+                                    ) {
+                                        Text(
+                                            text = if (confirmClearHistory) "TAP CLEAR" else "CLEAR ALL",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = if (confirmClearHistory) Color.White else CrimsonAlert,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        )
+                                    }
+                                }
+                                if (historyEntries.isEmpty()) {
+                                    Text(
+                                        text = "No history recorded yet",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MutedSlate,
+                                        modifier = Modifier.padding(vertical = 4.dp),
+                                    )
+                                } else {
+                                    historyEntries.take(25).forEach { entry ->
+                                        Surface(
+                                            color = NightTrayPill,
+                                            shape = RoundedCornerShape(50),
+                                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(50))
+                                                .clickable {
+                                                    openUrlInActiveTab(entry.url)
+                                                    activeSubTray = null
+                                                    showToolsBar = false
+                                                },
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Rounded.History,
+                                                    contentDescription = null,
+                                                    tint = MutedSlate,
+                                                    modifier = Modifier.size(13.dp),
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                                Text(
+                                                    text = entry.title,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = ChromeSilver,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.widthIn(max = 150.dp),
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        null -> Unit
                     }
                 }
             }
@@ -1204,6 +1847,350 @@ fun DownloadedVideosBrowserPanel(
                             }
                         }
 
+                        // 1.1.1.1 Cloudflare DNS VPN Toggle
+                        Surface(
+                            color = if (isVpnActive) EmeraldPulse.copy(alpha = 0.16f) else NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.85.dp,
+                                if (isVpnActive) EmeraldPulse.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.22f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { toggleCloudflareVpn() }
+                                .testTag("browser_vpn_1111_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.VpnLock,
+                                    contentDescription = "Toggle 1.1.1.1 DNS VPN",
+                                    tint = if (isVpnActive) EmeraldPulse else ChromeSilver,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isVpnActive) "1.1.1.1 VPN ON" else "1.1.1.1 VPN",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = if (isVpnActive) EmeraldPulse else ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // Ad & Tracker Blocker Toggle
+                        Surface(
+                            color = if (adBlockEnabled) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.8.dp,
+                                if (adBlockEnabled) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable {
+                                    val next = !adBlockEnabled
+                                    browserPrefs.setAdBlockEnabled(next)
+                                    localStatusBanner = if (next) "Ad blocker enabled" else "Ad blocker paused"
+                                }
+                                .testTag("browser_adblock_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Block,
+                                    contentDescription = "Toggle ad blocker",
+                                    tint = if (adBlockEnabled) NeonCyan else MutedSlate,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (blockedAdsCount > 0) "ADBLOCK · $blockedAdsCount" else "ADBLOCK",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (adBlockEnabled) NeonCyan else ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // Bookmark Current Page Toggle
+                        Surface(
+                            color = if (isCurrentBookmarked) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.8.dp,
+                                if (isCurrentBookmarked) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable(enabled = !activeTab.isHome) {
+                                    val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
+                                    val added = browserPrefs.toggleBookmark(targetUrl, activeTab.title)
+                                    localStatusBanner = if (added) "Bookmark saved" else "Bookmark removed"
+                                }
+                                .testTag("browser_bookmark_toggle_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = if (isCurrentBookmarked) Icons.Rounded.Bookmark else Icons.Outlined.BookmarkBorder,
+                                    contentDescription = "Bookmark page",
+                                    tint = when {
+                                        activeTab.isHome -> DimSlate
+                                        isCurrentBookmarked -> NeonCyan
+                                        else -> ChromeSilver
+                                    },
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = if (isCurrentBookmarked) "SAVED" else "BOOKMARK",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = when {
+                                        activeTab.isHome -> DimSlate
+                                        isCurrentBookmarked -> NeonCyan
+                                        else -> ChromeSilver
+                                    },
+                                )
+                            }
+                        }
+
+                        // Bookmarks List Sub-Tray
+                        Surface(
+                            color = if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.8.dp,
+                                if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable {
+                                    activeSubTray = if (activeSubTray == BrowserSubTray.BOOKMARKS) null else BrowserSubTray.BOOKMARKS
+                                }
+                                .testTag("browser_bookmarks_tray_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Bookmarks,
+                                    contentDescription = "Bookmarks list",
+                                    tint = if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan else ChromeSilver,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = "BOOKMARKS (${bookmarks.size})",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan else ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // History List Sub-Tray
+                        Surface(
+                            color = if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.8.dp,
+                                if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable {
+                                    confirmClearHistory = false
+                                    activeSubTray = if (activeSubTray == BrowserSubTray.HISTORY) null else BrowserSubTray.HISTORY
+                                }
+                                .testTag("browser_history_tray_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.History,
+                                    contentDescription = "Browsing history",
+                                    tint = if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan else ChromeSilver,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = "HISTORY (${historyEntries.size})",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan else ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // Find in Page
+                        Surface(
+                            color = if (activeSubTray == BrowserSubTray.FIND) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.8.dp,
+                                if (activeSubTray == BrowserSubTray.FIND) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable(enabled = !activeTab.isHome) {
+                                    activeSubTray = if (activeSubTray == BrowserSubTray.FIND) {
+                                        webViews[activeTab.id]?.clearMatches()
+                                        null
+                                    } else {
+                                        BrowserSubTray.FIND
+                                    }
+                                }
+                                .testTag("browser_find_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Search,
+                                    contentDescription = "Find in page",
+                                    tint = when {
+                                        activeTab.isHome -> DimSlate
+                                        activeSubTray == BrowserSubTray.FIND -> NeonCyan
+                                        else -> ChromeSilver
+                                    },
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = "FIND",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (activeTab.isHome) DimSlate else ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // Open New Private Tab
+                        Surface(
+                            color = NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(0.8.dp, PlasmaViolet.copy(alpha = 0.5f)),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { openNewTab(incognito = true) }
+                                .testTag("browser_new_private_tab_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.VisibilityOff,
+                                    contentDescription = "New private tab",
+                                    tint = PlasmaViolet,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = "+ PRIVATE",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // Cycle Search Engine
+                        Surface(
+                            color = NightTrayPill,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable {
+                                    val nextEngine = browserPrefs.cycleSearchEngine()
+                                    localStatusBanner = "Search engine: ${nextEngine.label}"
+                                }
+                                .testTag("browser_search_engine_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Public,
+                                    contentDescription = "Cycle search engine",
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = "SEARCH: ${searchEngine.label.uppercase()}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = ChromeSilver,
+                                )
+                            }
+                        }
+
+                        // Copy & Share URL Actions
+                        if (!activeTab.isHome) {
+                            Surface(
+                                color = NightTrayPill,
+                                shape = RoundedCornerShape(50),
+                                border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .clickable { copyActiveUrl() }
+                                    .testTag("browser_copy_url_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.ContentCopy,
+                                        contentDescription = "Copy page link",
+                                        tint = ChromeSilver,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = "COPY",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = ChromeSilver,
+                                    )
+                                }
+                            }
+
+                            Surface(
+                                color = NightTrayPill,
+                                shape = RoundedCornerShape(50),
+                                border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .clickable { shareActiveUrl() }
+                                    .testTag("browser_share_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Share,
+                                        contentDescription = "Share page link",
+                                        tint = ChromeSilver,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = "SHARE",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = ChromeSilver,
+                                    )
+                                }
+                            }
+                        }
+
                         // Pull Video Action
                         if (!activeTab.isHome) {
                             Surface(
@@ -1322,6 +2309,32 @@ fun DownloadedVideosBrowserPanel(
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
                                     text = "New tab",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = ChromeSilver,
+                                )
+                            }
+                        }
+                        Surface(
+                            color = NightTrayPill,
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(0.8.dp, PlasmaViolet.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { openNewTab(incognito = true) },
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.VisibilityOff,
+                                    contentDescription = "Add private tab",
+                                    tint = PlasmaViolet,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Private",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = ChromeSilver,
                                 )
@@ -1777,6 +2790,41 @@ private fun SamsungStartPageHome(
                 }
             }
         }
+    }
+}
+
+private val AD_TRACKER_HOSTS = setOf(
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "pagead2.googlesyndication.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "scorecardresearch.com",
+    "taboola.com",
+    "outbrain.com",
+    "ads.twitter.com",
+    "analytics.tiktok.com",
+    "adnxs.com",
+    "pubmatic.com",
+    "criteo.com",
+    "quantserve.com",
+    "moatads.com",
+    "rubiconproject.com",
+    "openx.net",
+    "adsrvr.org",
+    "amazon-adsystem.com",
+    "advertising.com",
+)
+
+private fun isAdOrTrackerRequest(request: WebResourceRequest?): Boolean {
+    if (request == null || request.isForMainFrame) return false
+    val uri = request.url ?: return false
+    val host = uri.host?.lowercase() ?: return false
+    if (host == "connect.facebook.net" && uri.path.orEmpty().contains("signals")) return true
+    return AD_TRACKER_HOSTS.any { blocked ->
+        host == blocked || host.endsWith(".$blocked")
     }
 }
 

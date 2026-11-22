@@ -12,6 +12,9 @@ interface DownloadedVideoDao {
     @Query("SELECT * FROM downloaded_videos ORDER BY createdAt DESC")
     fun observeAllVideos(): Flow<List<DownloadedVideoEntity>>
 
+    @Query("SELECT * FROM downloaded_videos")
+    suspend fun getAllVideosSnapshot(): List<DownloadedVideoEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertVideo(video: DownloadedVideoEntity): Long
 

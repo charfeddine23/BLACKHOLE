@@ -57,6 +57,12 @@ data class VaultDevicePickerUiState(
     val canNavigateUp: Boolean = false,
 )
 
+data class PendingMediaDeleteRequest(
+    val id: Long = System.nanoTime(),
+    val sender: IntentSender,
+    val candidateUriStrings: List<String>,
+)
+
 data class VaultUiState(
     val isLocked: Boolean = true,
     val biometricVerified: Boolean = false,
@@ -73,8 +79,7 @@ data class VaultUiState(
     val isErrorStatus: Boolean = false,
     val activePlayback: VaultPlaybackSession? = null,
     val devicePicker: VaultDevicePickerUiState = VaultDevicePickerUiState(),
-    val pendingMediaDeleteSender: IntentSender? = null,
-    val pendingDeleteCandidateUris: List<String> = emptyList(),
+    val pendingDeleteRequest: PendingMediaDeleteRequest? = null,
     val pendingUnremovedOriginals: List<PendingOriginalDeletion> = emptyList(),
 )
 
@@ -117,6 +122,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun unlockAfterBiometricVerification(noticeMessage: String? = null) {
         viewModelScope.launch {
             refreshStorageAndPermissionState(noticeMessage = noticeMessage, unlock = true)
+            if (_uiState.value.hasAllFilesAccess && _uiState.value.pendingUnremovedOriginals.isNotEmpty()) {
+                performPendingOriginalDeletions()
+            }
             refreshEntries()
         }
     }
@@ -180,8 +188,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 activePlayback = null,
                 transferState = VaultTransferUiState.Idle,
                 devicePicker = VaultDevicePickerUiState(),
-                pendingMediaDeleteSender = null,
-                pendingDeleteCandidateUris = emptyList(),
+                pendingDeleteRequest = null,
             )
         }
     }
@@ -352,7 +359,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         activeTransferJob = viewModelScope.launch {
             var movedCount = 0
             var originalsDeletedCount = 0
-            val pendingMediaUris = mutableListOf<Uri>()
+            val pendingMediaUris = LinkedHashSet<Uri>()
             val pendingOriginals = mutableListOf<PendingOriginalDeletion>()
             var recoverableSenderQ: IntentSender? = null
             var lastCategory = picker.category
@@ -372,12 +379,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                     originalsDeletedCount++
                                 } else {
                                     pendingMediaUris.add(uri)
+                                    progress.resolvedMediaUris.forEach { rawUri ->
+                                        runCatching { Uri.parse(rawUri) }.getOrNull()?.let { pendingMediaUris.add(it) }
+                                    }
                                     pendingOriginals.add(
                                         PendingOriginalDeletion(
                                             uriString = item.uriString,
                                             filePath = progress.resolvedOriginalPath ?: item.filePath,
                                             displayName = progress.metadata.originalName,
                                             category = item.category,
+                                            resolvedMediaUris = progress.resolvedMediaUris,
                                         ),
                                     )
                                     if (recoverableSenderQ == null && progress.recoverableDeleteSender != null) {
@@ -413,17 +424,24 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 val deleteSender = if (pendingMediaUris.isNotEmpty()) {
-                    repository.buildMediaStoreDeleteSender(pendingMediaUris) ?: recoverableSenderQ
+                    repository.buildMediaStoreDeleteSender(pendingMediaUris.toList()) ?: recoverableSenderQ
                 } else {
                     null
+                }
+
+                val deleteRequest = deleteSender?.let { sender ->
+                    PendingMediaDeleteRequest(
+                        sender = sender,
+                        candidateUriStrings = pendingMediaUris.map { it.toString() },
+                    )
                 }
 
                 val message = when {
                     movedCount == 0 -> "لم يتم نقل أي ملف."
                     originalsDeletedCount == movedCount ->
-                        "تم تشفير $movedCount ملف داخل الخزنة وحذفه من الهاتف نهائياً."
-                    deleteSender != null ->
-                        "تم تشفير $movedCount ملف داخل الخزنة — وافق على نافذة النظام لحذف الأصل من الهاتف."
+                        "تم تشفير $movedCount ملف داخل الخزنة وحذفه من الهاتف والمعرض نهائياً."
+                    deleteRequest != null ->
+                        "تم تشفير $movedCount ملف داخل الخزنة — وافق على نافذة النظام لحذف الأصل من المعرض نهائياً."
                     else ->
                         "تم تشفير $movedCount ملف بالخزنة، لكن تعذر حذف الأصل لعدم تفعيل صلاحية كل الملفات."
                 }
@@ -433,13 +451,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                         transferState = VaultTransferUiState.Idle,
                         selectedCategory = it.selectedCategory ?: lastCategory,
                         statusMessage = message,
-                        isErrorStatus = deleteSender == null && pendingOriginals.isNotEmpty(),
-                        pendingMediaDeleteSender = deleteSender,
-                        pendingDeleteCandidateUris = if (deleteSender != null) {
-                            pendingMediaUris.map { u -> u.toString() }
-                        } else {
-                            emptyList()
-                        },
+                        isErrorStatus = deleteRequest == null && pendingOriginals.isNotEmpty(),
+                        pendingDeleteRequest = deleteRequest,
                         pendingUnremovedOriginals = (it.pendingUnremovedOriginals + pendingOriginals)
                             .distinctBy { entry -> entry.uriString },
                     )
@@ -473,15 +486,15 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumePendingMediaDeleteSender(deletedBySystem: Boolean) {
         viewModelScope.launch {
-            val candidateUriStrings = _uiState.value.pendingDeleteCandidateUris
+            val candidateUriStrings = _uiState.value.pendingDeleteRequest?.candidateUriStrings.orEmpty()
             if (deletedBySystem && candidateUriStrings.isNotEmpty()) {
                 repository.cleanupMediaStoreAfterSystemDelete(candidateUriStrings.map(Uri::parse))
             }
             val remainingUnremoved = if (deletedBySystem) {
                 _uiState.value.pendingUnremovedOriginals.filterNot { item ->
-                    val goneByDelete = item.uriString in candidateUriStrings &&
-                        (item.filePath == null || !File(item.filePath).exists())
-                    goneByDelete
+                    val matchesBatch = item.uriString in candidateUriStrings ||
+                        item.resolvedMediaUris.any { it in candidateUriStrings }
+                    matchesBatch && repository.isMediaOriginalGone(item.uriString, item.filePath)
                 }
             } else {
                 _uiState.value.pendingUnremovedOriginals
@@ -489,17 +502,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
             val msg = when {
                 deletedBySystem && remainingUnremoved.isEmpty() ->
-                    "تم تشفير الملف وحذف النسخة الأصلية من الهاتف كلياً."
+                    "تم تشفير الملف وحذف النسخة الأصلية من الهاتف والمعرض كلياً."
                 deletedBySystem ->
                     "تم حذف الوسائط، وبقيت ${remainingUnremoved.size} ملفات تحتاج صلاحية كل الملفات لحذف أصلها."
                 else ->
-                    "تم التشفير في الخزنة لكن بقيت النسخة الأصلية على الهاتف — يمكنك حذفها أدناه."
+                    "تم التشفير في الخزنة لكن بقيت النسخة الأصلية في الهاتف — يمكنك حذفها أدناه."
             }
 
             _uiState.update {
                 it.copy(
-                    pendingMediaDeleteSender = null,
-                    pendingDeleteCandidateUris = emptyList(),
+                    pendingDeleteRequest = null,
                     pendingUnremovedOriginals = remainingUnremoved,
                     statusMessage = msg,
                     isErrorStatus = !deletedBySystem || remainingUnremoved.isNotEmpty(),
@@ -526,8 +538,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
         var deletedNow = 0
         val stillRemaining = mutableListOf<PendingOriginalDeletion>()
-        val mediaUrisForSender = mutableListOf<Uri>()
-        var recoverableSender: IntentSender? = null
+        val mediaUrisForSender = LinkedHashSet<Uri>()
 
         for (item in pending) {
             val deleted = repository.forceDeletePendingOriginal(item)
@@ -536,22 +547,31 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 stillRemaining.add(item)
                 mediaUrisForSender.add(Uri.parse(item.uriString))
+                item.resolvedMediaUris.forEach { raw ->
+                    runCatching { Uri.parse(raw) }.getOrNull()?.let { mediaUrisForSender.add(it) }
+                }
             }
         }
 
-        val sender = if (stillRemaining.isNotEmpty() && !repository.hasAllFilesAccess()) {
-            repository.buildMediaStoreDeleteSender(mediaUrisForSender) ?: recoverableSender
+        val sender = if (stillRemaining.isNotEmpty()) {
+            repository.buildMediaStoreDeleteSender(mediaUrisForSender.toList())
         } else {
             null
+        }
+        val deleteRequest = sender?.let {
+            PendingMediaDeleteRequest(
+                sender = it,
+                candidateUriStrings = mediaUrisForSender.map { u -> u.toString() },
+            )
         }
 
         val msg = when {
             stillRemaining.isEmpty() && deletedNow > 0 ->
-                "تم حذف جميع النسخ الأصلية ($deletedNow) من الهاتف نهائياً."
+                "تم حذف جميع النسخ الأصلية ($deletedNow) من الهاتف والمعرض نهائياً."
             deletedNow > 0 ->
                 "تم حذف $deletedNow نسخة، وبقيت ${stillRemaining.size} ملفات تتطلب صلاحية كل الملفات."
-            sender != null ->
-                "وافق على نافذة النظام لإتمام حذف النسخ المتبقية من الهاتف."
+            deleteRequest != null ->
+                "وافق على نافذة النظام لإتمام حذف النسخ المتبقية من المعرض."
             else ->
                 "تعذر حذف ${stillRemaining.size} ملف من الهاتف — فعّل صلاحية كل الملفات للمتابعة."
         }
@@ -559,14 +579,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 pendingUnremovedOriginals = stillRemaining,
-                pendingMediaDeleteSender = sender,
-                pendingDeleteCandidateUris = if (sender != null) {
-                    stillRemaining.map { entry -> entry.uriString }
-                } else {
-                    emptyList()
-                },
+                pendingDeleteRequest = deleteRequest,
                 statusMessage = msg,
-                isErrorStatus = stillRemaining.isNotEmpty() && sender == null,
+                isErrorStatus = stillRemaining.isNotEmpty() && deleteRequest == null,
             )
         }
     }
@@ -650,11 +665,20 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                 progress.metadata.originalName,
                                 progress.metadata.mimeType,
                             )
+                            val candidateUris = (listOf(sourceUri) + progress.resolvedMediaUris.mapNotNull {
+                                runCatching { Uri.parse(it) }.getOrNull()
+                            }).distinct()
                             val deleteSender = if (!progress.originalDeleted) {
-                                repository.buildMediaStoreDeleteSender(listOf(sourceUri))
+                                repository.buildMediaStoreDeleteSender(candidateUris)
                                     ?: progress.recoverableDeleteSender
                             } else {
                                 null
+                            }
+                            val deleteRequest = deleteSender?.let { sender ->
+                                PendingMediaDeleteRequest(
+                                    sender = sender,
+                                    candidateUriStrings = candidateUris.map { it.toString() },
+                                )
                             }
                             val pendingEntry = if (!progress.originalDeleted) {
                                 PendingOriginalDeletion(
@@ -662,15 +686,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                     filePath = progress.resolvedOriginalPath,
                                     displayName = label,
                                     category = resolvedCategory,
+                                    resolvedMediaUris = progress.resolvedMediaUris,
                                 )
                             } else {
                                 null
                             }
                             val msg = when {
                                 progress.originalDeleted ->
-                                    "تم تشفير '$label' في الخزنة وحذفه من الهاتف نهائياً."
-                                deleteSender != null ->
-                                    "تم تشفير '$label' في الخزنة — وافق على حذف الأصل من الهاتف."
+                                    "تم تشفير '$label' في الخزنة وحذفه من الهاتف والمعرض نهائياً."
+                                deleteRequest != null ->
+                                    "تم تشفير '$label' في الخزنة — وافق على حذف الأصل من المعرض."
                                 else ->
                                     "تم تشفير '$label' في الخزنة، لكن تعذر حذف الأصل لعدم توفر صلاحية كل الملفات."
                             }
@@ -679,13 +704,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                                     transferState = VaultTransferUiState.Idle,
                                     selectedCategory = it.selectedCategory ?: resolvedCategory,
                                     statusMessage = msg,
-                                    isErrorStatus = !progress.originalDeleted && deleteSender == null,
-                                    pendingMediaDeleteSender = deleteSender,
-                                    pendingDeleteCandidateUris = if (deleteSender != null) {
-                                        listOf(sourceUri.toString())
-                                    } else {
-                                        emptyList()
-                                    },
+                                    isErrorStatus = !progress.originalDeleted && deleteRequest == null,
+                                    pendingDeleteRequest = deleteRequest,
                                     pendingUnremovedOriginals = if (pendingEntry != null) {
                                         (it.pendingUnremovedOriginals + pendingEntry)
                                             .distinctBy { entry -> entry.uriString }
