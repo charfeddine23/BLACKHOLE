@@ -102,11 +102,23 @@ fun VaultScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by vaultViewModel.uiState.collectAsStateWithLifecycle()
+    val noScreenshotEnabled by vaultViewModel.noScreenshotEnabled.collectAsStateWithLifecycle()
+    var showVaultSettings by remember { mutableStateOf(false) }
 
-    // Enforce FLAG_SECURE while VaultScreen is visible to block screenshots & screen capture
-    DisposableEffect(context) {
+    LaunchedEffect(uiState.isLocked) {
+        if (uiState.isLocked) {
+            showVaultSettings = false
+        }
+    }
+
+    // Enforce FLAG_SECURE reactively while VaultScreen is visible when enabled in Settings
+    DisposableEffect(context, noScreenshotEnabled) {
         val activity = context.findActivity()
-        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        if (noScreenshotEnabled) {
+            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
         onDispose {
             activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
         }
@@ -143,6 +155,7 @@ fun VaultScreen(
                     vaultViewModel.closeDevicePicker()
                 }
             }
+            showVaultSettings -> showVaultSettings = false
             uiState.selectedCategory != null -> vaultViewModel.selectCategory(null)
             else -> {
                 vaultViewModel.lockVaultNow()
@@ -152,6 +165,15 @@ fun VaultScreen(
     }
 
     var pendingPickCategory by remember { mutableStateOf(VaultCategory.VIDEOS) }
+
+    val safFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+    ) { treeUri: Uri? ->
+        vaultViewModel.endExternalSystemFlow()
+        if (treeUri != null) {
+            vaultViewModel.onSafDirectorySelected(treeUri)
+        }
+    }
 
     val openDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -504,6 +526,7 @@ fun VaultScreen(
                 uiState.isLocked -> {
                     VaultLockedGate(
                         uiState = uiState,
+                        noScreenshotEnabled = noScreenshotEnabled,
                         biometricMessage = biometricError,
                         onBack = {
                             vaultViewModel.lockVaultNow()
@@ -520,7 +543,7 @@ fun VaultScreen(
                             vaultViewModel.lockVaultNow()
                             onBack()
                         },
-                        onLockNow = vaultViewModel::lockVaultNow,
+                        onOpenSettings = { showVaultSettings = true },
                         onOpenCategory = { cat -> vaultViewModel.selectCategory(cat) },
                         onRequestAllFilesAccess = requestAllFilesAccess,
                         onRetryDeletePendingOriginals = vaultViewModel::retryDeletePendingOriginals,
@@ -535,14 +558,12 @@ fun VaultScreen(
                         uiState = uiState,
                         cipher = vaultViewModel.getCipher(),
                         onBackToCategories = { vaultViewModel.selectCategory(null) },
-                        onLockNow = vaultViewModel::lockVaultNow,
+                        onOpenSettings = { showVaultSettings = true },
                         onPickFromGallery = { openInAppDevicePicker(activeCategory, false) },
                         onPickFromPhoneFiles = { openInAppDevicePicker(activeCategory, true) },
                         onMoveDownloadedVideo = vaultViewModel::moveDownloadedVideoToVault,
                         onCancelTransfer = vaultViewModel::cancelActiveTransfer,
                         onOpenEntry = vaultViewModel::openEntry,
-                        onRestoreEntry = vaultViewModel::restoreEntry,
-                        onDeleteEntry = vaultViewModel::deleteEntry,
                         onRestoreEntries = vaultViewModel::restoreEntries,
                         onDeleteEntries = vaultViewModel::deleteEntries,
                         onDismissStatus = vaultViewModel::dismissStatus,
@@ -551,6 +572,34 @@ fun VaultScreen(
                         onDismissPendingOriginals = vaultViewModel::dismissPendingUnremovedOriginals,
                     )
                 }
+            }
+
+            if (!uiState.isLocked && showVaultSettings) {
+                VaultSettingsOverlay(
+                    uiState = uiState,
+                    noScreenshotEnabled = noScreenshotEnabled,
+                    onToggleNoScreenshot = vaultViewModel::setNoScreenshotEnabled,
+                    onLockVaultNow = vaultViewModel::lockVaultNow,
+                    onRequestMediaPermission = requestMediaAccessPermission,
+                    onRequestAllFilesAccess = requestAllFilesAccess,
+                    onSelectInternalStorage = vaultViewModel::revertToInternalVaultStorage,
+                    onSelectPhoneHiddenStorage = {
+                        vaultViewModel.activatePhoneDownloadsVault()
+                    },
+                    onSelectExternalSafStorage = {
+                        vaultViewModel.beginExternalSystemFlow()
+                        val launched = runCatching {
+                            safFolderLauncher.launch(null)
+                            true
+                        }.getOrDefault(false)
+                        if (!launched) {
+                            vaultViewModel.endExternalSystemFlow()
+                            vaultViewModel.reportStatusError("مختار المجلدات غير متاح على هذا الجهاز.")
+                        }
+                    },
+                    onDismissStatus = vaultViewModel::dismissStatus,
+                    onClose = { showVaultSettings = false },
+                )
             }
 
             if (!uiState.isLocked && uiState.devicePicker.isOpen) {
@@ -581,6 +630,7 @@ fun VaultScreen(
                     VaultCategory.PHOTOS -> VaultProtectedPhotoViewer(
                         session = session,
                         cipher = vaultViewModel.getCipher(),
+                        noScreenshotEnabled = noScreenshotEnabled,
                         onRestore = vaultViewModel::restoreActivePlayback,
                         onDelete = vaultViewModel::deleteActivePlayback,
                         onClose = vaultViewModel::closePlayer,
@@ -588,6 +638,7 @@ fun VaultScreen(
                     VaultCategory.VIDEOS -> VaultProtectedVideoPlayer(
                         session = session,
                         cipher = vaultViewModel.getCipher(),
+                        noScreenshotEnabled = noScreenshotEnabled,
                         onRestore = vaultViewModel::restoreActivePlayback,
                         onDelete = vaultViewModel::deleteActivePlayback,
                         onClose = vaultViewModel::closePlayer,
@@ -595,8 +646,11 @@ fun VaultScreen(
                     VaultCategory.FILES -> VaultProtectedFileViewer(
                         session = session,
                         cipher = vaultViewModel.getCipher(),
+                        noScreenshotEnabled = noScreenshotEnabled,
                         onBeforeExternalOpen = vaultViewModel::beginExternalSystemFlow,
                         onReportOpenError = vaultViewModel::reportStatusError,
+                        onRestore = vaultViewModel::restoreActivePlayback,
+                        onDelete = vaultViewModel::deleteActivePlayback,
                         onClose = vaultViewModel::closePlayer,
                     )
                 }
@@ -608,6 +662,7 @@ fun VaultScreen(
 @Composable
 private fun VaultLockedGate(
     uiState: VaultUiState,
+    noScreenshotEnabled: Boolean,
     biometricMessage: String?,
     onBack: () -> Unit,
     onTriggerBiometric: () -> Unit,
@@ -655,7 +710,7 @@ private fun VaultLockedGate(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "FLAG_SECURE · BIOMETRIC ONLY",
+                        text = if (noScreenshotEnabled) "FLAG_SECURE · BIOMETRIC ONLY" else "BIOMETRIC PROTECTED",
                         style = MaterialTheme.typography.labelSmall,
                         color = EmeraldPulse,
                     )
@@ -712,7 +767,11 @@ private fun VaultLockedGate(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "خزنة محمية بالبصمة · FLAG_SECURE\nتحقق بالبصمة للدخول ونقل وإخفاء ملفاتك بأمان",
+                    text = if (noScreenshotEnabled) {
+                        "خزنة محمية بالبصمة · FLAG_SECURE\nتحقق بالبصمة للدخول ونقل وإخفاء ملفاتك بأمان"
+                    } else {
+                        "خزنة محمية بالبصمة\nتحقق بالبصمة للدخول ونقل وإخفاء ملفاتك بأمان"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MutedSlate,
                     textAlign = TextAlign.Center,

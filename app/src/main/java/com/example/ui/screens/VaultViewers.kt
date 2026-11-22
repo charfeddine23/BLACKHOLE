@@ -96,6 +96,7 @@ import java.io.File
 fun VaultProtectedVideoPlayer(
     session: VaultPlaybackSession,
     cipher: VaultCipher,
+    noScreenshotEnabled: Boolean,
     onRestore: () -> Unit,
     onDelete: () -> Unit,
     onClose: () -> Unit,
@@ -132,7 +133,7 @@ fun VaultProtectedVideoPlayer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "فيديو مشفر AES-256 · FLAG_SECURE",
+                subtitle = if (noScreenshotEnabled) "فيديو مشفر AES-256 · FLAG_SECURE" else "فيديو مشفر AES-256",
                 onRestore = onRestore,
                 onDelete = onDelete,
                 onClose = onClose,
@@ -169,6 +170,7 @@ fun VaultProtectedVideoPlayer(
 fun VaultProtectedPhotoViewer(
     session: VaultPlaybackSession,
     cipher: VaultCipher,
+    noScreenshotEnabled: Boolean,
     onRestore: () -> Unit,
     onDelete: () -> Unit,
     onClose: () -> Unit,
@@ -196,7 +198,7 @@ fun VaultProtectedPhotoViewer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "صورة مشفرة AES-256 · FLAG_SECURE",
+                subtitle = if (noScreenshotEnabled) "صورة مشفرة AES-256 · FLAG_SECURE" else "صورة مشفرة AES-256",
                 onRestore = onRestore,
                 onDelete = onDelete,
                 onClose = onClose,
@@ -256,8 +258,11 @@ fun VaultProtectedPhotoViewer(
 fun VaultProtectedFileViewer(
     session: VaultPlaybackSession,
     cipher: VaultCipher,
+    noScreenshotEnabled: Boolean,
     onBeforeExternalOpen: () -> Unit,
     onReportOpenError: (String) -> Unit,
+    onRestore: () -> Unit,
+    onDelete: () -> Unit,
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -303,7 +308,9 @@ fun VaultProtectedFileViewer(
         Column(modifier = Modifier.fillMaxSize()) {
             VaultViewerHeaderBar(
                 title = session.displayTitle,
-                subtitle = "ملف مشفر AES-256 داخل الخزنة · FLAG_SECURE Active",
+                subtitle = if (noScreenshotEnabled) "ملف مشفر AES-256 · FLAG_SECURE" else "ملف مشفر AES-256",
+                onRestore = onRestore,
+                onDelete = onDelete,
                 onClose = onClose,
             )
 
@@ -366,7 +373,11 @@ fun VaultProtectedFileViewer(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "مشفر AES-256 ومخفي عن الهاتف كلياً · FLAG_SECURE",
+                                text = if (noScreenshotEnabled) {
+                                    "مشفر AES-256 ومخفي عن الهاتف كلياً · FLAG_SECURE"
+                                } else {
+                                    "مشفر AES-256 ومخفي عن الهاتف كلياً"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = EmeraldPulse,
                             )

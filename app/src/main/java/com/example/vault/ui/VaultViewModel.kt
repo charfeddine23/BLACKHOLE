@@ -5,6 +5,7 @@ import android.content.IntentSender
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.local.AppPreferences
 import com.example.vault.data.DeviceMediaBrowser
 import com.example.vault.data.DeviceMediaItem
 import com.example.vault.data.PendingOriginalDeletion
@@ -79,9 +80,12 @@ data class VaultUiState(
 
 class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val appPreferences = AppPreferences.getInstance(application)
     private val vaultCipher = VaultCipher(application.applicationContext)
     private val repository = SafVaultRepository(application.applicationContext, vaultCipher)
     private val deviceBrowser = DeviceMediaBrowser(application.applicationContext)
+
+    val noScreenshotEnabled: StateFlow<Boolean> = appPreferences.noScreenshotEnabled
 
     private val _uiState = MutableStateFlow(VaultUiState())
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
@@ -844,6 +848,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     fun dismissStatus() {
         _uiState.update { it.copy(statusMessage = null, isErrorStatus = false) }
+    }
+
+    fun setNoScreenshotEnabled(enabled: Boolean) {
+        appPreferences.setNoScreenshotEnabled(enabled)
     }
 
     override fun onCleared() {

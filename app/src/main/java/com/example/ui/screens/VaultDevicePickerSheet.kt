@@ -23,7 +23,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -417,14 +416,16 @@ fun VaultDevicePickerSheet(
                         }
                     }
                     pickerState.browseFoldersMode -> {
-                        LazyColumn(
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                        LazyVerticalGrid(
+                            columns = GridCells.Adaptive(minSize = 100.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.fillMaxSize(),
                         ) {
                             items(visibleItems, key = { it.id }) { item ->
                                 val selected = item.uriString in pickerState.selectedUris
-                                DeviceFolderListRow(
+                                DeviceFolderGridTile(
                                     item = item,
                                     selected = selected,
                                     accent = accent,
@@ -440,10 +441,9 @@ fun VaultDevicePickerSheet(
                         }
                     }
                     else -> {
-                        val columns = if (pickerState.category == VaultCategory.PHOTOS) 3 else 2
                         LazyVerticalGrid(
-                            columns = GridCells.Fixed(columns),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                            columns = GridCells.Adaptive(minSize = 100.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.fillMaxSize(),
@@ -602,7 +602,7 @@ private fun DeviceGalleryGridItem(
         border = BorderStroke(if (selected) 2.dp else 0.75.dp, if (selected) accent else GlassStrokeBright.copy(alpha = 0.2f)),
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(if (item.category == VaultCategory.PHOTOS) 1f else 1.25f)
+            .aspectRatio(1f)
             .clip(RoundedCornerShape(14.dp))
             .clickable { onClick() }
             .testTag("picker_item_${item.id}"),
@@ -682,64 +682,88 @@ private fun DeviceGalleryGridItem(
 }
 
 @Composable
-private fun DeviceFolderListRow(
+private fun DeviceFolderGridTile(
     item: DeviceMediaItem,
     selected: Boolean,
     accent: Color,
     onClick: () -> Unit,
 ) {
+    val tileAccent = if (item.isDirectory) NeonCyan else accent
     Surface(
-        color = if (selected) accent.copy(alpha = 0.14f) else Color(0xFF0E1420),
+        color = if (selected) tileAccent.copy(alpha = 0.16f) else Color(0xFF0E1420),
         shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(if (selected) 1.2.dp else 0.75.dp, if (selected) accent else GlassStrokeBright.copy(alpha = 0.2f)),
+        border = BorderStroke(
+            width = if (selected) 2.dp else 0.75.dp,
+            color = if (selected) tileAccent else GlassStrokeBright.copy(alpha = 0.2f),
+        ),
         modifier = Modifier
             .fillMaxWidth()
+            .aspectRatio(0.95f)
             .clip(RoundedCornerShape(14.dp))
             .clickable { onClick() }
             .minimumInteractiveComponentSize()
             .testTag("picker_row_${item.id}"),
     ) {
-        Row(
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .fillMaxSize()
+                .padding(8.dp),
         ) {
-            Surface(
-                color = if (item.isDirectory) NeonCyan.copy(alpha = 0.16f) else accent.copy(alpha = 0.14f),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.size(40.dp),
-            ) {
-                Box(contentAlignment = Alignment.Center) {
+            if (!item.isDirectory) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(ObsidianVoid.copy(alpha = 0.7f)),
+                    contentAlignment = Alignment.Center,
+                ) {
                     Icon(
-                        imageVector = if (item.isDirectory) Icons.Rounded.Folder else Icons.Outlined.Description,
-                        contentDescription = null,
-                        tint = if (item.isDirectory) NeonCyan else accent,
-                        modifier = Modifier.size(22.dp),
+                        imageVector = if (selected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                        contentDescription = if (selected) "محدد" else "تحديد",
+                        tint = if (selected) tileAccent else ChromeSilver,
+                        modifier = Modifier.size(18.dp),
                     )
                 }
             }
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
+
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Surface(
+                    color = tileAccent.copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.size(42.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = if (item.isDirectory) Icons.Rounded.Folder else Icons.Outlined.Description,
+                            contentDescription = item.displayName,
+                            tint = tileAccent,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(7.dp))
                 Text(
                     text = item.displayName,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    ),
                     color = ChromeSilver,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
                 )
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    text = if (item.isDirectory) item.folderName else "${formatByteSize(item.sizeBytes)} · ${item.folderName}",
-                    style = MaterialTheme.typography.labelSmall,
+                    text = if (item.isDirectory) "مجلد" else formatByteSize(item.sizeBytes),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                     color = MutedSlate,
                     maxLines = 1,
-                )
-            }
-            if (!item.isDirectory) {
-                Icon(
-                    imageVector = if (selected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
-                    contentDescription = if (selected) "محدد" else "تحديد",
-                    tint = if (selected) accent else MutedSlate,
                 )
             }
         }

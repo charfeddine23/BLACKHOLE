@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.local.AppPreferences
 import com.example.data.local.BlackholeDatabase
 import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
@@ -48,6 +49,7 @@ data class BlackholeUiState(
 class BlackholeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
+    private val appPreferences = AppPreferences.getInstance(context)
     private val clipboardDetector = ClipboardDetector(context)
     private val cookieVault = CookieVaultManager.getInstance(context)
     private val appUpdateManager = AppUpdateManager()
@@ -55,6 +57,8 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
         context = context,
         videoDao = BlackholeDatabase.getInstance(context).downloadedVideoDao(),
     )
+
+    val noScreenshotEnabled: StateFlow<Boolean> = appPreferences.noScreenshotEnabled
 
     private val _inputUrl = MutableStateFlow("")
     private val _updateState = MutableStateFlow<UpdateCheckState>(UpdateCheckState.Idle)
@@ -329,6 +333,10 @@ class BlackholeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun clearVaultStatusMessage() {
         _vaultStatusMessage.value = null
+    }
+
+    fun setNoScreenshotEnabled(enabled: Boolean) {
+        appPreferences.setNoScreenshotEnabled(enabled)
     }
 
     companion object {

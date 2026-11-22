@@ -37,12 +37,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -104,6 +107,7 @@ import kotlinx.coroutines.launch
 fun BlackholeScreen(
     viewModel: BlackholeViewModel,
     onNavigateToVault: () -> Unit = {},
+    onNavigateToSettings: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -165,6 +169,7 @@ fun BlackholeScreen(
         videos = videos,
         onTapBlackhole = initiatePullWithPermissionCheck,
         onHoldVault = onNavigateToVault,
+        onOpenSettings = onNavigateToSettings,
         onDeleteVideo = viewModel::deleteVideo,
         onAutoSyncCookies = { url -> viewModel.syncWebViewSession(url, silent = true) },
         onManualSyncCookies = { url -> viewModel.syncWebViewSession(url, silent = false) },
@@ -183,6 +188,7 @@ private fun BlackholeScreenContent(
     videos: List<DownloadedVideoEntity>,
     onTapBlackhole: () -> Unit,
     onHoldVault: () -> Unit,
+    onOpenSettings: () -> Unit,
     onDeleteVideo: (DownloadedVideoEntity) -> Unit,
     onAutoSyncCookies: (String) -> Unit,
     onManualSyncCookies: (String) -> Unit,
@@ -357,38 +363,57 @@ private fun BlackholeScreenContent(
                     verticalArrangement = Arrangement.SpaceBetween,
                 ) {
                     // Minimalist Header
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(
-                            text = "BLACKHOLE",
-                            style = MaterialTheme.typography.displaySmall,
-                            color = ChromeSilver,
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Surface(
-                            color = Color.White.copy(alpha = 0.04f),
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.24f)),
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 48.dp),
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                            Text(
+                                text = "BLACKHOLE",
+                                style = MaterialTheme.typography.displaySmall,
+                                color = ChromeSilver,
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Surface(
+                                color = Color.White.copy(alpha = 0.04f),
+                                shape = RoundedCornerShape(50),
+                                border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.24f)),
                             ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .clip(CircleShape)
-                                        .background(if (isBusy) NeonCyan else EmeraldPulse),
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "PULSE SUITE · CHARFEDDINE KA",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MutedSlate,
-                                )
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(if (isBusy) NeonCyan else EmeraldPulse),
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "PULSE SUITE · CHARFEDDINE KA",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MutedSlate,
+                                    )
+                                }
                             }
+                        }
+
+                        IconButton(
+                            onClick = onOpenSettings,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .minimumInteractiveComponentSize()
+                                .testTag("open_settings_button"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Settings,
+                                contentDescription = "الإعدادات",
+                                tint = ChromeSilver.copy(alpha = 0.8f),
+                                modifier = Modifier.size(22.dp),
+                            )
                         }
                     }
 

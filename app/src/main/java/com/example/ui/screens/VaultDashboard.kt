@@ -25,24 +25,21 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.DriveFileMove
-import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material.icons.rounded.AddPhotoAlternate
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -96,7 +93,6 @@ import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.util.formatByteSize
-import com.example.util.formatShortDate
 import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultCipher
 import com.example.vault.data.VaultEncryptedMediaDataSource
@@ -113,7 +109,7 @@ import java.util.Locale
 fun VaultHomeCategoriesDashboard(
     uiState: VaultUiState,
     onBack: () -> Unit,
-    onLockNow: () -> Unit,
+    onOpenSettings: () -> Unit,
     onOpenCategory: (VaultCategory) -> Unit,
     onRequestAllFilesAccess: () -> Unit,
     onRetryDeletePendingOriginals: () -> Unit,
@@ -135,17 +131,45 @@ fun VaultHomeCategoriesDashboard(
     val photosTotalBytes = remember(photoEntries) { photoEntries.sumOf { it.sizeBytes } }
     val filesTotalBytes = remember(fileEntries) { fileEntries.sumOf { it.sizeBytes } }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-    ) {
+    val folderTiles = remember(videoEntries, photoEntries, fileEntries) {
+        listOf(
+            VaultFolderSummary(
+                category = VaultCategory.VIDEOS,
+                title = "الفيديوهات",
+                count = videoEntries.size,
+                totalSizeBytes = videosTotalBytes,
+                icon = Icons.Outlined.VideoLibrary,
+                accent = PlasmaViolet,
+                testTag = "vault_category_videos",
+            ),
+            VaultFolderSummary(
+                category = VaultCategory.PHOTOS,
+                title = "الصور",
+                count = photoEntries.size,
+                totalSizeBytes = photosTotalBytes,
+                icon = Icons.Outlined.PhotoLibrary,
+                accent = NeonCyan,
+                testTag = "vault_category_photos",
+            ),
+            VaultFolderSummary(
+                category = VaultCategory.FILES,
+                title = "الملفات",
+                count = fileEntries.size,
+                totalSizeBytes = filesTotalBytes,
+                icon = Icons.Rounded.FolderCopy,
+                accent = EmeraldPulse,
+                testTag = "vault_category_files",
+            ),
+        )
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
         VaultTopHeaderBar(
             title = "الخزنة",
             subtitle = "${uiState.entries.size} عنصر مشفر ومخفي",
             subtitleColor = NeonCyan,
             onBack = onBack,
-            onLockNow = onLockNow,
+            onOpenSettings = onOpenSettings,
         )
 
         VaultTransferAndStatusSection(
@@ -157,64 +181,53 @@ fun VaultHomeCategoriesDashboard(
             onDismissPendingOriginals = onDismissPendingOriginals,
         )
 
-        Spacer(modifier = Modifier.height(14.dp))
-
-        Column(
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(3),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier
+                .weight(1f)
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+                .testTag("vault_home_folders_grid"),
         ) {
-            VaultFolderCard(
-                title = "الفيديوهات",
-                count = videoEntries.size,
-                totalSizeBytes = videosTotalBytes,
-                icon = Icons.Outlined.VideoLibrary,
-                accent = PlasmaViolet,
-                onClick = { onOpenCategory(VaultCategory.VIDEOS) },
-                modifier = Modifier.testTag("vault_category_videos"),
-            )
-
-            VaultFolderCard(
-                title = "الصور",
-                count = photoEntries.size,
-                totalSizeBytes = photosTotalBytes,
-                icon = Icons.Outlined.PhotoLibrary,
-                accent = NeonCyan,
-                onClick = { onOpenCategory(VaultCategory.PHOTOS) },
-                modifier = Modifier.testTag("vault_category_photos"),
-            )
-
-            VaultFolderCard(
-                title = "الملفات",
-                count = fileEntries.size,
-                totalSizeBytes = filesTotalBytes,
-                icon = Icons.Rounded.FolderCopy,
-                accent = EmeraldPulse,
-                onClick = { onOpenCategory(VaultCategory.FILES) },
-                modifier = Modifier.testTag("vault_category_files"),
-            )
+            items(folderTiles, key = { it.category.name }) { folder ->
+                VaultFolderGridTile(
+                    title = folder.title,
+                    count = folder.count,
+                    totalSizeBytes = folder.totalSizeBytes,
+                    icon = folder.icon,
+                    accent = folder.accent,
+                    onClick = { onOpenCategory(folder.category) },
+                    modifier = Modifier.testTag(folder.testTag),
+                )
+            }
         }
-
-        Spacer(modifier = Modifier.height(24.dp))
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+private data class VaultFolderSummary(
+    val category: VaultCategory,
+    val title: String,
+    val count: Int,
+    val totalSizeBytes: Long,
+    val icon: ImageVector,
+    val accent: Color,
+    val testTag: String,
+)
+
 @Composable
 fun VaultCategoryDetailScreen(
     category: VaultCategory,
     uiState: VaultUiState,
     cipher: VaultCipher,
     onBackToCategories: () -> Unit,
-    onLockNow: () -> Unit,
+    onOpenSettings: () -> Unit,
     onPickFromGallery: () -> Unit,
     onPickFromPhoneFiles: () -> Unit,
     onMoveDownloadedVideo: (File) -> Unit,
     onCancelTransfer: () -> Unit,
     onOpenEntry: (VaultFileEntry) -> Unit,
-    onRestoreEntry: (VaultFileEntry) -> Unit,
-    onDeleteEntry: (VaultFileEntry) -> Unit,
     onRestoreEntries: (List<VaultFileEntry>) -> Unit,
     onDeleteEntries: (List<VaultFileEntry>) -> Unit,
     onDismissStatus: () -> Unit,
@@ -229,8 +242,7 @@ fun VaultCategoryDetailScreen(
     var selectedUris by remember(category) { mutableStateOf<Set<String>>(emptySet()) }
     var confirmBatchDelete by remember(category, selectedUris.size) { mutableStateOf(false) }
 
-    val isGalleryMode = category == VaultCategory.PHOTOS || category == VaultCategory.VIDEOS
-    val isSelectionActive = isGalleryMode && selectedUris.isNotEmpty()
+    val isSelectionActive = selectedUris.isNotEmpty()
 
     val categoryTitle = when (category) {
         VaultCategory.PHOTOS -> "الصور"
@@ -264,7 +276,7 @@ fun VaultCategoryDetailScreen(
                     onBackToCategories()
                 }
             },
-            onLockNow = onLockNow,
+            onOpenSettings = onOpenSettings,
         )
 
         Row(
@@ -445,13 +457,13 @@ fun VaultCategoryDetailScreen(
                     }
                 }
             }
-        } else if (isGalleryMode) {
-            // Pure edge-to-edge 3-column Gallery Grid for both Encrypted Photos & Encrypted Videos
+        } else {
+            // Unified Adaptive Grid Layout for Encrypted Photos, Videos, and Files (3 columns on phones)
             LazyVerticalGrid(
-                columns = GridCells.Fixed(3),
+                columns = GridCells.Adaptive(minSize = 100.dp),
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
@@ -459,31 +471,41 @@ fun VaultCategoryDetailScreen(
             ) {
                 items(categoryEntries, key = { it.uriString }) { item ->
                     val isSelected = item.uriString in selectedUris
-                    VaultGalleryMediaTile(
-                        entry = item,
-                        cipher = cipher,
-                        accent = categoryAccent,
-                        isSelectionMode = isSelectionActive,
-                        isSelected = isSelected,
-                        onClick = {
-                            if (isSelectionActive) {
-                                selectedUris = if (isSelected) {
-                                    selectedUris - item.uriString
-                                } else {
-                                    selectedUris + item.uriString
-                                }
-                            } else {
-                                onOpenEntry(item)
-                            }
-                        },
-                        onLongClick = {
-                            selectedUris = if (isSelected) {
-                                selectedUris - item.uriString
-                            } else {
-                                selectedUris + item.uriString
-                            }
-                        },
-                    )
+                    val toggleSelection = {
+                        selectedUris = if (isSelected) {
+                            selectedUris - item.uriString
+                        } else {
+                            selectedUris + item.uriString
+                        }
+                    }
+                    val handleTap = {
+                        if (isSelectionActive) {
+                            toggleSelection()
+                        } else {
+                            onOpenEntry(item)
+                        }
+                    }
+
+                    if (category == VaultCategory.FILES) {
+                        VaultGalleryFileTile(
+                            entry = item,
+                            accent = categoryAccent,
+                            isSelectionMode = isSelectionActive,
+                            isSelected = isSelected,
+                            onClick = handleTap,
+                            onLongClick = toggleSelection,
+                        )
+                    } else {
+                        VaultGalleryMediaTile(
+                            entry = item,
+                            cipher = cipher,
+                            accent = categoryAccent,
+                            isSelectionMode = isSelectionActive,
+                            isSelected = isSelected,
+                            onClick = handleTap,
+                            onLongClick = toggleSelection,
+                        )
+                    }
                 }
             }
 
@@ -571,24 +593,6 @@ fun VaultCategoryDetailScreen(
                     }
                 }
             }
-        } else {
-            LazyColumn(
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-            ) {
-                items(categoryEntries, key = { it.uriString }) { item ->
-                    VaultProtectedFileCard(
-                        entry = item,
-                        accent = categoryAccent,
-                        onOpen = { onOpenEntry(item) },
-                        onRestore = { onRestoreEntry(item) },
-                        onDelete = { onDeleteEntry(item) },
-                    )
-                }
-            }
         }
     }
 }
@@ -599,7 +603,7 @@ private fun VaultTopHeaderBar(
     subtitle: String,
     subtitleColor: Color,
     onBack: () -> Unit,
-    onLockNow: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -640,23 +644,23 @@ private fun VaultTopHeaderBar(
         }
 
         OutlinedButton(
-            onClick = onLockNow,
+            onClick = onOpenSettings,
             shape = RoundedCornerShape(50),
-            border = BorderStroke(0.85.dp, PlasmaViolet.copy(alpha = 0.7f)),
+            border = BorderStroke(0.85.dp, NeonCyan.copy(alpha = 0.65f)),
             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
             modifier = Modifier
                 .minimumInteractiveComponentSize()
-                .testTag("vault_lock_now_button"),
+                .testTag("vault_settings_button"),
         ) {
             Icon(
-                imageVector = Icons.Rounded.Lock,
-                contentDescription = "قفل الخزنة",
-                tint = PlasmaViolet,
+                imageVector = Icons.Outlined.Settings,
+                contentDescription = "إعدادات الخزنة",
+                tint = NeonCyan,
                 modifier = Modifier.size(15.dp),
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-                text = "قفل",
+                text = "الإعدادات",
                 style = MaterialTheme.typography.labelSmall,
                 color = ChromeSilver,
             )
@@ -665,7 +669,7 @@ private fun VaultTopHeaderBar(
 }
 
 @Composable
-private fun VaultFolderCard(
+private fun VaultFolderGridTile(
     title: String,
     count: Int,
     totalSizeBytes: Long,
@@ -676,98 +680,93 @@ private fun VaultFolderCard(
 ) {
     Surface(
         color = Color(0xFF0E1522),
-        shape = RoundedCornerShape(24.dp),
-        border = BorderStroke(0.95.dp, accent.copy(alpha = 0.45f)),
+        shape = RoundedCornerShape(22.dp),
+        border = BorderStroke(0.95.dp, accent.copy(alpha = 0.48f)),
         modifier = modifier
             .fillMaxWidth()
-            .height(116.dp)
-            .clip(RoundedCornerShape(24.dp))
+            .aspectRatio(0.82f)
+            .clip(RoundedCornerShape(22.dp))
             .clickable { onClick() }
             .minimumInteractiveComponentSize(),
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .drawBehind {
                     drawCircle(
                         brush = Brush.radialGradient(
                             colors = listOf(
-                                accent.copy(alpha = 0.22f),
-                                accent.copy(alpha = 0.04f),
+                                accent.copy(alpha = 0.24f),
+                                accent.copy(alpha = 0.05f),
                                 Color.Transparent,
                             ),
-                            center = Offset(size.width * 0.14f, size.height * 0.5f),
-                            radius = size.height * 0.95f,
+                            center = Offset(size.width * 0.5f, size.height * 0.34f),
+                            radius = size.width * 0.72f,
                         ),
-                        radius = size.height * 0.95f,
-                        center = Offset(size.width * 0.14f, size.height * 0.5f),
+                        radius = size.width * 0.72f,
+                        center = Offset(size.width * 0.5f, size.height * 0.34f),
                     )
                 }
-                .padding(horizontal = 18.dp, vertical = 18.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .padding(horizontal = 8.dp, vertical = 12.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f),
+            Surface(
+                color = accent.copy(alpha = 0.16f),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier.align(Alignment.TopEnd),
+            ) {
+                Text(
+                    text = count.toString(),
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                    ),
+                    color = accent,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(top = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
             ) {
                 Surface(
                     color = accent.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(16.dp),
                     border = BorderStroke(0.85.dp, accent.copy(alpha = 0.55f)),
-                    modifier = Modifier.size(58.dp),
+                    modifier = Modifier.size(48.dp),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
                             imageVector = icon,
                             contentDescription = title,
                             tint = accent,
-                            modifier = Modifier.size(28.dp),
+                            modifier = Modifier.size(24.dp),
                         )
                     }
                 }
-                Spacer(modifier = Modifier.width(16.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.titleLarge.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 21.sp,
-                        ),
-                        color = ChromeSilver,
-                    )
-                    Spacer(modifier = Modifier.height(3.dp))
-                    Text(
-                        text = if (count > 0) {
-                            "$count عنصر · ${formatByteSize(totalSizeBytes)}"
-                        } else {
-                            "فارغ"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MutedSlate,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    color = accent.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(50),
-                ) {
-                    Text(
-                        text = count.toString(),
-                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                        color = accent,
-                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 5.dp),
-                    )
-                }
-                Spacer(modifier = Modifier.width(6.dp))
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                    contentDescription = null,
-                    tint = MutedSlate,
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                    ),
+                    color = ChromeSilver,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = if (count > 0) formatByteSize(totalSizeBytes) else "فارغ",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                    color = MutedSlate,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
                 )
             }
         }
@@ -910,48 +909,93 @@ private fun VaultGalleryMediaTile(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VaultProtectedFileCard(
+private fun VaultGalleryFileTile(
     entry: VaultFileEntry,
     accent: Color,
-    onOpen: () -> Unit,
-    onRestore: () -> Unit,
-    onDelete: () -> Unit,
+    isSelectionMode: Boolean,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
 ) {
-    var confirmDelete by remember(entry.uriString) { mutableStateOf(false) }
+    val extLabel = remember(entry.displayTitle) {
+        entry.displayTitle.substringAfterLast('.', "").uppercase(Locale.US).take(5)
+    }
 
     Surface(
         color = Color(0xFF0E1420),
-        shape = RoundedCornerShape(18.dp),
-        border = BorderStroke(0.85.dp, GlassStrokeBright.copy(alpha = 0.24f)),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(
+            width = if (isSelected) 2.2.dp else 0.8.dp,
+            color = if (isSelected) accent else GlassStrokeBright.copy(alpha = 0.22f),
+        ),
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
-            .clickable { onOpen() }
+            .aspectRatio(0.95f)
+            .clip(RoundedCornerShape(14.dp))
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick,
+            )
             .testTag("vault_entry_${entry.id}"),
     ) {
-        Row(
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .fillMaxSize()
+                .drawBehind {
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                accent.copy(alpha = 0.18f),
+                                Color.Transparent,
+                            ),
+                            center = Offset(size.width * 0.5f, size.height * 0.32f),
+                            radius = size.width * 0.65f,
+                        ),
+                        radius = size.width * 0.65f,
+                        center = Offset(size.width * 0.5f, size.height * 0.32f),
+                    )
+                }
+                .padding(8.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f),
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(ObsidianVoid.copy(alpha = 0.7f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isSelectionMode) {
+                    Icon(
+                        imageVector = if (isSelected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                        contentDescription = if (isSelected) "محدد" else "تحديد",
+                        tint = if (isSelected) accent else ChromeSilver,
+                        modifier = Modifier.size(18.dp),
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Rounded.Lock,
+                        contentDescription = "مشفر",
+                        tint = EmeraldPulse,
+                        modifier = Modifier.size(12.dp),
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
             ) {
                 Surface(
-                    color = accent.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(14.dp),
-                    border = BorderStroke(0.8.dp, accent.copy(alpha = 0.55f)),
-                    modifier = Modifier.size(48.dp),
+                    color = accent.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(0.8.dp, accent.copy(alpha = 0.5f)),
+                    modifier = Modifier.size(44.dp),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        val extLabel = entry.displayTitle
-                            .substringAfterLast('.', "")
-                            .uppercase(Locale.US)
-                            .take(4)
                         if (extLabel.isNotBlank()) {
                             Text(
                                 text = extLabel,
@@ -960,84 +1004,37 @@ private fun VaultProtectedFileCard(
                                     fontWeight = FontWeight.Bold,
                                 ),
                                 color = accent,
+                                maxLines = 1,
                             )
                         } else {
                             Icon(
                                 imageVector = Icons.Outlined.Description,
-                                contentDescription = "فتح ${entry.displayTitle}",
+                                contentDescription = entry.displayTitle,
                                 tint = accent,
                                 modifier = Modifier.size(22.dp),
                             )
                         }
                     }
                 }
-                Spacer(modifier = Modifier.width(12.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = entry.displayTitle,
-                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-                        color = ChromeSilver,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Spacer(modifier = Modifier.height(3.dp))
-                    Text(
-                        text = "${formatByteSize(entry.sizeBytes)} · ${formatShortDate(entry.lastModifiedMs)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MutedSlate,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(
-                    onClick = onRestore,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .testTag("vault_restore_${entry.id}"),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Restore,
-                        contentDescription = "استعادة إلى الجهاز",
-                        tint = NeonCyan,
-                    )
-                }
-
-                if (confirmDelete) {
-                    Surface(
-                        color = CrimsonAlert,
-                        shape = RoundedCornerShape(50),
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .clickable {
-                                confirmDelete = false
-                                onDelete()
-                            }
-                            .minimumInteractiveComponentSize(),
-                    ) {
-                        Text(
-                            text = "حذف",
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            color = Color.White,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        )
-                    }
-                } else {
-                    IconButton(
-                        onClick = { confirmDelete = true },
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("vault_delete_${entry.id}"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.DeleteOutline,
-                            contentDescription = "حذف من الخزنة",
-                            tint = CrimsonAlert,
-                        )
-                    }
-                }
+                Spacer(modifier = Modifier.height(7.dp))
+                Text(
+                    text = entry.displayTitle,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    ),
+                    color = ChromeSilver,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = formatByteSize(entry.sizeBytes),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                    color = MutedSlate,
+                    maxLines = 1,
+                )
             }
         }
     }
