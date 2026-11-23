@@ -9,17 +9,26 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.AppPreferences
 import com.example.data.local.BrowserPreferencesStore
 import com.example.data.local.BrowserSearchEngine
+import com.example.engine.cookies.CookieVaultManager
+import com.example.engine.extractor.VideoStreamExtractor
 import com.example.engine.network.DnsPacketCodec
 import com.example.ui.navigation.buildMissingStartupRuntimePermissions
 import com.example.ui.screens.buildAllFilesAccessSettingIntents
 import com.example.ui.screens.launchSystemSettingsCandidates
 import com.example.vault.data.FileVaultRandomAccessReader
 import com.example.vault.data.SafVaultRepository
+import com.example.vault.data.VaultBrowserDownloadEngine
+import com.example.vault.data.VaultBrowserDownloadPhase
 import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultCipher
 import com.example.vault.data.VaultHeaderMetadata
 import com.example.vault.data.VaultStorageMode
 import com.example.vault.data.VaultTransferStage
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
@@ -289,5 +298,151 @@ class VaultEncryptionAndMoveTest {
             Manifest.permission.READ_MEDIA_VIDEO,
         )
         assertTrue(com.example.util.hasStrictMediaPermission(context))
+    }
+
+    @Test
+    fun `browser preferences store supports adding, editing, and deleting pinned sites`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val store = BrowserPreferencesStore.getInstance(context)
+        store.resetPinnedSitesToDefault()
+
+        val initialCount = store.pinnedSites.value.size
+        assertEquals(BrowserPreferencesStore.DEFAULT_PINNED_SITES.size, initialCount)
+
+        val added = store.addPinnedSite("My Cinema", "example.com/videos")
+        assertNotNull(added)
+        assertEquals("https://example.com/videos", added!!.url)
+        assertEquals(initialCount + 1, store.pinnedSites.value.size)
+
+        val updated = store.updatePinnedSite(added.id, "Cinema HD", "https://videos.example.org/hd")
+        assertTrue(updated)
+        val foundAfterUpdate = store.pinnedSites.value.firstOrNull { it.id == added.id }
+        assertNotNull(foundAfterUpdate)
+        assertEquals("Cinema HD", foundAfterUpdate!!.label)
+        assertEquals("https://videos.example.org/hd", foundAfterUpdate.url)
+
+        assertTrue(store.deletePinnedSite(added.id))
+        assertEquals(initialCount, store.pinnedSites.value.size)
+        assertNull(store.pinnedSites.value.firstOrNull { it.id == added.id })
+    }
+
+    @Test
+    fun `vault browser download engine downloads video from arbitrary page and encrypts directly into vault videos`() {
+        runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val cipher = testCipher(context)
+            val repo = SafVaultRepository(context, cipher)
+            val fakeMp4Payload = ("FTYPMP4_VAULT_STREAM_DATA_" + "0123456789ABCDEF".repeat(64)).repeat(32).toByteArray()
+
+            val mockHttpClient = OkHttpClient.Builder()
+                .addInterceptor { chain ->
+                    val req = chain.request()
+                    val url = req.url.toString()
+                    when {
+                        url == "https://custom-media-site.example/watch/clip1" -> {
+                            val html = """
+                                <html>
+                                  <head><title>Custom Clip 1080p</title></head>
+                                  <body>
+                                    <video src="https://cdn.custom-media-site.example/streams/clip_1080p.mp4"></video>
+                                  </body>
+                                </html>
+                            """.trimIndent()
+                            Response.Builder()
+                                .request(req)
+                                .protocol(Protocol.HTTP_1_1)
+                                .code(200)
+                                .message("OK")
+                                .header("Content-Type", "text/html; charset=utf-8")
+                                .body(html.toResponseBody("text/html".toMediaType()))
+                                .build()
+                        }
+                        url == "https://cdn.custom-media-site.example/streams/clip_1080p.mp4" -> {
+                            val isHead = req.method.equals("HEAD", ignoreCase = true)
+                            val rangeHeader = req.header("Range")
+                            if (isHead) {
+                                Response.Builder()
+                                    .request(req)
+                                    .protocol(Protocol.HTTP_1_1)
+                                    .code(200)
+                                    .message("OK")
+                                    .header("Content-Type", "video/mp4")
+                                    .header("Content-Length", fakeMp4Payload.size.toString())
+                                    .body(ByteArray(0).toResponseBody("video/mp4".toMediaType()))
+                                    .build()
+                            } else if (rangeHeader == "bytes=0-0") {
+                                Response.Builder()
+                                    .request(req)
+                                    .protocol(Protocol.HTTP_1_1)
+                                    .code(206)
+                                    .message("Partial Content")
+                                    .header("Content-Type", "video/mp4")
+                                    .header("Content-Range", "bytes 0-0/${fakeMp4Payload.size}")
+                                    .header("Content-Length", "1")
+                                    .body(fakeMp4Payload.copyOfRange(0, 1).toResponseBody("video/mp4".toMediaType()))
+                                    .build()
+                            } else {
+                                Response.Builder()
+                                    .request(req)
+                                    .protocol(Protocol.HTTP_1_1)
+                                    .code(200)
+                                    .message("OK")
+                                    .header("Content-Type", "video/mp4")
+                                    .header("Content-Length", fakeMp4Payload.size.toString())
+                                    .body(fakeMp4Payload.toResponseBody("video/mp4".toMediaType()))
+                                    .build()
+                            }
+                        }
+                        else -> {
+                            Response.Builder()
+                                .request(req)
+                                .protocol(Protocol.HTTP_1_1)
+                                .code(404)
+                                .message("Not Found")
+                                .body("".toResponseBody("text/plain".toMediaType()))
+                                .build()
+                        }
+                    }
+                }
+                .build()
+
+            val cookieVault = CookieVaultManager.getInstance(context)
+            val extractor = VideoStreamExtractor(client = mockHttpClient, webViewSniffer = null, cookieVault = cookieVault)
+            val engine = VaultBrowserDownloadEngine(
+                context = context,
+                vaultRepository = repo,
+                cookieVault = cookieVault,
+                okHttpClient = mockHttpClient,
+                extractor = extractor,
+            )
+
+            val phases = mutableListOf<VaultBrowserDownloadPhase>()
+            val ok = engine.downloadPageVideoToVault(
+                pageUrl = "https://custom-media-site.example/watch/clip1",
+                pageTitle = "Custom Clip 1080p",
+                domVideoUrls = listOf("https://cdn.custom-media-site.example/streams/clip_1080p.mp4"),
+                sniffedVideoUrls = emptyList(),
+                sniffedAudioUrls = emptyList(),
+                isCancelled = { false },
+                onState = { state -> phases += state.phase },
+            )
+
+            assertTrue("Expected downloadPageVideoToVault to succeed", ok)
+            assertTrue(phases.contains(VaultBrowserDownloadPhase.EXTRACTING))
+            assertTrue(phases.contains(VaultBrowserDownloadPhase.ENCRYPTING))
+            assertEquals(VaultBrowserDownloadPhase.COMPLETED, phases.last())
+
+            val storedEntries = repo.listVaultEntries().filter { it.category == VaultCategory.VIDEOS }
+            assertEquals(1, storedEntries.size)
+            val stored = storedEntries.first()
+            assertTrue(stored.isEncrypted)
+            assertTrue(stored.fileName.endsWith(VaultCipher.ENCRYPTED_VAULT_EXT))
+            val storedFile = File(stored.localFilePath!!)
+            assertTrue(storedFile.exists())
+            val decryptedBytes = cipher.openDecryptedInputStream(storedFile).use { it.readBytes() }
+            assertArrayEquals(fakeMp4Payload, decryptedBytes)
+
+            repo.deleteEntry(stored)
+        }
     }
 }

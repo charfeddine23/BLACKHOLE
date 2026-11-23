@@ -50,6 +50,7 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Restore
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -111,6 +112,7 @@ fun VaultHomeCategoriesDashboard(
     onBack: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenCategory: (VaultCategory) -> Unit,
+    onOpenPrivateBrowser: () -> Unit,
     onRequestAllFilesAccess: () -> Unit,
     onRetryDeletePendingOriginals: () -> Unit,
     onDismissPendingOriginals: () -> Unit,
@@ -131,34 +133,47 @@ fun VaultHomeCategoriesDashboard(
     val photosTotalBytes = remember(photoEntries) { photoEntries.sumOf { it.sizeBytes } }
     val filesTotalBytes = remember(fileEntries) { fileEntries.sumOf { it.sizeBytes } }
 
-    val folderTiles = remember(videoEntries, photoEntries, fileEntries) {
+    val homeTiles = remember(videoEntries, photoEntries, fileEntries) {
         listOf(
-            VaultFolderSummary(
-                category = VaultCategory.VIDEOS,
+            VaultHomeTileItem(
+                key = VaultCategory.VIDEOS.name,
                 title = "الفيديوهات",
-                count = videoEntries.size,
-                totalSizeBytes = videosTotalBytes,
+                badgeText = videoEntries.size.toString(),
+                subtitleText = if (videoEntries.isNotEmpty()) formatByteSize(videosTotalBytes) else "فارغ",
                 icon = Icons.Outlined.VideoLibrary,
                 accent = PlasmaViolet,
                 testTag = "vault_category_videos",
+                onClick = { onOpenCategory(VaultCategory.VIDEOS) },
             ),
-            VaultFolderSummary(
-                category = VaultCategory.PHOTOS,
+            VaultHomeTileItem(
+                key = VaultCategory.PHOTOS.name,
                 title = "الصور",
-                count = photoEntries.size,
-                totalSizeBytes = photosTotalBytes,
+                badgeText = photoEntries.size.toString(),
+                subtitleText = if (photoEntries.isNotEmpty()) formatByteSize(photosTotalBytes) else "فارغ",
                 icon = Icons.Outlined.PhotoLibrary,
                 accent = NeonCyan,
                 testTag = "vault_category_photos",
+                onClick = { onOpenCategory(VaultCategory.PHOTOS) },
             ),
-            VaultFolderSummary(
-                category = VaultCategory.FILES,
+            VaultHomeTileItem(
+                key = VaultCategory.FILES.name,
                 title = "الملفات",
-                count = fileEntries.size,
-                totalSizeBytes = filesTotalBytes,
+                badgeText = fileEntries.size.toString(),
+                subtitleText = if (fileEntries.isNotEmpty()) formatByteSize(filesTotalBytes) else "فارغ",
                 icon = Icons.Rounded.FolderCopy,
                 accent = EmeraldPulse,
                 testTag = "vault_category_files",
+                onClick = { onOpenCategory(VaultCategory.FILES) },
+            ),
+            VaultHomeTileItem(
+                key = "PRIVATE_BROWSER",
+                title = "private Brower",
+                badgeText = "AES",
+                subtitleText = "تصفح وتحميل مشفر",
+                icon = Icons.Rounded.VisibilityOff,
+                accent = NeonCyan,
+                testTag = "vault_category_private_browser",
+                onClick = onOpenPrivateBrowser,
             ),
         )
     }
@@ -182,38 +197,39 @@ fun VaultHomeCategoriesDashboard(
         )
 
         LazyVerticalGrid(
-            columns = GridCells.Fixed(3),
+            columns = GridCells.Adaptive(minSize = 148.dp),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .testTag("vault_home_folders_grid"),
         ) {
-            items(folderTiles, key = { it.category.name }) { folder ->
+            items(homeTiles, key = { it.key }) { tile ->
                 VaultFolderGridTile(
-                    title = folder.title,
-                    count = folder.count,
-                    totalSizeBytes = folder.totalSizeBytes,
-                    icon = folder.icon,
-                    accent = folder.accent,
-                    onClick = { onOpenCategory(folder.category) },
-                    modifier = Modifier.testTag(folder.testTag),
+                    title = tile.title,
+                    badgeText = tile.badgeText,
+                    subtitleText = tile.subtitleText,
+                    icon = tile.icon,
+                    accent = tile.accent,
+                    onClick = tile.onClick,
+                    modifier = Modifier.testTag(tile.testTag),
                 )
             }
         }
     }
 }
 
-private data class VaultFolderSummary(
-    val category: VaultCategory,
+private data class VaultHomeTileItem(
+    val key: String,
     val title: String,
-    val count: Int,
-    val totalSizeBytes: Long,
+    val badgeText: String,
+    val subtitleText: String,
     val icon: ImageVector,
     val accent: Color,
     val testTag: String,
+    val onClick: () -> Unit,
 )
 
 @Composable
@@ -716,8 +732,8 @@ private fun VaultTopHeaderBar(
 @Composable
 private fun VaultFolderGridTile(
     title: String,
-    count: Int,
-    totalSizeBytes: Long,
+    badgeText: String,
+    subtitleText: String,
     icon: ImageVector,
     accent: Color,
     onClick: () -> Unit,
@@ -729,7 +745,7 @@ private fun VaultFolderGridTile(
         border = BorderStroke(0.95.dp, accent.copy(alpha = 0.48f)),
         modifier = modifier
             .fillMaxWidth()
-            .aspectRatio(0.82f)
+            .aspectRatio(0.96f)
             .clip(RoundedCornerShape(22.dp))
             .clickable { onClick() }
             .minimumInteractiveComponentSize(),
@@ -760,7 +776,7 @@ private fun VaultFolderGridTile(
                 modifier = Modifier.align(Alignment.TopEnd),
             ) {
                 Text(
-                    text = count.toString(),
+                    text = badgeText,
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
@@ -806,7 +822,7 @@ private fun VaultFolderGridTile(
                 )
                 Spacer(modifier = Modifier.height(3.dp))
                 Text(
-                    text = if (count > 0) formatByteSize(totalSizeBytes) else "فارغ",
+                    text = subtitleText,
                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                     color = MutedSlate,
                     maxLines = 1,

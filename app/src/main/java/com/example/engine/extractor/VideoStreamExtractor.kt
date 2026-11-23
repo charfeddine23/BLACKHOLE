@@ -208,7 +208,7 @@ class VideoStreamExtractor(
         }
     }
 
-    private fun rankBestStreams(streams: List<ExtractedStream>): List<ExtractedStream> {
+    internal fun rankBestStreams(streams: List<ExtractedStream>): List<ExtractedStream> {
         return streams
             .filterNot { MetaVideoPowerExtractor.isMetaAudioOnlyUrl(it.streamUrl) }
             .distinctBy { it.streamUrl }
@@ -227,7 +227,7 @@ class VideoStreamExtractor(
             )
     }
 
-    private fun probeDirectMediaOrHls(
+    internal fun probeDirectMediaOrHls(
         url: String,
         platform: PlatformBadge,
         headers: Map<String, String>,
@@ -303,7 +303,7 @@ class VideoStreamExtractor(
         return null
     }
 
-    private fun expandHlsCandidates(candidates: List<ExtractedStream>): List<ExtractedStream> {
+    internal fun expandHlsCandidates(candidates: List<ExtractedStream>): List<ExtractedStream> {
         return candidates.map { candidate ->
             if (candidate.isHls) {
                 parseBestHlsVariant(
@@ -1180,7 +1180,7 @@ class VideoStreamExtractor(
             .ifBlank { "Blackhole_Capture" }
     }
 
-    private fun deriveTitleFromUrl(url: String): String {
+    internal fun deriveTitleFromUrl(url: String): String {
         return runCatching {
             val path = URI(url).path.orEmpty().trimEnd('/')
             val last = path.substringAfterLast('/').substringBeforeLast('.')
@@ -1216,23 +1216,23 @@ class VideoStreamExtractor(
         }.getOrDefault(candidate)
     }
 
-    private fun looksLikeHlsUrl(url: String): Boolean {
+    internal fun looksLikeHlsUrl(url: String): Boolean {
         val clean = url.substringBefore("?").lowercase()
         return clean.endsWith(".m3u8") || url.lowercase().contains(".m3u8?")
     }
 
-    private fun isHlsMime(contentType: String, url: String): Boolean {
+    internal fun isHlsMime(contentType: String, url: String): Boolean {
         return contentType.contains("mpegurl") || looksLikeHlsUrl(url)
     }
 
-    private fun isDirectVideoMimeOrExtension(contentType: String, url: String): Boolean {
+    internal fun isDirectVideoMimeOrExtension(contentType: String, url: String): Boolean {
         if (contentType.startsWith("video/")) return true
         val clean = url.substringBefore("?").lowercase()
         return clean.endsWith(".mp4") || clean.endsWith(".webm") ||
             clean.endsWith(".mov") || clean.endsWith(".mkv") || clean.endsWith(".m4v")
     }
 
-    private fun looksLikeDownloadableVideoUrl(url: String): Boolean {
+    internal fun looksLikeDownloadableVideoUrl(url: String): Boolean {
         val lower = url.lowercase()
         if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
         val pathOnly = lower.substringBefore("?")
@@ -1242,7 +1242,7 @@ class VideoStreamExtractor(
             lower.contains("video_mp4") || lower.contains(".mp4?")
     }
 
-    private fun resolveMimeType(contentType: String, url: String): String {
+    internal fun resolveMimeType(contentType: String, url: String): String {
         if (contentType.startsWith("video/")) return contentType.substringBefore(";").trim()
         val lower = url.substringBefore("?").lowercase()
         return when {
@@ -1253,7 +1253,7 @@ class VideoStreamExtractor(
         }
     }
 
-    private fun inferResolutionHeight(url: String): Int {
+    internal fun inferResolutionHeight(url: String): Int {
         val lower = url.lowercase()
         return when {
             lower.contains("2160") || lower.contains("4k") || lower.contains("uhd") -> 2160

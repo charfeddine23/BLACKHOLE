@@ -10,6 +10,9 @@ import com.example.vault.data.DeviceMediaBrowser
 import com.example.vault.data.DeviceMediaItem
 import com.example.vault.data.PendingOriginalDeletion
 import com.example.vault.data.SafVaultRepository
+import com.example.vault.data.VaultBrowserDownloadEngine
+import com.example.vault.data.VaultBrowserDownloadPhase
+import com.example.vault.data.VaultBrowserDownloadState
 import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultCipher
 import com.example.vault.data.VaultFileEntry
@@ -18,12 +21,14 @@ import com.example.vault.data.VaultTempShareHelper
 import com.example.vault.data.VaultTransferStage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 sealed interface VaultTransferUiState {
     data object Idle : VaultTransferUiState
@@ -81,6 +86,8 @@ data class VaultUiState(
     val devicePicker: VaultDevicePickerUiState = VaultDevicePickerUiState(),
     val pendingDeleteRequest: PendingMediaDeleteRequest? = null,
     val pendingUnremovedOriginals: List<PendingOriginalDeletion> = emptyList(),
+    val isPrivateBrowserOpen: Boolean = false,
+    val browserDownloadState: VaultBrowserDownloadState = VaultBrowserDownloadState(),
 )
 
 class VaultViewModel(application: Application) : AndroidViewModel(application) {
@@ -89,6 +96,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val vaultCipher = VaultCipher(application.applicationContext)
     private val repository = SafVaultRepository(application.applicationContext, vaultCipher)
     private val deviceBrowser = DeviceMediaBrowser(application.applicationContext)
+    private val browserDownloadEngine by lazy {
+        VaultBrowserDownloadEngine(application.applicationContext, repository)
+    }
 
     val noScreenshotEnabled: StateFlow<Boolean> = appPreferences.noScreenshotEnabled
 
@@ -97,6 +107,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     private var activeTransferJob: Job? = null
     private var pickerLoadJob: Job? = null
+    private var browserDownloadJob: Job? = null
+    private val browserDownloadCancelled = AtomicBoolean(false)
 
     @Volatile
     private var awaitingExternalSystemFlow: Boolean = false
@@ -169,7 +181,87 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectCategory(category: VaultCategory?) {
-        _uiState.update { it.copy(selectedCategory = category, statusMessage = null) }
+        _uiState.update {
+            it.copy(
+                selectedCategory = category,
+                isPrivateBrowserOpen = false,
+                statusMessage = null,
+            )
+        }
+    }
+
+    fun openPrivateBrowser() {
+        _uiState.update {
+            it.copy(
+                isPrivateBrowserOpen = true,
+                selectedCategory = null,
+                statusMessage = null,
+            )
+        }
+    }
+
+    fun closePrivateBrowser() {
+        _uiState.update { it.copy(isPrivateBrowserOpen = false) }
+    }
+
+    fun downloadPageVideoToVault(
+        pageUrl: String,
+        pageTitle: String? = null,
+        domVideoUrls: List<String> = emptyList(),
+        sniffedVideoUrls: List<String> = emptyList(),
+        sniffedAudioUrls: List<String> = emptyList(),
+    ) {
+        if (_uiState.value.isLocked || browserDownloadJob?.isActive == true) return
+        browserDownloadCancelled.set(false)
+        browserDownloadJob = viewModelScope.launch {
+            try {
+                val ok = browserDownloadEngine.downloadPageVideoToVault(
+                    pageUrl = pageUrl,
+                    pageTitle = pageTitle,
+                    domVideoUrls = domVideoUrls,
+                    sniffedVideoUrls = sniffedVideoUrls,
+                    sniffedAudioUrls = sniffedAudioUrls,
+                    isCancelled = { browserDownloadCancelled.get() },
+                    onState = { dlState ->
+                        _uiState.update { it.copy(browserDownloadState = dlState) }
+                    },
+                )
+                if (ok) {
+                    refreshEntries()
+                    delay(4_000L)
+                    if (_uiState.value.browserDownloadState.phase == VaultBrowserDownloadPhase.COMPLETED) {
+                        _uiState.update { it.copy(browserDownloadState = VaultBrowserDownloadState()) }
+                    }
+                }
+            } catch (_: CancellationException) {
+                _uiState.update {
+                    it.copy(
+                        browserDownloadState = VaultBrowserDownloadState(
+                            phase = VaultBrowserDownloadPhase.IDLE,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun cancelBrowserDownload() {
+        browserDownloadCancelled.set(true)
+        browserDownloadJob?.cancel()
+        browserDownloadJob = null
+        _uiState.update {
+            it.copy(
+                browserDownloadState = VaultBrowserDownloadState(
+                    phase = VaultBrowserDownloadPhase.IDLE,
+                ),
+            )
+        }
+    }
+
+    fun dismissBrowserDownloadStatus() {
+        if (!_uiState.value.browserDownloadState.isActive) {
+            _uiState.update { it.copy(browserDownloadState = VaultBrowserDownloadState()) }
+        }
     }
 
     fun lockVaultNow() {
@@ -178,12 +270,17 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         activeTransferJob = null
         pickerLoadJob?.cancel()
         pickerLoadJob = null
+        browserDownloadCancelled.set(true)
+        browserDownloadJob?.cancel()
+        browserDownloadJob = null
         VaultTempShareHelper.clearTempShareCache(getApplication())
         _uiState.update {
             it.copy(
                 isLocked = true,
                 biometricVerified = false,
                 selectedCategory = null,
+                isPrivateBrowserOpen = false,
+                browserDownloadState = VaultBrowserDownloadState(),
                 entries = emptyList(),
                 activePlayback = null,
                 transferState = VaultTransferUiState.Idle,
@@ -849,6 +946,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         activeTransferJob?.cancel()
         pickerLoadJob?.cancel()
+        browserDownloadCancelled.set(true)
+        browserDownloadJob?.cancel()
         VaultTempShareHelper.clearTempShareCache(getApplication())
     }
 }

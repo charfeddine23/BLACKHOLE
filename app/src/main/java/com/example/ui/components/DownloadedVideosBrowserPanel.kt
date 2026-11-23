@@ -33,12 +33,15 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -77,6 +80,7 @@ import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DesktopWindows
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
@@ -93,11 +97,16 @@ import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.VpnLock
 import androidx.compose.material.icons.rounded.ZoomIn
 import androidx.compose.material.icons.rounded.ZoomOut
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -135,10 +144,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.local.BrowserPinnedSite
 import com.example.data.local.BrowserPreferencesStore
 import com.example.data.local.BrowserSearchEngine
 import com.example.engine.network.ClientSpoofer
 import com.example.engine.network.CloudflareDnsVpnService
+import org.json.JSONObject
 import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ChromeSilver
@@ -245,6 +256,82 @@ private val NightTrayPill = Color(0xFF111927)
 private val NightCardSurface = Color(0xFF0C1320)
 private val NightHairline = GlassStrokeSubtle
 
+private const val DOM_MEDIA_PROBE_JS = """
+(function() {
+  try {
+    var urls = [];
+    var pushUrl = function(u) {
+      if (u && typeof u === 'string' && /^https?:\/\//i.test(u) && urls.indexOf(u) === -1) {
+        urls.push(u);
+      }
+    };
+    document.querySelectorAll('video').forEach(function(v) {
+      pushUrl(v.currentSrc);
+      pushUrl(v.src);
+      v.querySelectorAll('source').forEach(function(s) {
+        pushUrl(s.src);
+        pushUrl(s.getAttribute('data-src'));
+      });
+    });
+    document.querySelectorAll('meta[property*="og:video"], meta[name*="twitter:player:stream"]').forEach(function(m) {
+      pushUrl(m.getAttribute('content'));
+    });
+    if (window.performance && window.performance.getEntriesByType) {
+      window.performance.getEntriesByType('resource').forEach(function(r) {
+        var name = r && r.name ? r.name : '';
+        if (/\.(mp4|m3u8|webm|mov|m4v)(\?|$|#)/i.test(name) || /videoplayback|mime=video/i.test(name)) {
+          pushUrl(name);
+        }
+      });
+    }
+    return JSON.stringify({ title: document.title || '', urls: urls.slice(0, 16) });
+  } catch (e) {
+    return JSON.stringify({ title: '', urls: [] });
+  }
+})();
+"""
+
+fun collectLiveWebViewMediaCandidates(
+    webView: WebView?,
+    onResult: (pageTitle: String?, domVideoUrls: List<String>) -> Unit,
+) {
+    if (webView == null) {
+        onResult(null, emptyList())
+        return
+    }
+    runCatching {
+        webView.evaluateJavascript(DOM_MEDIA_PROBE_JS) { raw ->
+            val parsedTitleAndUrls = runCatching {
+                val cleaned = raw?.trim().orEmpty()
+                if (cleaned.isBlank() || cleaned == "null") {
+                    null to emptyList()
+                } else {
+                    val unquoted = if (cleaned.startsWith("\"") && cleaned.endsWith("\"")) {
+                        org.json.JSONTokener(cleaned).nextValue()?.toString() ?: cleaned
+                    } else {
+                        cleaned
+                    }
+                    val obj = JSONObject(unquoted)
+                    val title = obj.optString("title").takeIf { it.isNotBlank() }
+                    val arr = obj.optJSONArray("urls")
+                    val list = buildList {
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val u = arr.optString(i)
+                                if (u.startsWith("http", ignoreCase = true)) add(u)
+                            }
+                        }
+                    }
+                    title to list
+                }
+            }.getOrElse { webView.title to emptyList() }
+            onResult(parsedTitleAndUrls.first ?: webView.title, parsedTitleAndUrls.second)
+        }
+    }.onFailure {
+        onResult(webView.title, emptyList())
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun DownloadedVideosBrowserPanel(
@@ -262,6 +349,17 @@ fun DownloadedVideosBrowserPanel(
     onDismissStatus: () -> Unit,
     onBindWebViewRef: (WebView?) -> Unit,
     modifier: Modifier = Modifier,
+    enableEditableSpeedDials: Boolean = false,
+    exitButtonLabel: String = "VIDEOS",
+    onBeforeExternalFlow: () -> Unit = {},
+    onDirectDownloadIntercepted: ((url: String, mimeType: String?) -> Boolean)? = null,
+    viewportOverlayContent: @Composable BoxScope.(
+        currentPageUrl: String,
+        isHomeTab: Boolean,
+        activeWebView: WebView?,
+        sniffedVideoUrls: List<String>,
+        sniffedAudioUrls: List<String>,
+    ) -> Unit = { _, _, _, _, _ -> },
 ) {
     val context = LocalContext.current
     val browserPrefs = remember(context) { BrowserPreferencesStore.getInstance(context) }
@@ -269,6 +367,7 @@ fun DownloadedVideosBrowserPanel(
     val historyEntries by browserPrefs.history.collectAsStateWithLifecycle()
     val adBlockEnabled by browserPrefs.adBlockEnabled.collectAsStateWithLifecycle()
     val searchEngine by browserPrefs.searchEngine.collectAsStateWithLifecycle()
+    val pinnedSites by browserPrefs.pinnedSites.collectAsStateWithLifecycle()
     val isVpnActive by CloudflareDnsVpnService.isVpnActive.collectAsStateWithLifecycle()
 
     val tabs = remember { mutableStateListOf(BrowserTabState()) }
@@ -276,6 +375,8 @@ fun DownloadedVideosBrowserPanel(
     val activeTab = tabs.getOrElse(activeTabIndex) { tabs.first() }
 
     val webViews = remember { mutableStateMapOf<String, WebView>() }
+    val sniffedVideoUrlsByTab = remember { mutableStateMapOf<String, List<String>>() }
+    val sniffedAudioUrlsByTab = remember { mutableStateMapOf<String, List<String>>() }
     var addressText by remember { mutableStateOf("") }
     var isUrlFocused by remember { mutableStateOf(false) }
     var showPromoBanner by remember { mutableStateOf(true) }
@@ -323,6 +424,7 @@ fun DownloadedVideosBrowserPanel(
         }
         val prepareIntent = runCatching { VpnService.prepare(context) }.getOrNull()
         if (prepareIntent != null) {
+            onBeforeExternalFlow()
             vpnPermissionLauncher.launch(prepareIntent)
         } else {
             CloudflareDnsVpnService.start(context)
@@ -519,6 +621,8 @@ fun DownloadedVideosBrowserPanel(
     fun closeTab(index: Int) {
         if (index !in tabs.indices) return
         val removed = tabs[index]
+        sniffedVideoUrlsByTab.remove(removed.id)
+        sniffedAudioUrlsByTab.remove(removed.id)
         webViews.remove(removed.id)?.let { wv ->
             runCatching {
                 wv.stopLoading()
@@ -587,6 +691,7 @@ fun DownloadedVideosBrowserPanel(
         val target = webViews[activeTab.id]?.url ?: activeTab.url
         if (target == HOME_TAB_URL || target.isBlank()) return
         runCatching {
+            onBeforeExternalFlow()
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_SUBJECT, activeTab.title)
@@ -743,7 +848,7 @@ fun DownloadedVideosBrowserPanel(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "VIDEOS",
+                            text = exitButtonLabel,
                             style = MaterialTheme.typography.labelSmall.copy(
                                 fontSize = 9.5.sp,
                                 fontWeight = FontWeight.Bold,
@@ -965,6 +1070,8 @@ fun DownloadedVideosBrowserPanel(
         ) {
             if (activeTab.isHome) {
                 SamsungStartPageHome(
+                    pinnedSites = pinnedSites,
+                    enableEditableSpeedDials = enableEditableSpeedDials,
                     syncedDomainsCount = syncedDomains.size,
                     storedCookieCount = storedCookieCount,
                     isPermanentCookieLock = isPermanentCookieLock,
@@ -973,6 +1080,21 @@ fun DownloadedVideosBrowserPanel(
                     onOpenShortcut = { shortcutUrl -> openUrlInActiveTab(shortcutUrl) },
                     onToggleTools = { showToolsBar = !showToolsBar },
                     onManualSync = { onManualSyncCookies("https://www.instagram.com/") },
+                    onAddPinnedSite = { label, url ->
+                        val added = browserPrefs.addPinnedSite(label, url) != null
+                        if (added) localStatusBanner = "تمت إضافة الموقع إلى القائمة المثبتة"
+                        added
+                    },
+                    onUpdatePinnedSite = { id, label, url ->
+                        val updated = browserPrefs.updatePinnedSite(id, label, url)
+                        if (updated) localStatusBanner = "تم تحديث الموقع المثبت"
+                        updated
+                    },
+                    onDeletePinnedSite = { id ->
+                        val deleted = browserPrefs.deletePinnedSite(id)
+                        if (deleted) localStatusBanner = "تم حذف الموقع من القائمة المثبتة"
+                        deleted
+                    },
                 )
             } else {
                 key(activeTab.id) {
@@ -1029,6 +1151,9 @@ fun DownloadedVideosBrowserPanel(
 
                                 setDownloadListener { dlUrl, userAgent, contentDisposition, mimetype, _ ->
                                     if (dlUrl.isNullOrBlank()) return@setDownloadListener
+                                    if (onDirectDownloadIntercepted?.invoke(dlUrl, mimetype) == true) {
+                                        return@setDownloadListener
+                                    }
                                     val fileName = URLUtil.guessFileName(dlUrl, contentDisposition, mimetype)
                                         .ifBlank { "download.bin" }
                                     val queued = runCatching {
@@ -1073,6 +1198,27 @@ fun DownloadedVideosBrowserPanel(
                                                 "utf-8",
                                                 ByteArrayInputStream(ByteArray(0)),
                                             )
+                                        }
+                                        val reqUrl = request?.url?.toString().orEmpty()
+                                        if (reqUrl.isNotBlank()) {
+                                            when {
+                                                isInterceptableAudioStream(reqUrl) -> {
+                                                    view?.post {
+                                                        val prev = sniffedAudioUrlsByTab[tabId].orEmpty()
+                                                        if (reqUrl !in prev) {
+                                                            sniffedAudioUrlsByTab[tabId] = (listOf(reqUrl) + prev).take(10)
+                                                        }
+                                                    }
+                                                }
+                                                isInterceptableVideoStream(reqUrl) -> {
+                                                    view?.post {
+                                                        val prev = sniffedVideoUrlsByTab[tabId].orEmpty()
+                                                        if (reqUrl !in prev) {
+                                                            sniffedVideoUrlsByTab[tabId] = (listOf(reqUrl) + prev).take(16)
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         return super.shouldInterceptRequest(view, request)
                                     }
@@ -1130,6 +1276,45 @@ fun DownloadedVideosBrowserPanel(
                                     }
 
                                     private var retriedGoogleMismatch = false
+
+                                    override fun onPageStarted(
+                                        view: WebView?,
+                                        url: String?,
+                                        favicon: android.graphics.Bitmap?,
+                                    ) {
+                                        super.onPageStarted(view, url, favicon)
+                                        sniffedVideoUrlsByTab.remove(tabId)
+                                        sniffedAudioUrlsByTab.remove(tabId)
+                                        if (!url.isNullOrBlank()) {
+                                            updateTabById(tabId) {
+                                                it.copy(
+                                                    url = url,
+                                                    canGoBack = view?.canGoBack() == true,
+                                                    canGoForward = view?.canGoForward() == true,
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    override fun doUpdateVisitedHistory(
+                                        view: WebView?,
+                                        url: String?,
+                                        isReload: Boolean,
+                                    ) {
+                                        super.doUpdateVisitedHistory(view, url, isReload)
+                                        if (!url.isNullOrBlank() && url.startsWith("http", ignoreCase = true)) {
+                                            updateTabById(tabId) {
+                                                it.copy(
+                                                    url = url,
+                                                    canGoBack = view?.canGoBack() == true,
+                                                    canGoForward = view?.canGoForward() == true,
+                                                )
+                                            }
+                                            if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
+                                                addressText = url
+                                            }
+                                        }
+                                    }
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
@@ -1290,6 +1475,14 @@ fun DownloadedVideosBrowserPanel(
                     modifier = Modifier.fillMaxSize(),
                 )
             }
+
+            viewportOverlayContent(
+                activeWebView?.url ?: activeTab.url,
+                activeTab.isHome,
+                activeWebView,
+                sniffedVideoUrlsByTab[activeTab.id].orEmpty(),
+                sniffedAudioUrlsByTab[activeTab.id].orEmpty(),
+            )
         }
 
         // 4. Inline Cookie & Browser Status Toast (Zero Dialog — Nocturnal)
@@ -2518,8 +2711,11 @@ fun DownloadedVideosBrowserPanel(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SamsungStartPageHome(
+    pinnedSites: List<BrowserPinnedSite>,
+    enableEditableSpeedDials: Boolean,
     syncedDomainsCount: Int,
     storedCookieCount: Int,
     isPermanentCookieLock: Boolean,
@@ -2528,7 +2724,33 @@ private fun SamsungStartPageHome(
     onOpenShortcut: (String) -> Unit,
     onToggleTools: () -> Unit,
     onManualSync: () -> Unit,
+    onAddPinnedSite: (label: String, url: String) -> Boolean,
+    onUpdatePinnedSite: (id: String, label: String, url: String) -> Boolean,
+    onDeletePinnedSite: (id: String) -> Boolean,
 ) {
+    var isEditingPinnedSites by remember { mutableStateOf(false) }
+    var editingSite by remember { mutableStateOf<BrowserPinnedSite?>(null) }
+    var showSiteEditorDialog by remember { mutableStateOf(false) }
+    var siteLabelInput by remember { mutableStateOf("") }
+    var siteUrlInput by remember { mutableStateOf("") }
+    var siteEditorError by remember { mutableStateOf<String?>(null) }
+
+    fun openAddSiteModal() {
+        editingSite = null
+        siteLabelInput = ""
+        siteUrlInput = "https://"
+        siteEditorError = null
+        showSiteEditorDialog = true
+    }
+
+    fun openEditSiteModal(site: BrowserPinnedSite) {
+        editingSite = site
+        siteLabelInput = site.label
+        siteUrlInput = site.url
+        siteEditorError = null
+        showSiteEditorDialog = true
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -2563,43 +2785,113 @@ private fun SamsungStartPageHome(
                 .fillMaxSize()
                 .padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
-            // Top-right Controls (Tools/Zoom + Vault Session Badge)
+            // Top Controls (Editable Pinned Sites Actions on Left + Tools/Zoom & Vault Badge on Right)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(
-                    onClick = onToggleTools,
-                    modifier = Modifier.size(34.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Tune,
-                        contentDescription = "Browser settings, desktop & zoom",
-                        tint = ChromeSilver,
-                        modifier = Modifier.size(18.dp),
-                    )
+                if (enableEditableSpeedDials) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Surface(
+                            color = NeonCyan.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(0.8.dp, NeonCyan.copy(alpha = 0.55f)),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { openAddSiteModal() }
+                                .testTag("browser_add_pinned_site_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = "إضافة موقع مثبت",
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = "إضافة موقع",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = NeonCyan,
+                                )
+                            }
+                        }
+
+                        Surface(
+                            color = if (isEditingPinnedSites) PlasmaViolet.copy(alpha = 0.22f) else NightCardSurface,
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(
+                                0.8.dp,
+                                if (isEditingPinnedSites) PlasmaViolet.copy(alpha = 0.7f) else GlassStrokeBright.copy(alpha = 0.25f),
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { isEditingPinnedSites = !isEditingPinnedSites }
+                                .testTag("browser_edit_pinned_sites_button"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Edit,
+                                    contentDescription = "تعديل المواقع المثبتة",
+                                    tint = if (isEditingPinnedSites) PlasmaViolet else ChromeSilver,
+                                    modifier = Modifier.size(13.dp),
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (isEditingPinnedSites) "تم" else "تعديل",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (isEditingPinnedSites) PlasmaViolet else ChromeSilver,
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(1.dp))
                 }
-                Spacer(modifier = Modifier.width(6.dp))
-                Surface(
-                    color = if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.16f) else NightCardSurface,
-                    shape = CircleShape,
-                    border = BorderStroke(
-                        0.85.dp,
-                        if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.7f) else GlassStrokeBright.copy(alpha = 0.25f),
-                    ),
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .clickable { onManualSync() }
-                        .testTag("browser_home_vault_badge"),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text(
-                            text = syncedDomainsCount.toString(),
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            color = if (syncedDomainsCount > 0) EmeraldPulse else ChromeSilver,
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onToggleTools,
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Tune,
+                            contentDescription = "Browser settings, desktop & zoom",
+                            tint = ChromeSilver,
+                            modifier = Modifier.size(18.dp),
                         )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.16f) else NightCardSurface,
+                        shape = CircleShape,
+                        border = BorderStroke(
+                            0.85.dp,
+                            if (syncedDomainsCount > 0) EmeraldPulse.copy(alpha = 0.7f) else GlassStrokeBright.copy(alpha = 0.25f),
+                        ),
+                        modifier = Modifier
+                            .size(28.dp)
+                            .clip(CircleShape)
+                            .clickable { onManualSync() }
+                            .testTag("browser_home_vault_badge"),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                text = syncedDomainsCount.toString(),
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = if (syncedDomainsCount > 0) EmeraldPulse else ChromeSilver,
+                            )
+                        }
                     }
                 }
             }
@@ -2722,6 +3014,24 @@ private fun SamsungStartPageHome(
 
             Spacer(modifier = Modifier.height(6.dp))
 
+            val displayedSpeedDials = remember(pinnedSites, enableEditableSpeedDials) {
+                if (enableEditableSpeedDials) {
+                    pinnedSites
+                } else {
+                    StartPageSpeedDials.map { item ->
+                        BrowserPinnedSite(
+                            id = item.label,
+                            label = item.label,
+                            url = item.url,
+                            glyph = item.glyph,
+                            colorStartHex = item.tileColors.first().value.toLong(),
+                            colorEndHex = item.tileColors.last().value.toLong(),
+                            isPlayIcon = item.isPlayIcon,
+                        )
+                    }
+                }
+            }
+
             // 5-Column Nocturnal Quick Access Speed Dial Grid
             LazyVerticalGrid(
                 columns = GridCells.Fixed(5),
@@ -2732,60 +3042,328 @@ private fun SamsungStartPageHome(
                     .weight(1f)
                     .fillMaxWidth(),
             ) {
-                items(StartPageSpeedDials, key = { it.label }) { item ->
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
+                items(displayedSpeedDials, key = { it.id }) { item ->
+                    val tileColors = if (enableEditableSpeedDials) {
+                        listOf(Color(item.colorStartHex), Color(item.colorEndHex))
+                    } else {
+                        StartPageSpeedDials.firstOrNull { it.label == item.label }?.tileColors
+                            ?: listOf(Color(item.colorStartHex), Color(item.colorEndHex))
+                    }
+                    Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(14.dp))
-                            .clickable { onOpenShortcut(item.url) }
+                            .combinedClickable(
+                                onClick = {
+                                    if (enableEditableSpeedDials && isEditingPinnedSites) {
+                                        openEditSiteModal(item)
+                                    } else {
+                                        onOpenShortcut(item.url)
+                                    }
+                                },
+                                onLongClick = if (enableEditableSpeedDials) {
+                                    { openEditSiteModal(item) }
+                                } else {
+                                    null
+                                },
+                            )
                             .padding(vertical = 4.dp)
                             .testTag("speed_dial_${item.label.lowercase().replace(" ", "_")}"),
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(48.dp)
-                                .clip(RoundedCornerShape(15.dp))
-                                .background(
-                                    if (item.tileColors.size > 1) {
-                                        Brush.linearGradient(item.tileColors)
-                                    } else {
-                                        SolidColor(item.tileColors.first())
-                                    },
-                                )
-                                .border(
-                                    width = 0.75.dp,
-                                    color = GlassStrokeBright.copy(alpha = 0.24f),
-                                    shape = RoundedCornerShape(15.dp),
-                                ),
-                            contentAlignment = Alignment.Center,
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.fillMaxWidth(),
                         ) {
-                            if (item.isPlayIcon) {
-                                Icon(
-                                    imageVector = Icons.Rounded.PlayArrow,
-                                    contentDescription = item.label,
-                                    tint = item.glyphColor,
-                                    modifier = Modifier.size(26.dp),
-                                )
-                            } else {
-                                Text(
-                                    text = item.glyph,
-                                    style = MaterialTheme.typography.titleMedium.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = if (item.glyph.length > 2) 14.sp else 19.sp,
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(
+                                        if (tileColors.size > 1) {
+                                            Brush.linearGradient(tileColors)
+                                        } else {
+                                            SolidColor(tileColors.first())
+                                        },
+                                    )
+                                    .border(
+                                        width = if (isEditingPinnedSites && enableEditableSpeedDials) 1.2.dp else 0.75.dp,
+                                        color = if (isEditingPinnedSites && enableEditableSpeedDials) {
+                                            NeonCyan.copy(alpha = 0.65f)
+                                        } else {
+                                            GlassStrokeBright.copy(alpha = 0.24f)
+                                        },
+                                        shape = RoundedCornerShape(15.dp),
                                     ),
-                                    color = item.glyphColor,
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (item.isPlayIcon) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.PlayArrow,
+                                        contentDescription = item.label,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(26.dp),
+                                    )
+                                } else {
+                                    Text(
+                                        text = item.glyph,
+                                        style = MaterialTheme.typography.titleMedium.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = if (item.glyph.length > 2) 14.sp else 19.sp,
+                                        ),
+                                        color = Color.White,
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(5.dp))
+                            Text(
+                                text = item.label,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
+                                color = ChromeSilver.copy(alpha = 0.9f),
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+
+                        if (enableEditableSpeedDials && isEditingPinnedSites) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .size(18.dp)
+                                    .clip(CircleShape)
+                                    .background(CrimsonAlert)
+                                    .clickable { onDeletePinnedSite(item.id) }
+                                    .testTag("speed_dial_delete_${item.id}"),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Close,
+                                    contentDescription = "حذف ${item.label}",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(11.dp),
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .size(18.dp)
+                                    .clip(CircleShape)
+                                    .background(NeonCyan)
+                                    .clickable { openEditSiteModal(item) }
+                                    .testTag("speed_dial_edit_${item.id}"),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Edit,
+                                    contentDescription = "تعديل ${item.label}",
+                                    tint = ObsidianVoid,
+                                    modifier = Modifier.size(11.dp),
                                 )
                             }
                         }
-                        Spacer(modifier = Modifier.height(5.dp))
-                        Text(
-                            text = item.label,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
-                            color = ChromeSilver.copy(alpha = 0.9f),
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            textAlign = TextAlign.Center,
+                    }
+                }
+
+                if (enableEditableSpeedDials) {
+                    item(key = "add_new_pinned_site_tile") {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(14.dp))
+                                .clickable { openAddSiteModal() }
+                                .padding(vertical = 4.dp)
+                                .testTag("speed_dial_add_tile"),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(RoundedCornerShape(15.dp))
+                                    .background(NeonCyan.copy(alpha = 0.12f))
+                                    .border(
+                                        width = 1.dp,
+                                        color = NeonCyan.copy(alpha = 0.55f),
+                                        shape = RoundedCornerShape(15.dp),
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = "إضافة موقع جديد",
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(24.dp),
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(5.dp))
+                            Text(
+                                text = "إضافة موقع",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
+                                color = NeonCyan,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inline Nocturnal Pinned Site Add/Edit Sheet
+        if (enableEditableSpeedDials && showSiteEditorDialog) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(ObsidianVoid.copy(alpha = 0.78f))
+                    .clickable { showSiteEditorDialog = false }
+                    .padding(horizontal = 20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Surface(
+                    color = Color(0xFF0E1522),
+                    shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .widthIn(max = 460.dp)
+                        .clickable(enabled = false) {},
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(20.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = if (editingSite == null) "إضافة موقع جديد" else "تعديل الموقع المثبت",
+                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                color = ChromeSilver,
+                            )
+                            IconButton(
+                                onClick = { showSiteEditorDialog = false },
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Close,
+                                    contentDescription = "إغلاق",
+                                    tint = MutedSlate,
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        OutlinedTextField(
+                            value = siteLabelInput,
+                            onValueChange = {
+                                siteLabelInput = it
+                                siteEditorError = null
+                            },
+                            label = { Text("اسم الموقع") },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = NeonCyan,
+                                unfocusedBorderColor = GlassStrokeBright.copy(alpha = 0.35f),
+                                focusedTextColor = ChromeSilver,
+                                unfocusedTextColor = ChromeSilver,
+                                focusedLabelColor = NeonCyan,
+                                unfocusedLabelColor = MutedSlate,
+                                cursorColor = NeonCyan,
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("pinned_site_name_input"),
                         )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        OutlinedTextField(
+                            value = siteUrlInput,
+                            onValueChange = {
+                                siteUrlInput = it
+                                siteEditorError = null
+                            },
+                            label = { Text("رابط الموقع (URL)") },
+                            placeholder = { Text("https://example.com") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = NeonCyan,
+                                unfocusedBorderColor = GlassStrokeBright.copy(alpha = 0.35f),
+                                focusedTextColor = ChromeSilver,
+                                unfocusedTextColor = ChromeSilver,
+                                focusedLabelColor = NeonCyan,
+                                unfocusedLabelColor = MutedSlate,
+                                cursorColor = NeonCyan,
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("pinned_site_url_input"),
+                        )
+
+                        if (!siteEditorError.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = siteEditorError!!,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CrimsonAlert,
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(18.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            val currentEdit = editingSite
+                            if (currentEdit != null) {
+                                OutlinedButton(
+                                    onClick = {
+                                        onDeletePinnedSite(currentEdit.id)
+                                        showSiteEditorDialog = false
+                                    },
+                                    border = BorderStroke(0.9.dp, CrimsonAlert.copy(alpha = 0.7f)),
+                                    modifier = Modifier.testTag("pinned_site_delete_button"),
+                                ) {
+                                    Text("حذف", color = CrimsonAlert)
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { showSiteEditorDialog = false },
+                                border = BorderStroke(0.9.dp, GlassStrokeBright.copy(alpha = 0.35f)),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("pinned_site_cancel_button"),
+                            ) {
+                                Text("إلغاء", color = ChromeSilver)
+                            }
+                            Button(
+                                onClick = {
+                                    val saved = if (currentEdit == null) {
+                                        onAddPinnedSite(siteLabelInput, siteUrlInput)
+                                    } else {
+                                        onUpdatePinnedSite(currentEdit.id, siteLabelInput, siteUrlInput)
+                                    }
+                                    if (saved) {
+                                        showSiteEditorDialog = false
+                                    } else {
+                                        siteEditorError = "أدخل رابط موقع صحيح مثل https://example.com"
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = NeonCyan,
+                                    contentColor = ObsidianVoid,
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("pinned_site_save_button"),
+                            ) {
+                                Text("حفظ", fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                 }
             }
@@ -2826,6 +3404,38 @@ private fun isAdOrTrackerRequest(request: WebResourceRequest?): Boolean {
     return AD_TRACKER_HOSTS.any { blocked ->
         host == blocked || host.endsWith(".$blocked")
     }
+}
+
+private fun isInterceptableVideoStream(url: String): Boolean {
+    val lower = url.lowercase()
+    if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
+    val pathOnly = lower.substringBefore("?").substringBefore("#")
+    if (pathOnly.endsWith(".ts") || pathOnly.endsWith(".m4s") || pathOnly.endsWith(".vtt") ||
+        pathOnly.endsWith(".jpg") || pathOnly.endsWith(".jpeg") || pathOnly.endsWith(".png") ||
+        pathOnly.endsWith(".webp") || pathOnly.endsWith(".css") || pathOnly.endsWith(".js")
+    ) {
+        return false
+    }
+    return pathOnly.endsWith(".m3u8") ||
+        pathOnly.endsWith(".mp4") ||
+        pathOnly.endsWith(".m4v") ||
+        pathOnly.endsWith(".webm") ||
+        pathOnly.endsWith(".mov") ||
+        lower.contains(".m3u8?") ||
+        lower.contains(".mp4?") ||
+        lower.contains("mime=video") ||
+        lower.contains("mime_type=video") ||
+        lower.contains("video/mp4")
+}
+
+private fun isInterceptableAudioStream(url: String): Boolean {
+    val lower = url.lowercase()
+    if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
+    val pathOnly = lower.substringBefore("?").substringBefore("#")
+    return pathOnly.endsWith(".m4a") ||
+        pathOnly.endsWith(".aac") ||
+        lower.contains("mime=audio") ||
+        lower.contains("mime_type=audio")
 }
 
 private fun deriveHostLabel(url: String): String {

@@ -9,6 +9,7 @@ import android.os.Build
 import android.provider.MediaStore
 import android.provider.Settings
 import android.view.WindowManager
+import android.webkit.WebView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
@@ -76,6 +77,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.ui.components.DownloadedVideosBrowserPanel
+import com.example.ui.components.FloatingBlackholeDownloadOverlay
+import com.example.ui.components.collectLiveWebViewMediaCandidates
 import com.example.ui.components.rememberSafeScreenInsets
 import com.example.ui.theme.ChromeSilver
 import com.example.ui.theme.CrimsonAlert
@@ -101,8 +105,10 @@ fun VaultScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by vaultViewModel.uiState.collectAsStateWithLifecycle()
+    val blackholeUiState by viewModel.uiState.collectAsStateWithLifecycle()
     val noScreenshotEnabled by vaultViewModel.noScreenshotEnabled.collectAsStateWithLifecycle()
     var showVaultSettings by remember { mutableStateOf(false) }
+    var vaultBrowserWebViewRef by remember { mutableStateOf<WebView?>(null) }
 
     LaunchedEffect(uiState.isLocked) {
         if (uiState.isLocked) {
@@ -155,6 +161,14 @@ fun VaultScreen(
                 }
             }
             showVaultSettings -> showVaultSettings = false
+            uiState.isPrivateBrowserOpen -> {
+                val wv = vaultBrowserWebViewRef
+                if (wv != null && wv.canGoBack()) {
+                    wv.goBack()
+                } else {
+                    vaultViewModel.closePrivateBrowser()
+                }
+            }
             uiState.selectedCategory != null -> vaultViewModel.selectCategory(null)
             else -> {
                 vaultViewModel.lockVaultNow()
@@ -516,6 +530,61 @@ fun VaultScreen(
                         onDismissStatus = vaultViewModel::dismissStatus,
                     )
                 }
+                uiState.isPrivateBrowserOpen -> {
+                    DownloadedVideosBrowserPanel(
+                        syncedDomains = blackholeUiState.syncedDomains,
+                        storedCookieCount = blackholeUiState.storedCookieCount,
+                        isPermanentCookieLock = blackholeUiState.isPermanentCookieLock,
+                        statusMessage = blackholeUiState.vaultStatusMessage,
+                        onAutoSyncCookies = { url -> viewModel.syncWebViewSession(url, silent = true) },
+                        onManualSyncCookies = { url -> viewModel.syncWebViewSession(url, silent = false) },
+                        onRestoreCookiesToBrowser = viewModel::restoreBrowserCookies,
+                        onTogglePermanentCookieLock = viewModel::togglePermanentCookieLock,
+                        onClearCookies = viewModel::clearAllCookies,
+                        onPullCurrentPage = { pageUrl ->
+                            collectLiveWebViewMediaCandidates(vaultBrowserWebViewRef) { pageTitle, domUrls ->
+                                vaultViewModel.downloadPageVideoToVault(
+                                    pageUrl = pageUrl,
+                                    pageTitle = pageTitle,
+                                    domVideoUrls = domUrls,
+                                )
+                            }
+                        },
+                        onExitBrowser = vaultViewModel::closePrivateBrowser,
+                        onDismissStatus = viewModel::clearVaultStatusMessage,
+                        onBindWebViewRef = { wv -> vaultBrowserWebViewRef = wv },
+                        enableEditableSpeedDials = true,
+                        exitButtonLabel = "الخزنة",
+                        onBeforeExternalFlow = vaultViewModel::beginExternalSystemFlow,
+                        onDirectDownloadIntercepted = { dlUrl, _ ->
+                            vaultViewModel.downloadPageVideoToVault(pageUrl = dlUrl)
+                            true
+                        },
+                        viewportOverlayContent = { currentPageUrl, isHomeTab, activeWebView, sniffedVideos, sniffedAudios ->
+                            FloatingBlackholeDownloadOverlay(
+                                downloadState = uiState.browserDownloadState,
+                                sniffedCandidatesCount = if (isHomeTab) 0 else sniffedVideos.size,
+                                isPageActive = !isHomeTab,
+                                onTapBlackhole = {
+                                    collectLiveWebViewMediaCandidates(activeWebView) { pageTitle, domUrls ->
+                                        vaultViewModel.downloadPageVideoToVault(
+                                            pageUrl = currentPageUrl,
+                                            pageTitle = pageTitle,
+                                            domVideoUrls = domUrls,
+                                            sniffedVideoUrls = sniffedVideos,
+                                            sniffedAudioUrls = sniffedAudios,
+                                        )
+                                    }
+                                },
+                                onCancelDownload = vaultViewModel::cancelBrowserDownload,
+                                onDismissStatus = vaultViewModel::dismissBrowserDownloadStatus,
+                            )
+                        },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("vault_private_browser_panel"),
+                    )
+                }
                 activeCategory == null -> {
                     VaultHomeCategoriesDashboard(
                         uiState = uiState,
@@ -525,6 +594,7 @@ fun VaultScreen(
                         },
                         onOpenSettings = { showVaultSettings = true },
                         onOpenCategory = { cat -> vaultViewModel.selectCategory(cat) },
+                        onOpenPrivateBrowser = vaultViewModel::openPrivateBrowser,
                         onRequestAllFilesAccess = requestAllFilesAccess,
                         onRetryDeletePendingOriginals = vaultViewModel::retryDeletePendingOriginals,
                         onDismissPendingOriginals = vaultViewModel::dismissPendingUnremovedOriginals,
