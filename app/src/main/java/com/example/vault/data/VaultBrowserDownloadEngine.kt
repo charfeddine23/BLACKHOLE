@@ -92,7 +92,7 @@ class VaultBrowserDownloadEngine(
             onState(
                 VaultBrowserDownloadState(
                     phase = VaultBrowserDownloadPhase.ERROR,
-                    message = "افتح صفحة ويب تحتوي على فيديو أولاً ثم اضغط على دائرة الثقب الأسود.",
+                    message = "أدخل رابط الفيديو في الشريط بالأعلى أو افتح صفحة فيديو أولاً ثم اضغط زر التحميل.",
                 ),
             )
             return@withContext false

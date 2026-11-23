@@ -542,11 +542,16 @@ fun VaultScreen(
                         onTogglePermanentCookieLock = viewModel::togglePermanentCookieLock,
                         onClearCookies = viewModel::clearAllCookies,
                         onPullCurrentPage = { pageUrl ->
-                            collectLiveWebViewMediaCandidates(vaultBrowserWebViewRef) { pageTitle, domUrls ->
+                            vaultViewModel.downloadPageVideoToVault(pageUrl = pageUrl)
+                        },
+                        onPullCurrentPageWithMedia = { pageUrl, liveWebView, sniffedVideos, sniffedAudios ->
+                            collectLiveWebViewMediaCandidates(liveWebView) { pageTitle, domUrls ->
                                 vaultViewModel.downloadPageVideoToVault(
                                     pageUrl = pageUrl,
                                     pageTitle = pageTitle,
                                     domVideoUrls = domUrls,
+                                    sniffedVideoUrls = sniffedVideos,
+                                    sniffedAudioUrls = sniffedAudios,
                                 )
                             }
                         },

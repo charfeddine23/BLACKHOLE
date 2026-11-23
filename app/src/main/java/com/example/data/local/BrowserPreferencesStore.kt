@@ -32,6 +32,7 @@ data class BrowserPinnedSite(
     val colorStartHex: Long,
     val colorEndHex: Long,
     val isPlayIcon: Boolean = false,
+    val logoPath: String? = null,
 )
 
 enum class BrowserSearchEngine(
@@ -46,8 +47,9 @@ enum class BrowserSearchEngine(
 
 class BrowserPreferencesStore private constructor(context: Context) {
 
+    private val appContext = context.applicationContext
     private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -122,12 +124,23 @@ class BrowserPreferencesStore private constructor(context: Context) {
         return next
     }
 
-    fun addPinnedSite(label: String, rawUrl: String): BrowserPinnedSite? {
+    fun isPinnedSite(url: String): Boolean {
+        val normalized = url.trim().trimEnd('/')
+        return _pinnedSites.value.any { it.url.trim().trimEnd('/').equals(normalized, ignoreCase = true) }
+    }
+
+    fun addPinnedSite(
+        label: String,
+        rawUrl: String,
+        logoPath: String? = null,
+    ): BrowserPinnedSite? {
         val normalizedUrl = normalizePinnedUrl(rawUrl) ?: return null
         val cleanLabel = label.trim().ifBlank { deriveShortLabelFromUrl(normalizedUrl) }
         val palette = PINNED_ACCENT_PALETTES[
             kotlin.math.abs((cleanLabel + normalizedUrl).hashCode()) % PINNED_ACCENT_PALETTES.size
         ]
+        val resolvedLogoPath = logoPath?.takeIf { it.isNotBlank() }
+            ?: SiteLogoFetcher.getCachedLogoFile(appContext, normalizedUrl)?.absolutePath
         val entry = BrowserPinnedSite(
             id = "site_${System.nanoTime()}",
             label = cleanLabel.take(24),
@@ -136,19 +149,31 @@ class BrowserPreferencesStore private constructor(context: Context) {
             colorStartHex = palette.first,
             colorEndHex = palette.second,
             isPlayIcon = false,
+            logoPath = resolvedLogoPath,
         )
         val updated = _pinnedSites.value + entry
         savePinnedSites(updated)
         return entry
     }
 
-    fun updatePinnedSite(id: String, label: String, rawUrl: String): Boolean {
+    fun updatePinnedSite(
+        id: String,
+        label: String,
+        rawUrl: String,
+        logoPath: String? = null,
+    ): Boolean {
         val normalizedUrl = normalizePinnedUrl(rawUrl) ?: return false
         val cleanLabel = label.trim().ifBlank { deriveShortLabelFromUrl(normalizedUrl) }
         val current = _pinnedSites.value
         val index = current.indexOfFirst { it.id == id }
         if (index < 0) return false
         val existing = current[index]
+        val urlChanged = !existing.url.trimEnd('/').equals(normalizedUrl.trimEnd('/'), ignoreCase = true)
+        val resolvedLogoPath = when {
+            !logoPath.isNullOrBlank() -> logoPath
+            urlChanged -> SiteLogoFetcher.getCachedLogoFile(appContext, normalizedUrl)?.absolutePath
+            else -> existing.logoPath ?: SiteLogoFetcher.getCachedLogoFile(appContext, normalizedUrl)?.absolutePath
+        }
         val updated = current.toMutableList().apply {
             set(
                 index,
@@ -161,8 +186,22 @@ class BrowserPreferencesStore private constructor(context: Context) {
                         deriveGlyph(cleanLabel)
                     },
                     isPlayIcon = existing.isPlayIcon && cleanLabel.equals(existing.label, ignoreCase = true),
+                    logoPath = resolvedLogoPath,
                 ),
             )
+        }
+        savePinnedSites(updated)
+        return true
+    }
+
+    fun updatePinnedSiteLogo(id: String, logoPath: String): Boolean {
+        val current = _pinnedSites.value
+        val index = current.indexOfFirst { it.id == id }
+        if (index < 0) return false
+        val existing = current[index]
+        if (existing.logoPath == logoPath) return true
+        val updated = current.toMutableList().apply {
+            set(index, existing.copy(logoPath = logoPath))
         }
         savePinnedSites(updated)
         return true

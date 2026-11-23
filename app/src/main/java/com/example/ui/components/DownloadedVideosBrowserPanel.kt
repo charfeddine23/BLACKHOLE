@@ -30,6 +30,8 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -39,6 +41,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -49,6 +52,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -63,6 +67,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
@@ -72,6 +77,7 @@ import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Public
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.Block
@@ -85,7 +91,6 @@ import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
@@ -129,11 +134,15 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -144,9 +153,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
+import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import com.example.data.local.BrowserPinnedSite
 import com.example.data.local.BrowserPreferencesStore
 import com.example.data.local.BrowserSearchEngine
+import com.example.data.local.SiteLogoFetcher
 import com.example.engine.network.ClientSpoofer
 import com.example.engine.network.CloudflareDnsVpnService
 import org.json.JSONObject
@@ -162,8 +180,14 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -353,6 +377,12 @@ fun DownloadedVideosBrowserPanel(
     exitButtonLabel: String = "VIDEOS",
     onBeforeExternalFlow: () -> Unit = {},
     onDirectDownloadIntercepted: ((url: String, mimeType: String?) -> Boolean)? = null,
+    onPullCurrentPageWithMedia: ((
+        pageUrl: String,
+        activeWebView: WebView?,
+        sniffedVideoUrls: List<String>,
+        sniffedAudioUrls: List<String>,
+    ) -> Unit)? = null,
     viewportOverlayContent: @Composable BoxScope.(
         currentPageUrl: String,
         isHomeTab: Boolean,
@@ -362,6 +392,8 @@ fun DownloadedVideosBrowserPanel(
     ) -> Unit = { _, _, _, _, _ -> },
 ) {
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val coroutineScope = rememberCoroutineScope()
     val browserPrefs = remember(context) { BrowserPreferencesStore.getInstance(context) }
     val bookmarks by browserPrefs.bookmarks.collectAsStateWithLifecycle()
     val historyEntries by browserPrefs.history.collectAsStateWithLifecycle()
@@ -404,6 +436,28 @@ fun DownloadedVideosBrowserPanel(
 
     val activeWebView = webViews[activeTab.id]
     val isCurrentBookmarked = !activeTab.isHome && browserPrefs.isBookmarked(activeTab.url)
+    val isCurrentPinnedToHome = !activeTab.isHome &&
+        enableEditableSpeedDials &&
+        browserPrefs.isPinnedSite(activeWebView?.url ?: activeTab.url)
+
+    // Automatically fetch & cache website logos for any pinned sites on the start page
+    LaunchedEffect(pinnedSites, enableEditableSpeedDials) {
+        if (!enableEditableSpeedDials) return@LaunchedEffect
+        val semaphore = Semaphore(4)
+        pinnedSites.forEach { site ->
+            val hasValidFile = !site.logoPath.isNullOrBlank() && File(site.logoPath).exists()
+            if (!hasValidFile) {
+                launch {
+                    semaphore.withPermit {
+                        val cached = SiteLogoFetcher.fetchAndCacheLogoDeduplicated(context, site.url)
+                        if (!cached.isNullOrBlank()) {
+                            browserPrefs.updatePinnedSiteLogo(site.id, cached)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult(),
@@ -487,11 +541,13 @@ fun DownloadedVideosBrowserPanel(
 
     BackHandler(
         enabled = customFullscreenView != null ||
+            showToolsBar ||
             activeSubTray != null ||
             (!activeTab.isHome && activeTab.canGoBack),
     ) {
         when {
             customFullscreenView != null -> exitFullscreenVideo()
+            showToolsBar -> showToolsBar = false
             activeSubTray != null -> {
                 if (activeSubTray == BrowserSubTray.FIND) {
                     webViews[activeTab.id]?.clearMatches()
@@ -618,6 +674,65 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
+    fun extractDirectUrlFromAddressBar(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed == HOME_TAB_URL) return null
+        return when {
+            trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.contains(".") && !trimmed.contains(" ") -> "https://$trimmed"
+            else -> null
+        }
+    }
+
+    fun urlsMatchSamePage(first: String?, second: String?): Boolean {
+        if (first.isNullOrBlank() || second.isNullOrBlank()) return false
+        return first.trim().trimEnd('/').equals(second.trim().trimEnd('/'), ignoreCase = true)
+    }
+
+    fun resolveTopBarDownloadUrl(): String? {
+        val barUrl = extractDirectUrlFromAddressBar(addressText)
+        val loadedUrl = webViews[activeTab.id]?.url?.takeIf { it.startsWith("http", ignoreCase = true) }
+            ?: activeTab.url.takeIf { it.startsWith("http", ignoreCase = true) }
+        return when {
+            barUrl != null && (loadedUrl == null || isUrlFocused || !urlsMatchSamePage(barUrl, loadedUrl)) -> barUrl
+            loadedUrl != null -> loadedUrl
+            else -> barUrl
+        }
+    }
+
+    fun triggerPullFromTopUrl() {
+        val targetUrl = resolveTopBarDownloadUrl()
+        if (targetUrl.isNullOrBlank()) {
+            if (onPullCurrentPageWithMedia != null) {
+                onPullCurrentPageWithMedia("", null, emptyList(), emptyList())
+            } else {
+                localStatusBanner = "أدخل رابط الفيديو في الشريط بالأعلى أو افتح صفحة أولاً"
+            }
+            return
+        }
+        focusManager.clearFocus()
+        isUrlFocused = false
+        addressText = targetUrl
+        onAutoSyncCookies(targetUrl)
+
+        val loadedUrl = webViews[activeTab.id]?.url?.takeIf { it.startsWith("http", ignoreCase = true) }
+            ?: activeTab.url.takeIf { it.startsWith("http", ignoreCase = true) }
+        val matchesLiveWebView = !activeTab.isHome &&
+            activeWebView != null &&
+            urlsMatchSamePage(targetUrl, loadedUrl)
+
+        val matchedWebView = if (matchesLiveWebView) activeWebView else null
+        val sniffedVideos = if (matchesLiveWebView) sniffedVideoUrlsByTab[activeTab.id].orEmpty() else emptyList()
+        val sniffedAudios = if (matchesLiveWebView) sniffedAudioUrlsByTab[activeTab.id].orEmpty() else emptyList()
+
+        if (onPullCurrentPageWithMedia != null) {
+            onPullCurrentPageWithMedia(targetUrl, matchedWebView, sniffedVideos, sniffedAudios)
+        } else {
+            onPullCurrentPage(targetUrl)
+        }
+    }
+
     fun closeTab(index: Int) {
         if (index !in tabs.indices) return
         val removed = tabs[index]
@@ -711,11 +826,14 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
-    Column(
+    Box(
         modifier = modifier
             .fillMaxSize()
             .background(ObsidianVoid)
             .testTag("downloaded_videos_browser_panel"),
+    ) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
     ) {
         // 1. Compact Nocturnal Top Tab Strip + Exit Pill
         Column(
@@ -1080,14 +1198,45 @@ fun DownloadedVideosBrowserPanel(
                     onOpenShortcut = { shortcutUrl -> openUrlInActiveTab(shortcutUrl) },
                     onToggleTools = { showToolsBar = !showToolsBar },
                     onManualSync = { onManualSyncCookies("https://www.instagram.com/") },
-                    onAddPinnedSite = { label, url ->
-                        val added = browserPrefs.addPinnedSite(label, url) != null
-                        if (added) localStatusBanner = "تمت إضافة الموقع إلى القائمة المثبتة"
-                        added
+                    onAddPinnedSite = { label, url, previewLogoPath ->
+                        val added = browserPrefs.addPinnedSite(label, url, logoPath = previewLogoPath)
+                        if (added != null) {
+                            localStatusBanner = "تمت إضافة الموقع وجلب الشعار تلقائياً"
+                            if (added.logoPath.isNullOrBlank()) {
+                                coroutineScope.launch {
+                                    val fetched = SiteLogoFetcher.fetchAndCacheLogo(
+                                        context = context,
+                                        siteUrl = added.url,
+                                        forceRefresh = true,
+                                    )
+                                    if (!fetched.isNullOrBlank()) {
+                                        browserPrefs.updatePinnedSiteLogo(added.id, fetched)
+                                    }
+                                }
+                            }
+                            true
+                        } else {
+                            false
+                        }
                     },
-                    onUpdatePinnedSite = { id, label, url ->
-                        val updated = browserPrefs.updatePinnedSite(id, label, url)
-                        if (updated) localStatusBanner = "تم تحديث الموقع المثبت"
+                    onUpdatePinnedSite = { id, label, url, previewLogoPath ->
+                        val updated = browserPrefs.updatePinnedSite(id, label, url, logoPath = previewLogoPath)
+                        if (updated) {
+                            localStatusBanner = "تم تحديث الموقع المثبت"
+                            val refreshed = browserPrefs.pinnedSites.value.firstOrNull { it.id == id }
+                            if (refreshed != null && refreshed.logoPath.isNullOrBlank()) {
+                                coroutineScope.launch {
+                                    val fetched = SiteLogoFetcher.fetchAndCacheLogo(
+                                        context = context,
+                                        siteUrl = refreshed.url,
+                                        forceRefresh = true,
+                                    )
+                                    if (!fetched.isNullOrBlank()) {
+                                        browserPrefs.updatePinnedSiteLogo(refreshed.id, fetched)
+                                    }
+                                }
+                            }
+                        }
                         updated
                     },
                     onDeletePinnedSite = { id ->
@@ -1476,12 +1625,20 @@ fun DownloadedVideosBrowserPanel(
                 )
             }
 
+            val resolvedOverlayUrl = resolveTopBarDownloadUrl()
+            val loadedOverlayUrl = activeWebView?.url?.takeIf { it.startsWith("http", ignoreCase = true) }
+                ?: activeTab.url.takeIf { it.startsWith("http", ignoreCase = true) }
+            val overlayMatchesWebView = !activeTab.isHome &&
+                activeWebView != null &&
+                resolvedOverlayUrl != null &&
+                urlsMatchSamePage(resolvedOverlayUrl, loadedOverlayUrl)
+
             viewportOverlayContent(
-                activeWebView?.url ?: activeTab.url,
-                activeTab.isHome,
-                activeWebView,
-                sniffedVideoUrlsByTab[activeTab.id].orEmpty(),
-                sniffedAudioUrlsByTab[activeTab.id].orEmpty(),
+                resolvedOverlayUrl.orEmpty(),
+                resolvedOverlayUrl == null,
+                if (overlayMatchesWebView) activeWebView else null,
+                if (overlayMatchesWebView) sniffedVideoUrlsByTab[activeTab.id].orEmpty() else emptyList(),
+                if (overlayMatchesWebView) sniffedAudioUrlsByTab[activeTab.id].orEmpty() else emptyList(),
             )
         }
 
@@ -1801,627 +1958,7 @@ fun DownloadedVideosBrowserPanel(
             }
         }
 
-        // 5. Inline Tools & Zoom Tray (Zero Popup — Nocturnal Obsidian)
-        AnimatedVisibility(
-            visible = showToolsBar,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut(),
-        ) {
-            Surface(
-                color = NightChromeSurface,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 10.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        // Zoom Out / % Reset / Zoom In Capsule
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = { zoomPageBy(-20) },
-                                    enabled = !activeTab.isHome,
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .testTag("browser_zoom_out_button"),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.ZoomOut,
-                                        contentDescription = "Zoom out page",
-                                        tint = if (activeTab.isHome) DimSlate else ChromeSilver,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                }
-                                Text(
-                                    text = "$zoomPercent%",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (zoomPercent == 100) MutedSlate else NeonCyan,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .clickable(enabled = !activeTab.isHome) { resetZoom() }
-                                        .padding(horizontal = 6.dp, vertical = 5.dp)
-                                        .testTag("browser_zoom_reset_button"),
-                                )
-                                IconButton(
-                                    onClick = { zoomPageBy(+20) },
-                                    enabled = !activeTab.isHome,
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .testTag("browser_zoom_in_button"),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.ZoomIn,
-                                        contentDescription = "Zoom in page",
-                                        tint = if (activeTab.isHome) DimSlate else NeonCyan,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                }
-                            }
-                        }
-
-                        // Desktop View Toggle Action
-                        Surface(
-                            color = if (isDesktopMode) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (isDesktopMode) NeonCyan.copy(alpha = 0.7f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable { toggleDesktopMode() }
-                                .testTag("browser_desktop_mode_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.DesktopWindows,
-                                    contentDescription = "Toggle desktop view",
-                                    tint = if (isDesktopMode) NeonCyan else ChromeSilver,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (isDesktopMode) "DESKTOP ON" else "DESKTOP VIEW",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (isDesktopMode) NeonCyan else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Permanent AES-256 Cookie Lock Pill
-                        Surface(
-                            color = if (isPermanentCookieLock) EmeraldPulse.copy(alpha = 0.13f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (isPermanentCookieLock) EmeraldPulse.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable { onTogglePermanentCookieLock() }
-                                .testTag("browser_permanent_cookie_lock_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.VerifiedUser,
-                                    contentDescription = "Permanent cookie protection",
-                                    tint = if (isPermanentCookieLock) EmeraldPulse else MutedSlate,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (isPermanentCookieLock) {
-                                        "FOREVER LOCK · $storedCookieCount"
-                                    } else {
-                                        "TEMP SESSION · $storedCookieCount"
-                                    },
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (isPermanentCookieLock) EmeraldPulse else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Sync Cookies Action
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable {
-                                    onManualSyncCookies(
-                                        if (activeTab.isHome) "https://www.instagram.com/" else activeTab.url,
-                                    )
-                                }
-                                .testTag("browser_sync_cookies_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Sync,
-                                    contentDescription = "Sync cookies",
-                                    tint = EmeraldPulse,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "SYNC (${syncedDomains.size})",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Clear Cookies (Inline 2-tap confirm, zero dialog)
-                        if (storedCookieCount > 0) {
-                            Surface(
-                                color = if (confirmClearCookies) CrimsonAlert else CrimsonAlert.copy(alpha = 0.12f),
-                                shape = RoundedCornerShape(50),
-                                border = BorderStroke(
-                                    0.8.dp,
-                                    CrimsonAlert.copy(alpha = if (confirmClearCookies) 1f else 0.55f),
-                                ),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .clickable {
-                                        if (confirmClearCookies) {
-                                            confirmClearCookies = false
-                                            onClearCookies()
-                                        } else {
-                                            confirmClearCookies = true
-                                        }
-                                    }
-                                    .testTag("browser_clear_cookies_button"),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Outlined.DeleteOutline,
-                                        contentDescription = "Clear cookie vault",
-                                        tint = if (confirmClearCookies) Color.White else CrimsonAlert,
-                                        modifier = Modifier.size(15.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = if (confirmClearCookies) "TAP AGAIN TO CLEAR" else "CLEAR VAULT",
-                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                        color = if (confirmClearCookies) Color.White else CrimsonAlert,
-                                    )
-                                }
-                            }
-                        }
-
-                        // Reload Action
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable(enabled = !activeTab.isHome) { webViews[activeTab.id]?.reload() }
-                                .testTag("browser_reload_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Refresh,
-                                    contentDescription = "Reload page",
-                                    tint = if (activeTab.isHome) DimSlate else ChromeSilver,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "RELOAD",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (activeTab.isHome) DimSlate else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // 1.1.1.1 Cloudflare DNS VPN Toggle
-                        Surface(
-                            color = if (isVpnActive) EmeraldPulse.copy(alpha = 0.16f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.85.dp,
-                                if (isVpnActive) EmeraldPulse.copy(alpha = 0.75f) else GlassStrokeBright.copy(alpha = 0.22f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable { toggleCloudflareVpn() }
-                                .testTag("browser_vpn_1111_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.VpnLock,
-                                    contentDescription = "Toggle 1.1.1.1 DNS VPN",
-                                    tint = if (isVpnActive) EmeraldPulse else ChromeSilver,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (isVpnActive) "1.1.1.1 VPN ON" else "1.1.1.1 VPN",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                    color = if (isVpnActive) EmeraldPulse else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Ad & Tracker Blocker Toggle
-                        Surface(
-                            color = if (adBlockEnabled) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (adBlockEnabled) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable {
-                                    val next = !adBlockEnabled
-                                    browserPrefs.setAdBlockEnabled(next)
-                                    localStatusBanner = if (next) "Ad blocker enabled" else "Ad blocker paused"
-                                }
-                                .testTag("browser_adblock_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Block,
-                                    contentDescription = "Toggle ad blocker",
-                                    tint = if (adBlockEnabled) NeonCyan else MutedSlate,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (blockedAdsCount > 0) "ADBLOCK · $blockedAdsCount" else "ADBLOCK",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (adBlockEnabled) NeonCyan else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Bookmark Current Page Toggle
-                        Surface(
-                            color = if (isCurrentBookmarked) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (isCurrentBookmarked) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable(enabled = !activeTab.isHome) {
-                                    val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
-                                    val added = browserPrefs.toggleBookmark(targetUrl, activeTab.title)
-                                    localStatusBanner = if (added) "Bookmark saved" else "Bookmark removed"
-                                }
-                                .testTag("browser_bookmark_toggle_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = if (isCurrentBookmarked) Icons.Rounded.Bookmark else Icons.Outlined.BookmarkBorder,
-                                    contentDescription = "Bookmark page",
-                                    tint = when {
-                                        activeTab.isHome -> DimSlate
-                                        isCurrentBookmarked -> NeonCyan
-                                        else -> ChromeSilver
-                                    },
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = if (isCurrentBookmarked) "SAVED" else "BOOKMARK",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = when {
-                                        activeTab.isHome -> DimSlate
-                                        isCurrentBookmarked -> NeonCyan
-                                        else -> ChromeSilver
-                                    },
-                                )
-                            }
-                        }
-
-                        // Bookmarks List Sub-Tray
-                        Surface(
-                            color = if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable {
-                                    activeSubTray = if (activeSubTray == BrowserSubTray.BOOKMARKS) null else BrowserSubTray.BOOKMARKS
-                                }
-                                .testTag("browser_bookmarks_tray_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Bookmarks,
-                                    contentDescription = "Bookmarks list",
-                                    tint = if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan else ChromeSilver,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "BOOKMARKS (${bookmarks.size})",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (activeSubTray == BrowserSubTray.BOOKMARKS) NeonCyan else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // History List Sub-Tray
-                        Surface(
-                            color = if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable {
-                                    confirmClearHistory = false
-                                    activeSubTray = if (activeSubTray == BrowserSubTray.HISTORY) null else BrowserSubTray.HISTORY
-                                }
-                                .testTag("browser_history_tray_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.History,
-                                    contentDescription = "Browsing history",
-                                    tint = if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan else ChromeSilver,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "HISTORY (${historyEntries.size})",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (activeSubTray == BrowserSubTray.HISTORY) NeonCyan else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Find in Page
-                        Surface(
-                            color = if (activeSubTray == BrowserSubTray.FIND) NeonCyan.copy(alpha = 0.14f) else NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(
-                                0.8.dp,
-                                if (activeSubTray == BrowserSubTray.FIND) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.2f),
-                            ),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable(enabled = !activeTab.isHome) {
-                                    activeSubTray = if (activeSubTray == BrowserSubTray.FIND) {
-                                        webViews[activeTab.id]?.clearMatches()
-                                        null
-                                    } else {
-                                        BrowserSubTray.FIND
-                                    }
-                                }
-                                .testTag("browser_find_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Search,
-                                    contentDescription = "Find in page",
-                                    tint = when {
-                                        activeTab.isHome -> DimSlate
-                                        activeSubTray == BrowserSubTray.FIND -> NeonCyan
-                                        else -> ChromeSilver
-                                    },
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "FIND",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = if (activeTab.isHome) DimSlate else ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Open New Private Tab
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.8.dp, PlasmaViolet.copy(alpha = 0.5f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable { openNewTab(incognito = true) }
-                                .testTag("browser_new_private_tab_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.VisibilityOff,
-                                    contentDescription = "New private tab",
-                                    tint = PlasmaViolet,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "+ PRIVATE",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Cycle Search Engine
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .clickable {
-                                    val nextEngine = browserPrefs.cycleSearchEngine()
-                                    localStatusBanner = "Search engine: ${nextEngine.label}"
-                                }
-                                .testTag("browser_search_engine_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Public,
-                                    contentDescription = "Cycle search engine",
-                                    tint = NeonCyan,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "SEARCH: ${searchEngine.label.uppercase()}",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-
-                        // Copy & Share URL Actions
-                        if (!activeTab.isHome) {
-                            Surface(
-                                color = NightTrayPill,
-                                shape = RoundedCornerShape(50),
-                                border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .clickable { copyActiveUrl() }
-                                    .testTag("browser_copy_url_button"),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.ContentCopy,
-                                        contentDescription = "Copy page link",
-                                        tint = ChromeSilver,
-                                        modifier = Modifier.size(14.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = "COPY",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = ChromeSilver,
-                                    )
-                                }
-                            }
-
-                            Surface(
-                                color = NightTrayPill,
-                                shape = RoundedCornerShape(50),
-                                border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .clickable { shareActiveUrl() }
-                                    .testTag("browser_share_button"),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.Share,
-                                        contentDescription = "Share page link",
-                                        tint = ChromeSilver,
-                                        modifier = Modifier.size(14.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = "SHARE",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = ChromeSilver,
-                                    )
-                                }
-                            }
-                        }
-
-                        // Pull Video Action
-                        if (!activeTab.isHome) {
-                            Surface(
-                                color = NeonCyan.copy(alpha = 0.16f),
-                                shape = RoundedCornerShape(50),
-                                border = BorderStroke(0.85.dp, NeonCyan.copy(alpha = 0.7f)),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .clickable {
-                                        val pullTarget = webViews[activeTab.id]?.url ?: activeTab.url
-                                        onManualSyncCookies(pullTarget)
-                                        onPullCurrentPage(pullTarget)
-                                    }
-                                    .testTag("browser_pull_video_button"),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.ArrowDownward,
-                                        contentDescription = "Pull video",
-                                        tint = NeonCyan,
-                                        modifier = Modifier.size(15.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = "PULL VIDEO",
-                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                        color = ChromeSilver,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // (Settings & features popup is rendered as a floating Samsung-style card overlay at Box level)
 
         // 6. Inline Tab Manager Strip (Zero Popup — Nocturnal)
         AnimatedVisibility(
@@ -2595,25 +2132,19 @@ fun DownloadedVideosBrowserPanel(
                 )
             }
 
-            // Pull Current Page Video (1-tap download action in center-right slot)
+            val canPullTopUrl = resolveTopBarDownloadUrl() != null
+
+            // Pull Current Page / Top Bar URL Video (1-tap highest-quality download)
             IconButton(
-                onClick = {
-                    if (!activeTab.isHome) {
-                        val pullTarget = webViews[activeTab.id]?.url ?: activeTab.url
-                        onManualSyncCookies(pullTarget)
-                        onPullCurrentPage(pullTarget)
-                    } else {
-                        showToolsBar = !showToolsBar
-                    }
-                },
+                onClick = { triggerPullFromTopUrl() },
                 modifier = Modifier
                     .minimumInteractiveComponentSize()
                     .testTag("browser_bottom_pull_button"),
             ) {
                 Icon(
                     imageVector = Icons.Rounded.ArrowDownward,
-                    contentDescription = "Download video from current page",
-                    tint = if (!activeTab.isHome) NeonCyan else ChromeSilver,
+                    contentDescription = "Download video from top URL in highest quality",
+                    tint = if (canPullTopUrl) NeonCyan else ChromeSilver,
                     modifier = Modifier.size(21.dp),
                 )
             }
@@ -2679,7 +2210,7 @@ fun DownloadedVideosBrowserPanel(
                 }
             }
 
-            // More / Zoom In & Out Controls
+            // Browser Settings & Features Menu Button (Samsung-style Popup Trigger)
             IconButton(
                 onClick = {
                     showToolsBar = !showToolsBar
@@ -2691,21 +2222,504 @@ fun DownloadedVideosBrowserPanel(
             ) {
                 Box(contentAlignment = Alignment.TopEnd) {
                     Icon(
-                        imageVector = Icons.Rounded.MoreVert,
-                        contentDescription = "Zoom & browser tools",
-                        tint = if (showToolsBar || zoomPercent != 100) NeonCyan else ChromeSilver,
-                        modifier = Modifier.size(22.dp),
+                        imageVector = Icons.Outlined.Settings,
+                        contentDescription = "Browser settings & features",
+                        tint = if (showToolsBar || zoomPercent != 100 || isDesktopMode || isVpnActive) NeonCyan else ChromeSilver,
+                        modifier = Modifier.size(21.dp),
                     )
-                    if (syncedDomains.isNotEmpty() || zoomPercent != 100) {
+                    if (syncedDomains.isNotEmpty() || zoomPercent != 100 || isVpnActive) {
                         Box(
                             modifier = Modifier
-                                .offset(x = 2.dp, y = 1.dp)
+                                .offset(x = 2.dp, y = (-1).dp)
                                 .size(5.5.dp)
                                 .clip(CircleShape)
-                                .background(AmberWarning),
+                                .background(if (isVpnActive) EmeraldPulse else AmberWarning),
                         )
                     }
                 }
+            }
+        }
+    }
+
+    // Dimmed backdrop + Samsung-Browser-Style Floating Vertical Features/Settings Card
+    AnimatedVisibility(
+        visible = showToolsBar,
+        enter = fadeIn(),
+        exit = fadeOut(),
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.48f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {
+                    showToolsBar = false
+                },
+        )
+    }
+
+    AnimatedVisibility(
+        visible = showToolsBar,
+        enter = fadeIn() + scaleIn(
+            initialScale = 0.9f,
+            transformOrigin = TransformOrigin(0.92f, 1f),
+        ),
+        exit = fadeOut() + scaleOut(
+            targetScale = 0.9f,
+            transformOrigin = TransformOrigin(0.92f, 1f),
+        ),
+        modifier = Modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = 10.dp, bottom = 58.dp),
+    ) {
+        Surface(
+            color = Color(0xFF1A2130),
+            shape = RoundedCornerShape(26.dp),
+            border = BorderStroke(0.85.dp, GlassStrokeBright.copy(alpha = 0.22f)),
+            shadowElevation = 18.dp,
+            modifier = Modifier
+                .width(262.dp)
+                .heightIn(max = 520.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {}
+                .testTag("browser_settings_popup_menu"),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp),
+            ) {
+                // --- Section 1: Navigation, Downloads & Bookmarks ---
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.History,
+                    label = "History",
+                    badgeText = historyEntries.size.takeIf { it > 0 }?.toString(),
+                    onClick = {
+                        confirmClearHistory = false
+                        activeSubTray = if (activeSubTray == BrowserSubTray.HISTORY) null else BrowserSubTray.HISTORY
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_history_tray_button"),
+                )
+
+                val canPullFromMenu = resolveTopBarDownloadUrl() != null
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.ArrowDownward,
+                    label = "Downloads",
+                    enabled = canPullFromMenu,
+                    iconTint = if (canPullFromMenu) NeonCyan else DimSlate,
+                    onClick = {
+                        triggerPullFromTopUrl()
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_pull_video_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.Bookmarks,
+                    label = "Saved pages",
+                    badgeText = bookmarks.size.takeIf { it > 0 }?.toString(),
+                    onClick = {
+                        activeSubTray = if (activeSubTray == BrowserSubTray.BOOKMARKS) null else BrowserSubTray.BOOKMARKS
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_bookmarks_tray_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = if (isCurrentBookmarked) Icons.Rounded.Bookmark else Icons.Rounded.Add,
+                    label = if (isCurrentBookmarked) "Saved in bookmarks" else "Add page to",
+                    enabled = !activeTab.isHome,
+                    isActive = isCurrentBookmarked,
+                    onClick = {
+                        val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
+                        val added = browserPrefs.toggleBookmark(targetUrl, activeTab.title)
+                        localStatusBanner = if (added) "Bookmark saved" else "Bookmark removed"
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_bookmark_toggle_button"),
+                )
+
+                if (enableEditableSpeedDials) {
+                    BrowserMenuFeatureRow(
+                        icon = Icons.Rounded.PushPin,
+                        label = if (isCurrentPinnedToHome) "Pinned to home" else "Pin to home",
+                        enabled = !activeTab.isHome,
+                        isActive = isCurrentPinnedToHome,
+                        activeAccent = EmeraldPulse,
+                        onClick = {
+                            val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
+                            val normalizedTarget = targetUrl.trim().trimEnd('/')
+                            val existingPinned = pinnedSites.firstOrNull {
+                                it.url.trim().trimEnd('/').equals(normalizedTarget, ignoreCase = true)
+                            }
+                            if (existingPinned != null) {
+                                browserPrefs.deletePinnedSite(existingPinned.id)
+                                localStatusBanner = "تمت إزالة الموقع من الواجهة الرئيسية"
+                            } else {
+                                val addedSite = browserPrefs.addPinnedSite(activeTab.title, targetUrl)
+                                if (addedSite != null) {
+                                    localStatusBanner = "تم تثبيت الموقع في الواجهة الرئيسية مع جلب الشعار"
+                                    if (addedSite.logoPath.isNullOrBlank()) {
+                                        coroutineScope.launch {
+                                            val fetched = SiteLogoFetcher.fetchAndCacheLogo(
+                                                context = context,
+                                                siteUrl = addedSite.url,
+                                                forceRefresh = true,
+                                            )
+                                            if (!fetched.isNullOrBlank()) {
+                                                browserPrefs.updatePinnedSiteLogo(addedSite.id, fetched)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            showToolsBar = false
+                        },
+                        modifier = Modifier.testTag("browser_pin_to_home_button"),
+                    )
+                }
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Outlined.Lock,
+                    label = "Cookie Sync",
+                    badgeText = if (syncedDomains.isNotEmpty()) "${syncedDomains.size}" else null,
+                    badgeColor = EmeraldPulse,
+                    isActive = syncedDomains.isNotEmpty(),
+                    activeAccent = EmeraldPulse,
+                    onClick = {
+                        onManualSyncCookies(
+                            if (activeTab.isHome) "https://www.instagram.com/" else activeTab.url,
+                        )
+                    },
+                    modifier = Modifier.testTag("browser_sync_cookies_button"),
+                )
+
+                // Dotted Separator (matching Samsung Browser popup menu)
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.dp, vertical = 6.dp)
+                        .height(1.5.dp),
+                ) {
+                    drawLine(
+                        color = GlassStrokeBright.copy(alpha = 0.28f),
+                        start = Offset(0f, size.height / 2f),
+                        end = Offset(size.width, size.height / 2f),
+                        strokeWidth = 1.2.dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 10f), 0f),
+                    )
+                }
+
+                // --- Section 2: Site View, Privacy & Page Tools ---
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.DesktopWindows,
+                    label = "Desktop site",
+                    isActive = isDesktopMode,
+                    badgeText = if (isDesktopMode) "ON" else null,
+                    onClick = {
+                        toggleDesktopMode()
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_desktop_mode_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.VisibilityOff,
+                    label = "Private tab",
+                    iconTint = PlasmaViolet,
+                    onClick = {
+                        openNewTab(incognito = true)
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_new_private_tab_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.Block,
+                    label = "Ad blockers",
+                    isActive = adBlockEnabled,
+                    badgeText = when {
+                        !adBlockEnabled -> "OFF"
+                        blockedAdsCount > 0 -> "$blockedAdsCount"
+                        else -> "ON"
+                    },
+                    badgeColor = if (adBlockEnabled) NeonCyan else MutedSlate,
+                    onClick = {
+                        val next = !adBlockEnabled
+                        browserPrefs.setAdBlockEnabled(next)
+                        localStatusBanner = if (next) "Ad blocker enabled" else "Ad blocker paused"
+                    },
+                    modifier = Modifier.testTag("browser_adblock_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.VpnLock,
+                    label = "1.1.1.1 VPN",
+                    isActive = isVpnActive,
+                    activeAccent = EmeraldPulse,
+                    badgeText = if (isVpnActive) "ON" else null,
+                    badgeColor = EmeraldPulse,
+                    onClick = { toggleCloudflareVpn() },
+                    modifier = Modifier.testTag("browser_vpn_1111_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.VerifiedUser,
+                    label = if (isPermanentCookieLock) "Privacy lock" else "Temp session",
+                    isActive = isPermanentCookieLock,
+                    activeAccent = EmeraldPulse,
+                    badgeText = if (storedCookieCount > 0) "$storedCookieCount" else if (isPermanentCookieLock) "AES" else null,
+                    badgeColor = EmeraldPulse,
+                    onClick = { onTogglePermanentCookieLock() },
+                    modifier = Modifier.testTag("browser_permanent_cookie_lock_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Outlined.Public,
+                    label = "Search engine",
+                    badgeText = searchEngine.label,
+                    onClick = {
+                        val nextEngine = browserPrefs.cycleSearchEngine()
+                        localStatusBanner = "Search engine: ${nextEngine.label}"
+                    },
+                    modifier = Modifier.testTag("browser_search_engine_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.Search,
+                    label = "Find on page",
+                    enabled = !activeTab.isHome,
+                    isActive = activeSubTray == BrowserSubTray.FIND,
+                    onClick = {
+                        activeSubTray = if (activeSubTray == BrowserSubTray.FIND) {
+                            webViews[activeTab.id]?.clearMatches()
+                            null
+                        } else {
+                            BrowserSubTray.FIND
+                        }
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_find_button"),
+                )
+
+                // Text Size / Page Zoom Stepper Row
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .padding(horizontal = 18.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.ZoomIn,
+                            contentDescription = "Text size",
+                            tint = if (activeTab.isHome) DimSlate else if (zoomPercent != 100) NeonCyan else ChromeSilver,
+                            modifier = Modifier.size(21.dp),
+                        )
+                        Spacer(modifier = Modifier.width(15.dp))
+                        Text(
+                            text = "Text size",
+                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                            color = if (activeTab.isHome) DimSlate else ChromeSilver,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(Color.White.copy(alpha = if (activeTab.isHome) 0.03f else 0.08f))
+                                .clickable(enabled = !activeTab.isHome) { zoomPageBy(-20) }
+                                .testTag("browser_zoom_out_button"),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.ZoomOut,
+                                contentDescription = "Zoom out page",
+                                tint = if (activeTab.isHome) DimSlate else ChromeSilver,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                        Text(
+                            text = "$zoomPercent%",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = when {
+                                activeTab.isHome -> DimSlate
+                                zoomPercent != 100 -> NeonCyan
+                                else -> ChromeSilver
+                            },
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(enabled = !activeTab.isHome) { resetZoom() }
+                                .padding(horizontal = 5.dp, vertical = 4.dp)
+                                .testTag("browser_zoom_reset_button"),
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(Color.White.copy(alpha = if (activeTab.isHome) 0.03f else 0.12f))
+                                .clickable(enabled = !activeTab.isHome) { zoomPageBy(+20) }
+                                .testTag("browser_zoom_in_button"),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.ZoomIn,
+                                contentDescription = "Zoom in page",
+                                tint = if (activeTab.isHome) DimSlate else NeonCyan,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                    }
+                }
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.Refresh,
+                    label = "Reload",
+                    enabled = !activeTab.isHome,
+                    onClick = {
+                        webViews[activeTab.id]?.reload()
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_reload_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.ContentCopy,
+                    label = "Copy link",
+                    enabled = !activeTab.isHome,
+                    onClick = {
+                        copyActiveUrl()
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_copy_url_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Rounded.Share,
+                    label = "Share",
+                    enabled = !activeTab.isHome,
+                    onClick = {
+                        shareActiveUrl()
+                        showToolsBar = false
+                    },
+                    modifier = Modifier.testTag("browser_share_button"),
+                )
+
+                if (storedCookieCount > 0) {
+                    BrowserMenuFeatureRow(
+                        icon = Icons.Outlined.DeleteOutline,
+                        label = if (confirmClearCookies) "Tap again to clear" else "Clear vault",
+                        iconTint = CrimsonAlert,
+                        textColor = CrimsonAlert,
+                        onClick = {
+                            if (confirmClearCookies) {
+                                confirmClearCookies = false
+                                onClearCookies()
+                                showToolsBar = false
+                            } else {
+                                confirmClearCookies = true
+                            }
+                        },
+                        modifier = Modifier.testTag("browser_clear_cookies_button"),
+                    )
+                }
+            }
+        }
+    }
+    }
+}
+
+@Composable
+private fun BrowserMenuFeatureRow(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    isActive: Boolean = false,
+    activeAccent: Color = NeonCyan,
+    iconTint: Color? = null,
+    textColor: Color? = null,
+    badgeText: String? = null,
+    badgeColor: Color = NeonCyan,
+) {
+    val resolvedIconTint = when {
+        !enabled -> DimSlate
+        iconTint != null -> iconTint
+        isActive -> activeAccent
+        else -> ChromeSilver
+    }
+    val resolvedTextColor = when {
+        !enabled -> DimSlate
+        textColor != null -> textColor
+        isActive -> activeAccent
+        else -> ChromeSilver
+    }
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clickable(enabled = enabled) { onClick() }
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.weight(1f),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = resolvedIconTint,
+                modifier = Modifier.size(21.dp),
+            )
+            Spacer(modifier = Modifier.width(15.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                color = resolvedTextColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        if (!badgeText.isNullOrBlank()) {
+            Spacer(modifier = Modifier.width(8.dp))
+            Surface(
+                color = badgeColor.copy(alpha = 0.14f),
+                shape = RoundedCornerShape(50),
+                border = BorderStroke(0.6.dp, badgeColor.copy(alpha = 0.45f)),
+            ) {
+                Text(
+                    text = badgeText,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                    ),
+                    color = badgeColor,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                )
             }
         }
     }
@@ -2724,22 +2738,27 @@ private fun SamsungStartPageHome(
     onOpenShortcut: (String) -> Unit,
     onToggleTools: () -> Unit,
     onManualSync: () -> Unit,
-    onAddPinnedSite: (label: String, url: String) -> Boolean,
-    onUpdatePinnedSite: (id: String, label: String, url: String) -> Boolean,
+    onAddPinnedSite: (label: String, url: String, logoPath: String?) -> Boolean,
+    onUpdatePinnedSite: (id: String, label: String, url: String, logoPath: String?) -> Boolean,
     onDeletePinnedSite: (id: String) -> Boolean,
 ) {
+    val context = LocalContext.current
     var isEditingPinnedSites by remember { mutableStateOf(false) }
     var editingSite by remember { mutableStateOf<BrowserPinnedSite?>(null) }
     var showSiteEditorDialog by remember { mutableStateOf(false) }
     var siteLabelInput by remember { mutableStateOf("") }
     var siteUrlInput by remember { mutableStateOf("") }
     var siteEditorError by remember { mutableStateOf<String?>(null) }
+    var previewLogoPath by remember { mutableStateOf<String?>(null) }
+    var isFetchingPreviewLogo by remember { mutableStateOf(false) }
 
     fun openAddSiteModal() {
         editingSite = null
         siteLabelInput = ""
         siteUrlInput = "https://"
         siteEditorError = null
+        previewLogoPath = null
+        isFetchingPreviewLogo = false
         showSiteEditorDialog = true
     }
 
@@ -2748,7 +2767,38 @@ private fun SamsungStartPageHome(
         siteLabelInput = site.label
         siteUrlInput = site.url
         siteEditorError = null
+        previewLogoPath = site.logoPath
+        isFetchingPreviewLogo = false
         showSiteEditorDialog = true
+    }
+
+    // Live automatic logo preview while typing/pasting site URL in the add/edit dialog
+    LaunchedEffect(showSiteEditorDialog, siteUrlInput) {
+        if (!showSiteEditorDialog) return@LaunchedEffect
+        val trimmed = siteUrlInput.trim()
+        val candidateUrl = when {
+            trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.contains(".") && !trimmed.contains(" ") -> "https://$trimmed"
+            else -> null
+        }
+        val hostPart = candidateUrl?.substringAfter("://")?.substringBefore("/")?.trim().orEmpty()
+        if (candidateUrl == null || !hostPart.contains(".") || hostPart.endsWith(".")) {
+            previewLogoPath = editingSite?.takeIf { it.url.equals(candidateUrl, ignoreCase = true) }?.logoPath
+            isFetchingPreviewLogo = false
+            return@LaunchedEffect
+        }
+        val immediateCache = SiteLogoFetcher.getCachedLogoFile(context, candidateUrl)?.absolutePath
+        if (immediateCache != null) {
+            previewLogoPath = immediateCache
+            isFetchingPreviewLogo = false
+            return@LaunchedEffect
+        }
+        isFetchingPreviewLogo = true
+        delay(420L)
+        val fetched = SiteLogoFetcher.fetchAndCacheLogoDeduplicated(context, candidateUrl)
+        previewLogoPath = fetched
+        isFetchingPreviewLogo = false
     }
 
     Box(
@@ -2862,11 +2912,13 @@ private fun SamsungStartPageHome(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = onToggleTools,
-                        modifier = Modifier.size(34.dp),
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("browser_start_settings_button"),
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Tune,
-                            contentDescription = "Browser settings, desktop & zoom",
+                            contentDescription = "Browser settings & features",
                             tint = ChromeSilver,
                             modifier = Modifier.size(18.dp),
                         )
@@ -3073,46 +3125,14 @@ private fun SamsungStartPageHome(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .clip(RoundedCornerShape(15.dp))
-                                    .background(
-                                        if (tileColors.size > 1) {
-                                            Brush.linearGradient(tileColors)
-                                        } else {
-                                            SolidColor(tileColors.first())
-                                        },
-                                    )
-                                    .border(
-                                        width = if (isEditingPinnedSites && enableEditableSpeedDials) 1.2.dp else 0.75.dp,
-                                        color = if (isEditingPinnedSites && enableEditableSpeedDials) {
-                                            NeonCyan.copy(alpha = 0.65f)
-                                        } else {
-                                            GlassStrokeBright.copy(alpha = 0.24f)
-                                        },
-                                        shape = RoundedCornerShape(15.dp),
-                                    ),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                if (item.isPlayIcon) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.PlayArrow,
-                                        contentDescription = item.label,
-                                        tint = Color.White,
-                                        modifier = Modifier.size(26.dp),
-                                    )
-                                } else {
-                                    Text(
-                                        text = item.glyph,
-                                        style = MaterialTheme.typography.titleMedium.copy(
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = if (item.glyph.length > 2) 14.sp else 19.sp,
-                                        ),
-                                        color = Color.White,
-                                    )
-                                }
-                            }
+                            SpeedDialSiteIconBox(
+                                label = item.label,
+                                glyph = item.glyph,
+                                isPlayIcon = item.isPlayIcon,
+                                logoPath = item.logoPath,
+                                tileColors = tileColors,
+                                isEditing = isEditingPinnedSites && enableEditableSpeedDials,
+                            )
                             Spacer(modifier = Modifier.height(5.dp))
                             Text(
                                 text = item.label,
@@ -3236,11 +3256,51 @@ private fun SamsungStartPageHome(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
-                            Text(
-                                text = if (editingSite == null) "إضافة موقع جديد" else "تعديل الموقع المثبت",
-                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                color = ChromeSilver,
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    val previewTitle = siteLabelInput.trim().ifBlank {
+                                        siteUrlInput.substringAfter("://")
+                                            .substringBefore("/")
+                                            .removePrefix("www.")
+                                            .substringBefore(".")
+                                            .ifBlank { "Web" }
+                                    }
+                                    SpeedDialSiteIconBox(
+                                        label = previewTitle,
+                                        glyph = previewTitle.take(2).replaceFirstChar { it.uppercaseChar() },
+                                        isPlayIcon = false,
+                                        logoPath = previewLogoPath,
+                                        tileColors = listOf(Color(0xFF152238), Color(0xFF0E1727)),
+                                        isEditing = false,
+                                    )
+                                    if (isFetchingPreviewLogo) {
+                                        CircularProgressIndicator(
+                                            color = NeonCyan,
+                                            strokeWidth = 2.dp,
+                                            modifier = Modifier.size(22.dp),
+                                        )
+                                    }
+                                }
+                                Column {
+                                    Text(
+                                        text = if (editingSite == null) "إضافة موقع جديد" else "تعديل الموقع المثبت",
+                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = ChromeSilver,
+                                    )
+                                    Text(
+                                        text = when {
+                                            isFetchingPreviewLogo -> "جاري جلب شعار الموقع تلقائياً..."
+                                            !previewLogoPath.isNullOrBlank() -> "تم جلب الشعار تلقائياً"
+                                            else -> "سيتم جلب الشعار تلقائياً عند إدخال الرابط"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (!previewLogoPath.isNullOrBlank()) EmeraldPulse else MutedSlate,
+                                    )
+                                }
+                            }
                             IconButton(
                                 onClick = { showSiteEditorDialog = false },
                                 modifier = Modifier.size(32.dp),
@@ -3343,9 +3403,9 @@ private fun SamsungStartPageHome(
                             Button(
                                 onClick = {
                                     val saved = if (currentEdit == null) {
-                                        onAddPinnedSite(siteLabelInput, siteUrlInput)
+                                        onAddPinnedSite(siteLabelInput, siteUrlInput, previewLogoPath)
                                     } else {
-                                        onUpdatePinnedSite(currentEdit.id, siteLabelInput, siteUrlInput)
+                                        onUpdatePinnedSite(currentEdit.id, siteLabelInput, siteUrlInput, previewLogoPath)
                                     }
                                     if (saved) {
                                         showSiteEditorDialog = false
@@ -3369,6 +3429,156 @@ private fun SamsungStartPageHome(
             }
         }
     }
+}
+
+private data class DecodedSiteLogo(
+    val bitmap: Bitmap,
+    val hasTransparentEdges: Boolean,
+    val needsLightCardBacking: Boolean,
+)
+
+@Composable
+private fun SpeedDialSiteIconBox(
+    label: String,
+    glyph: String,
+    isPlayIcon: Boolean,
+    logoPath: String?,
+    tileColors: List<Color>,
+    isEditing: Boolean,
+) {
+    var decodedLogo by remember(logoPath) { mutableStateOf<DecodedSiteLogo?>(null) }
+
+    LaunchedEffect(logoPath) {
+        if (logoPath.isNullOrBlank()) {
+            decodedLogo = null
+            return@LaunchedEffect
+        }
+        decodedLogo = withContext(Dispatchers.IO) {
+            runCatching {
+                val file = File(logoPath)
+                if (!file.exists() || file.length() <= 100L) return@runCatching null
+                val bmp = BitmapFactory.decodeFile(file.absolutePath) ?: return@runCatching null
+                analyzeDecodedSiteLogo(bmp)
+            }.getOrNull()
+        }
+    }
+
+    val logo = decodedLogo
+    val tileShape = RoundedCornerShape(15.dp)
+    val borderColor = if (isEditing) NeonCyan.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.24f)
+    val borderWidth = if (isEditing) 1.2.dp else 0.75.dp
+
+    if (logo != null) {
+        val backdropColor = when {
+            !logo.hasTransparentEdges -> Color.Transparent
+            logo.needsLightCardBacking -> Color(0xFFF3F6FA)
+            else -> Color(0xFF131D2E)
+        }
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(tileShape)
+                .background(backdropColor)
+                .border(width = borderWidth, color = borderColor, shape = tileShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                bitmap = logo.bitmap.asImageBitmap(),
+                contentDescription = label,
+                contentScale = if (logo.hasTransparentEdges) ContentScale.Fit else ContentScale.Crop,
+                modifier = if (logo.hasTransparentEdges) {
+                    Modifier
+                        .fillMaxSize()
+                        .padding(6.dp)
+                } else {
+                    Modifier.fillMaxSize()
+                },
+            )
+        }
+    } else {
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(tileShape)
+                .background(
+                    if (tileColors.size > 1) {
+                        Brush.linearGradient(tileColors)
+                    } else {
+                        SolidColor(tileColors.first())
+                    },
+                )
+                .border(width = borderWidth, color = borderColor, shape = tileShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (isPlayIcon) {
+                Icon(
+                    imageVector = Icons.Rounded.PlayArrow,
+                    contentDescription = label,
+                    tint = Color.White,
+                    modifier = Modifier.size(26.dp),
+                )
+            } else {
+                Text(
+                    text = glyph,
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = if (glyph.length > 2) 14.sp else 19.sp,
+                    ),
+                    color = Color.White,
+                )
+            }
+        }
+    }
+}
+
+private fun analyzeDecodedSiteLogo(bitmap: Bitmap): DecodedSiteLogo {
+    val w = bitmap.width
+    val h = bitmap.height
+    if (w <= 0 || h <= 0) {
+        return DecodedSiteLogo(bitmap = bitmap, hasTransparentEdges = true, needsLightCardBacking = true)
+    }
+    var transparentSamples = 0
+    val corners = listOf(
+        0 to 0,
+        (w - 1) to 0,
+        0 to (h - 1),
+        (w - 1) to (h - 1),
+    )
+    for ((cx, cy) in corners) {
+        val alpha = android.graphics.Color.alpha(bitmap.getPixel(cx, cy))
+        if (alpha < 210) transparentSamples++
+    }
+    val hasTransparentEdges = transparentSamples >= 2
+    if (!hasTransparentEdges) {
+        return DecodedSiteLogo(bitmap = bitmap, hasTransparentEdges = false, needsLightCardBacking = false)
+    }
+
+    var lumSum = 0.0
+    var opaqueCount = 0
+    val stepX = (w / 10).coerceAtLeast(1)
+    val stepY = (h / 10).coerceAtLeast(1)
+    var y = 0
+    while (y < h) {
+        var x = 0
+        while (x < w) {
+            val px = bitmap.getPixel(x, y)
+            if (android.graphics.Color.alpha(px) > 120) {
+                val r = android.graphics.Color.red(px) / 255.0
+                val g = android.graphics.Color.green(px) / 255.0
+                val b = android.graphics.Color.blue(px) / 255.0
+                lumSum += (0.299 * r + 0.587 * g + 0.114 * b)
+                opaqueCount++
+            }
+            x += stepX
+        }
+        y += stepY
+    }
+    val avgLum = if (opaqueCount > 0) lumSum / opaqueCount else 0.5
+    return DecodedSiteLogo(
+        bitmap = bitmap,
+        hasTransparentEdges = true,
+        needsLightCardBacking = avgLum < 0.72,
+    )
 }
 
 private val AD_TRACKER_HOSTS = setOf(
