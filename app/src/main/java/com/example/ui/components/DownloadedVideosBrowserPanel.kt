@@ -1598,6 +1598,14 @@ fun DownloadedVideosBrowserPanel(
                                     ) {
                                         super.doUpdateVisitedHistory(view, url, isReload)
                                         if (!url.isNullOrBlank() && url.startsWith("http", ignoreCase = true)) {
+                                            val previousUrl = tabs.firstOrNull { it.id == tabId }?.url.orEmpty()
+                                            val prevIdentity = canonicalRouteIdentity(previousUrl)
+                                            val nextIdentity = canonicalRouteIdentity(url)
+                                            if (prevIdentity.isNotBlank() && prevIdentity != nextIdentity) {
+                                                sniffedVideoUrlsByTab.remove(tabId)
+                                                sniffedAudioUrlsByTab.remove(tabId)
+                                                webViewMonitor.resetForNavigation(tabId)
+                                            }
                                             updateTabById(tabId) {
                                                 it.copy(
                                                     url = url,
@@ -3642,4 +3650,22 @@ private fun deriveHostLabel(url: String): String {
         .removePrefix("www.")
         .removePrefix("m.")
         .ifBlank { "Web" }
+}
+
+private fun canonicalRouteIdentity(url: String): String {
+    val clean = url.trim().substringBefore("#")
+    if (!clean.startsWith("http://", ignoreCase = true) &&
+        !clean.startsWith("https://", ignoreCase = true)
+    ) {
+        return ""
+    }
+    val uri = runCatching { Uri.parse(clean) }.getOrNull() ?: return clean.substringBefore("?")
+    val host = uri.host?.lowercase().orEmpty().removePrefix("www.")
+    val path = uri.encodedPath.orEmpty().trimEnd('/')
+    val keyParams = listOf("v", "id", "vid", "video_id", "story_fbid", "p", "q", "list")
+        .mapNotNull { key ->
+            uri.getQueryParameter(key)?.takeIf { it.isNotBlank() }?.let { "$key=$it" }
+        }
+        .joinToString("&")
+    return if (keyParams.isNotBlank()) "$host$path?$keyParams" else "$host$path"
 }

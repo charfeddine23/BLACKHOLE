@@ -151,7 +151,7 @@ class VaultBrowserDownloadEngine(
                         title = resolvedPageTitle?.takeIf { it.isNotBlank() } ?: "",
                         activePageUrl = cleanPageUrl,
                         pickerCandidates = resolution.candidates,
-                        message = "تم رصد عدة مقاطع فيديو — اختر الفيديو المطلوب تحميله:",
+                        message = "تم العثور على ${resolution.candidates.size} روابط فيديو — اختر الرابط الذي تريد تحميله:",
                     ),
                 )
                 return@withContext false

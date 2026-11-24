@@ -25,12 +25,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.Check
@@ -78,6 +81,7 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
+import com.example.util.formatByteSize
 import com.example.util.formatTransferSpeed
 import com.example.vault.browser.ResolvedMediaCandidate
 import com.example.vault.browser.VideoElementTelemetry
@@ -345,14 +349,31 @@ fun FloatingBlackholeDownloadOverlay(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .heightIn(max = 320.dp)
+                                .verticalScroll(rememberScrollState())
                                 .padding(top = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(7.dp),
                         ) {
                             downloadState.pickerCandidates.forEachIndexed { idx, cand ->
+                                val cleanUrlPreview = cand.stream.streamUrl
+                                    .substringAfter("://")
+                                    .take(56)
+                                val sizePart = if (cand.stream.estimatedBytes > 0L) {
+                                    " · ${formatByteSize(cand.stream.estimatedBytes)}"
+                                } else {
+                                    ""
+                                }
                                 Surface(
-                                    color = Color(0xFF121C2E),
+                                    color = if (cand.isActiveVideoMatch) Color(0xFF10242B) else Color(0xFF121C2E),
                                     shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(0.75.dp, NeonCyan.copy(alpha = 0.35f)),
+                                    border = BorderStroke(
+                                        width = if (cand.isActiveVideoMatch) 1.dp else 0.75.dp,
+                                        color = if (cand.isActiveVideoMatch) {
+                                            EmeraldPulse.copy(alpha = 0.65f)
+                                        } else {
+                                            NeonCyan.copy(alpha = 0.35f)
+                                        },
+                                    ),
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(12.dp))
@@ -362,22 +383,74 @@ fun FloatingBlackholeDownloadOverlay(
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                                            .padding(horizontal = 10.dp, vertical = 9.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                     ) {
-                                        Column(modifier = Modifier.weight(1f)) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(24.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    if (cand.isActiveVideoMatch) {
+                                                        EmeraldPulse.copy(alpha = 0.2f)
+                                                    } else {
+                                                        NeonCyan.copy(alpha = 0.16f)
+                                                    },
+                                                ),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
                                             Text(
-                                                text = cand.stream.title.ifBlank { "فيديو #${idx + 1}" },
-                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                                color = ChromeSilver,
+                                                text = "${idx + 1}",
+                                                style = MaterialTheme.typography.labelSmall.copy(
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                ),
+                                                color = if (cand.isActiveVideoMatch) EmeraldPulse else NeonCyan,
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                Text(
+                                                    text = cand.stream.title.ifBlank { "رابط فيديو #${idx + 1}" },
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                                    color = ChromeSilver,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f, fill = false),
+                                                )
+                                                if (cand.isActiveVideoMatch) {
+                                                    Surface(
+                                                        color = EmeraldPulse.copy(alpha = 0.18f),
+                                                        shape = RoundedCornerShape(50),
+                                                    ) {
+                                                        Text(
+                                                            text = "نشط",
+                                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                                fontSize = 9.sp,
+                                                                fontWeight = FontWeight.Bold,
+                                                            ),
+                                                            color = EmeraldPulse,
+                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            Text(
+                                                text = "${cand.stream.qualityLabel} · ${if (cand.stream.isHls) "HLS" else "MP4"}$sizePart · ${cand.matchReason}",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                                color = NeonCyan,
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis,
                                             )
                                             Text(
-                                                text = "${cand.stream.qualityLabel} · ${if (cand.stream.isHls) "HLS" else "MP4"} · ${cand.matchReason}",
-                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                                color = NeonCyan,
+                                                text = cleanUrlPreview,
+                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.5.sp),
+                                                color = MutedSlate,
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis,
                                             )
@@ -385,9 +458,9 @@ fun FloatingBlackholeDownloadOverlay(
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Icon(
                                             imageVector = Icons.Rounded.ArrowDownward,
-                                            contentDescription = "تحميل هذا الفيديو",
+                                            contentDescription = "تحميل هذا الرابط",
                                             tint = EmeraldPulse,
-                                            modifier = Modifier.size(18.dp),
+                                            modifier = Modifier.size(19.dp),
                                         )
                                     }
                                 }

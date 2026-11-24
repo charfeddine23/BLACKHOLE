@@ -130,12 +130,20 @@ class MediaCandidateResolver(
         }
 
         // 3. Probe live DOM & intercepted network streams (including HLS & MPD BaseURL fallback)
+        val verifiedLiveVideoUrls = buildSet {
+            activeVideo?.bestDirectHttpUrl?.let { add(it) }
+            activeVideo?.sourceUrls.orEmpty().forEach { add(it) }
+            nonAdIntercepted
+                .filter { it.mediaKind == InterceptedMediaKind.VIDEO_DIRECT || it.mediaKind == InterceptedMediaKind.HLS_M3U8 }
+                .forEach { add(it.url) }
+        }
         val probedLiveStreams = probeCapturedUrls(
             pageUrl = routedOutcome?.canonicalUrl ?: cleanPageUrl,
             pageTitle = resolvedTitle,
             platform = routedOutcome?.platform ?: platform,
             candidateUrls = prioritizedVideoUrls,
             audioUrls = nonAdAudioUrls,
+            verifiedLiveUrls = verifiedLiveVideoUrls,
             baseHeaders = sessionHeaders,
         )
 
@@ -260,25 +268,19 @@ class MediaCandidateResolver(
                 .thenByDescending { it.stream.estimatedBytes },
         )
 
-        val top = scored.first()
         val distinctGroups = scored.distinctBy { it.distinctGroupKey }
 
-        // 5. Decide between deterministic auto-download vs CandidatePicker for genuine multi-video ambiguity
-        val hasPlaybackLock = top.isActiveVideoMatch ||
-            (activeVideo != null && !activeVideo.paused && activeVideo.isAdvancing && distinctGroups.size == 1)
-
-        if (!hasPlaybackLock && distinctGroups.size >= 2) {
-            val runnerUp = distinctGroups[1]
-            val scoreGap = top.matchScore - runnerUp.matchScore
-            val looksAmbiguous = scoreGap < 1_800 && top.matchScore < 9_000
-            if (looksAmbiguous) {
-                return CandidateResolutionOutcome.NeedsPicker(
-                    candidates = distinctGroups.take(5),
-                )
-            }
+        // 5. Strict 1-vs-Many rule:
+        //    - Single unique video link -> start downloading immediately in highest quality
+        //    - Multiple unique video links -> present all links cleanly so the user chooses which to download
+        if (distinctGroups.size >= 2) {
+            return CandidateResolutionOutcome.NeedsPicker(
+                candidates = distinctGroups.take(12),
+            )
         }
 
-        val fallbacks = scored.drop(1).take(5)
+        val top = distinctGroups.first()
+        val fallbacks = scored.filterNot { it.stream.streamUrl == top.stream.streamUrl }.take(5)
         return CandidateResolutionOutcome.Resolved(
             primary = top,
             fallbacks = fallbacks,
@@ -325,6 +327,7 @@ class MediaCandidateResolver(
         platform: PlatformBadge,
         candidateUrls: List<String>,
         audioUrls: List<String>,
+        verifiedLiveUrls: Set<String>,
         baseHeaders: Map<String, String>,
     ): List<ExtractedStream> {
         if (candidateUrls.isEmpty()) return emptyList()
@@ -369,7 +372,11 @@ class MediaCandidateResolver(
                         audioStreamUrl = if (needsAudio) fallbackAudio else probed.audioStreamUrl,
                     ),
                 )
-            } else if (extractor.looksLikeHlsUrl(rawUrl) || extractor.looksLikeDownloadableVideoUrl(rawUrl)) {
+            } else if (
+                extractor.looksLikeHlsUrl(rawUrl) ||
+                extractor.looksLikeDownloadableVideoUrl(rawUrl) ||
+                rawUrl in verifiedLiveUrls
+            ) {
                 val isHls = extractor.looksLikeHlsUrl(rawUrl)
                 val height = extractor.inferResolutionHeight(rawUrl)
                 val needsAudio = !isHls && fallbackAudio != null && (
@@ -454,12 +461,43 @@ class MediaCandidateResolver(
     }
 
     private fun deriveDistinctStreamGroupKey(url: String): String {
-        val clean = url.substringBefore("?").substringBefore("#").lowercase()
-        // Group HLS resolution playlists / quality suffixes under one logical video when under the same path
-        val parent = clean.substringBeforeLast("/", clean)
-        val filePart = clean.substringAfterLast("/")
-            .replace(Regex("""(1080p|720p|480p|360p|240p|hd|sd|low|high|master|playlist)"""), "")
-        return "$parent/$filePart"
+        val parsed = runCatching { Uri.parse(url) }.getOrNull()
+        val host = normalizeCdnHost(parsed?.host?.lowercase().orEmpty())
+        val rawPath = parsed?.encodedPath?.lowercase()
+            ?: url.substringBefore("?").substringBefore("#").lowercase()
+        val cleanPath = rawPath.replace(
+            Regex("""/(4k|2160p|1440p|1080p|720p|480p|360p|240p|144p|hd|sd|high|medium|low)/"""),
+            "/",
+        )
+        val parent = cleanPath.substringBeforeLast("/", cleanPath)
+        val filePart = cleanPath.substringAfterLast("/")
+            .replace(
+                Regex("""([_-]?(4k|2160p|1440p|1080p|720p|480p|360p|240p|144p|fhd|hd|sd|low|high|orig|master|playlist))"""),
+                "",
+            )
+        val identityQuery = parsed?.queryParameterNames
+            ?.filter { it.lowercase() in IDENTITY_QUERY_PARAMS }
+            ?.sorted()
+            ?.mapNotNull { key ->
+                val value = parsed.getQueryParameter(key)?.trim()?.takeIf { it.isNotBlank() }
+                value?.let { "$key=$it" }
+            }
+            ?.joinToString("&")
+            .orEmpty()
+        return if (identityQuery.isNotBlank()) {
+            "$host$parent/$filePart?$identityQuery"
+        } else {
+            "$host$parent/$filePart"
+        }
+    }
+
+    private fun normalizeCdnHost(host: String): String {
+        return when {
+            host.endsWith(".googlevideo.com") -> "googlevideo.com"
+            host.endsWith(".cdninstagram.com") -> "cdninstagram.com"
+            host.endsWith(".fbcdn.net") -> "fbcdn.net"
+            else -> host.replace(Regex("""^(cdn|edge|media|s|v)\d+\."""), "$1.")
+        }
     }
 
     companion object {
@@ -478,6 +516,21 @@ class MediaCandidateResolver(
             "media",
             "cdn",
             "watch",
+        )
+
+        private val IDENTITY_QUERY_PARAMS = setOf(
+            "id",
+            "v",
+            "vid",
+            "video_id",
+            "docid",
+            "media_id",
+            "clip",
+            "file",
+            "key",
+            "hash",
+            "source",
+            "item_id",
         )
     }
 }

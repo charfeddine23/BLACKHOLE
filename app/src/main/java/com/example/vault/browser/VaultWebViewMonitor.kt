@@ -460,14 +460,10 @@ class VaultWebViewMonitor {
                 }
 
                 function isLikelyAdElement(video, st) {
-                  var dur = Number(video.duration || 0);
                   var cls = ((video.className || '') + ' ' + (video.id || '')).toLowerCase();
                   var srcStr = ((video.currentSrc || '') + ' ' + (video.getAttribute('src') || '')).toLowerCase();
                   if (/(\bad[-_]?|preroll|vast|sponsored|doubleclick|googlesyndication)/.test(cls) ||
                       /(doubleclick|googlesyndication|preroll|vast|adsystem)/.test(srcStr)) {
-                    return true;
-                  }
-                  if (video.muted && dur > 0 && dur <= 18 && Number(video.videoWidth || 0) <= 640) {
                     return true;
                   }
                   return false;
