@@ -106,6 +106,12 @@ class BrowserPreferencesStore private constructor(context: Context) {
         prefs.edit().putString(KEY_HISTORY_JSON, json.encodeToString(updated)).apply()
     }
 
+    fun removeHistoryEntry(url: String) {
+        val updated = _history.value.filterNot { it.url.equals(url, ignoreCase = true) }
+        _history.value = updated
+        prefs.edit().putString(KEY_HISTORY_JSON, json.encodeToString(updated)).apply()
+    }
+
     fun clearHistory() {
         _history.value = emptyList()
         prefs.edit().remove(KEY_HISTORY_JSON).apply()
@@ -116,11 +122,15 @@ class BrowserPreferencesStore private constructor(context: Context) {
         prefs.edit().putBoolean(KEY_AD_BLOCK_ENABLED, enabled).apply()
     }
 
+    fun setSearchEngine(engine: BrowserSearchEngine) {
+        _searchEngine.value = engine
+        prefs.edit().putString(KEY_SEARCH_ENGINE, engine.name).apply()
+    }
+
     fun cycleSearchEngine(): BrowserSearchEngine {
         val entries = BrowserSearchEngine.entries
         val next = entries[(entries.indexOf(_searchEngine.value) + 1) % entries.size]
-        _searchEngine.value = next
-        prefs.edit().putString(KEY_SEARCH_ENGINE, next.name).apply()
+        setSearchEngine(next)
         return next
     }
 

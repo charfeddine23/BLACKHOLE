@@ -155,6 +155,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas as AndroidCanvas
 import androidx.compose.foundation.Image
 import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material3.CircularProgressIndicator
@@ -197,8 +198,6 @@ import java.util.concurrent.atomic.AtomicInteger
 private const val HOME_TAB_URL = "about:blackhole-home"
 
 private enum class BrowserSubTray {
-    BOOKMARKS,
-    HISTORY,
     FIND,
 }
 
@@ -414,6 +413,8 @@ fun DownloadedVideosBrowserPanel(
     val activeTab = tabs.getOrElse(activeTabIndex) { tabs.first() }
 
     val webViews = remember { mutableStateMapOf<String, WebView>() }
+    val tabThumbnails = remember { mutableStateMapOf<String, Bitmap>() }
+    val tabFavicons = remember { mutableStateMapOf<String, Bitmap>() }
     val sniffedVideoUrlsByTab = remember { mutableStateMapOf<String, List<String>>() }
     val sniffedAudioUrlsByTab = remember { mutableStateMapOf<String, List<String>>() }
     var addressText by remember { mutableStateOf("") }
@@ -422,10 +423,29 @@ fun DownloadedVideosBrowserPanel(
     var showToolsBar by remember { mutableStateOf(false) }
     var showTabsBarTray by remember { mutableStateOf(false) }
     var activeSubTray by remember { mutableStateOf<BrowserSubTray?>(null) }
+    val featureWindowStack = remember { mutableStateListOf<BrowserFeatureWindow>() }
+    val activeFeatureWindow = featureWindowStack.lastOrNull()
+    val activeDetectedVideo by webViewMonitor.activeVideoTelemetry.collectAsStateWithLifecycle()
     var isDesktopMode by remember { mutableStateOf(false) }
-    var confirmClearCookies by remember { mutableStateOf(false) }
-    var confirmClearHistory by remember { mutableStateOf(false) }
     var localStatusBanner by remember { mutableStateOf<String?>(null) }
+
+    fun openFeatureWindow(window: BrowserFeatureWindow) {
+        showToolsBar = false
+        showTabsBarTray = false
+        if (featureWindowStack.lastOrNull() != window) {
+            featureWindowStack.add(window)
+        }
+    }
+
+    fun popFeatureWindow() {
+        if (featureWindowStack.isNotEmpty()) {
+            featureWindowStack.removeAt(featureWindowStack.lastIndex)
+        }
+    }
+
+    fun closeAllFeatureWindows() {
+        featureWindowStack.clear()
+    }
 
     val blockedAdsCounter = remember { AtomicInteger(0) }
     var blockedAdsCount by remember { mutableIntStateOf(0) }
@@ -544,6 +564,26 @@ fun DownloadedVideosBrowserPanel(
                 }
             }
             webViews.clear()
+            tabThumbnails.clear()
+            tabFavicons.clear()
+        }
+    }
+
+    fun captureTabThumbnail(tabId: String, wv: WebView?) {
+        if (wv == null) return
+        val w = wv.width
+        val h = wv.height
+        if (w <= 0 || h <= 0) return
+        runCatching {
+            val targetWidth = 420
+            val scale = (targetWidth.toFloat() / w.toFloat()).coerceAtMost(1f)
+            val targetHeight = (h * scale).toInt().coerceIn(120, 960)
+            val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.RGB_565)
+            val canvas = AndroidCanvas(bmp)
+            canvas.scale(scale, scale)
+            canvas.translate(-wv.scrollX.toFloat(), -wv.scrollY.toFloat())
+            wv.draw(canvas)
+            tabThumbnails[tabId] = bmp
         }
     }
 
@@ -555,12 +595,16 @@ fun DownloadedVideosBrowserPanel(
 
     BackHandler(
         enabled = customFullscreenView != null ||
+            activeFeatureWindow != null ||
+            showTabsBarTray ||
             showToolsBar ||
             activeSubTray != null ||
             (!activeTab.isHome && activeTab.canGoBack),
     ) {
         when {
             customFullscreenView != null -> exitFullscreenVideo()
+            activeFeatureWindow != null -> popFeatureWindow()
+            showTabsBarTray -> showTabsBarTray = false
             showToolsBar -> showToolsBar = false
             activeSubTray != null -> {
                 if (activeSubTray == BrowserSubTray.FIND) {
@@ -668,6 +712,10 @@ fun DownloadedVideosBrowserPanel(
     }
 
     fun openNewTab(initialUrl: String = HOME_TAB_URL, incognito: Boolean = false) {
+        val currentActive = tabs.getOrNull(activeTabIndex)
+        if (currentActive != null && !currentActive.isHome) {
+            captureTabThumbnail(currentActive.id, webViews[currentActive.id])
+        }
         val tab = BrowserTabState(
             title = if (initialUrl == HOME_TAB_URL) {
                 if (incognito) "Private" else "New tab"
@@ -715,8 +763,9 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
-    fun triggerPullFromTopUrl() {
-        val targetUrl = resolveTopBarDownloadUrl()
+    fun triggerPullFromTopUrl(explicitUrl: String? = null) {
+        val targetUrl = explicitUrl?.let { extractDirectUrlFromAddressBar(it) ?: it.trim().takeIf { s -> s.startsWith("http", ignoreCase = true) } }
+            ?: resolveTopBarDownloadUrl()
         if (targetUrl.isNullOrBlank()) {
             if (onPullCurrentPageWithMedia != null) {
                 onPullCurrentPageWithMedia("", null, emptyList(), emptyList(), null, emptyList())
@@ -727,7 +776,9 @@ fun DownloadedVideosBrowserPanel(
         }
         focusManager.clearFocus()
         isUrlFocused = false
-        addressText = targetUrl
+        if (explicitUrl == null) {
+            addressText = targetUrl
+        }
         onAutoSyncCookies(targetUrl)
 
         val tabId = activeTab.id
@@ -768,6 +819,8 @@ fun DownloadedVideosBrowserPanel(
         val removed = tabs[index]
         sniffedVideoUrlsByTab.remove(removed.id)
         sniffedAudioUrlsByTab.remove(removed.id)
+        tabThumbnails.remove(removed.id)
+        tabFavicons.remove(removed.id)
         webViewMonitor.clearTab(removed.id)
         webViews.remove(removed.id)?.let { wv ->
             runCatching {
@@ -792,6 +845,46 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
+    fun closeAllTabs(incognitoOnly: Boolean) {
+        val toRemove = if (incognitoOnly) {
+            tabs.filter { it.isIncognito }
+        } else {
+            tabs.toList()
+        }
+        toRemove.forEach { removed ->
+            sniffedVideoUrlsByTab.remove(removed.id)
+            sniffedAudioUrlsByTab.remove(removed.id)
+            tabThumbnails.remove(removed.id)
+            tabFavicons.remove(removed.id)
+            webViewMonitor.clearTab(removed.id)
+            webViews.remove(removed.id)?.let { wv ->
+                runCatching {
+                    webViewMonitor.detachFrom(wv)
+                    wv.stopLoading()
+                    wv.destroy()
+                }
+            }
+        }
+        if (incognitoOnly) {
+            tabs.removeAll { it.isIncognito }
+            if (tabs.isEmpty()) {
+                tabs.add(BrowserTabState())
+                activeTabIndex = 0
+                addressText = ""
+            } else if (activeTabIndex >= tabs.size) {
+                activeTabIndex = tabs.lastIndex
+            }
+        } else {
+            tabs.clear()
+            tabs.add(BrowserTabState())
+            activeTabIndex = 0
+            addressText = ""
+            zoomPercent = 100
+            cssFallbackZoom = 100
+            showTabsBarTray = false
+        }
+    }
+
     fun zoomPageBy(stepPercent: Int) {
         val wv = webViews[activeTab.id] ?: return
         wv.evaluateJavascript(UNLOCK_VIEWPORT_JS, null)
@@ -806,6 +899,18 @@ fun DownloadedVideosBrowserPanel(
                 null,
             )
         }
+    }
+
+    fun applyZoomPercent(targetPercent: Int) {
+        val clamped = targetPercent.coerceIn(50, 250)
+        zoomPercent = clamped
+        cssFallbackZoom = clamped
+        val wv = webViews[activeTab.id] ?: return
+        wv.evaluateJavascript(UNLOCK_VIEWPORT_JS, null)
+        wv.evaluateJavascript(
+            "document.documentElement.style.zoom = '${clamped}%';",
+            null,
+        )
     }
 
     fun resetZoom() {
@@ -907,7 +1012,12 @@ fun DownloadedVideosBrowserPanel(
                             modifier = Modifier
                                 .height(26.dp)
                                 .clip(RoundedCornerShape(50))
-                                .clickable { activeTabIndex = index }
+                                .clickable {
+                                    if (!activeTab.isHome) {
+                                        captureTabThumbnail(activeTab.id, webViews[activeTab.id])
+                                    }
+                                    activeTabIndex = index
+                                }
                                 .testTag("browser_tab_${index}"),
                         ) {
                             Row(
@@ -1558,6 +1668,9 @@ fun DownloadedVideosBrowserPanel(
                                             null,
                                         )
                                         webViewMonitor.injectMonitor(view)
+                                        view?.postDelayed({
+                                            captureTabThumbnail(tabId, view)
+                                        }, 250L)
                                     }
                                 }
 
@@ -1575,6 +1688,12 @@ fun DownloadedVideosBrowserPanel(
                                     override fun onReceivedTitle(view: WebView?, title: String?) {
                                         if (!title.isNullOrBlank()) {
                                             updateTabById(tabId) { it.copy(title = title) }
+                                        }
+                                    }
+
+                                    override fun onReceivedIcon(view: WebView?, icon: Bitmap?) {
+                                        if (icon != null) {
+                                            tabFavicons[tabId] = icon
                                         }
                                     }
 
@@ -1853,273 +1972,13 @@ fun DownloadedVideosBrowserPanel(
                             }
                         }
 
-                        BrowserSubTray.BOOKMARKS -> {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState())
-                                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                if (bookmarks.isEmpty()) {
-                                    Text(
-                                        text = "No bookmarks saved yet",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MutedSlate,
-                                        modifier = Modifier.padding(vertical = 4.dp),
-                                    )
-                                } else {
-                                    bookmarks.forEach { bm ->
-                                        Surface(
-                                            color = NightTrayPill,
-                                            shape = RoundedCornerShape(50),
-                                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.22f)),
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(50))
-                                                .clickable {
-                                                    openUrlInActiveTab(bm.url)
-                                                    activeSubTray = null
-                                                    showToolsBar = false
-                                                },
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Rounded.Bookmark,
-                                                    contentDescription = null,
-                                                    tint = NeonCyan,
-                                                    modifier = Modifier.size(13.dp),
-                                                )
-                                                Spacer(modifier = Modifier.width(5.dp))
-                                                Text(
-                                                    text = bm.title,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = ChromeSilver,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    modifier = Modifier.widthIn(max = 140.dp),
-                                                )
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Icon(
-                                                    imageVector = Icons.Rounded.Close,
-                                                    contentDescription = "Remove bookmark",
-                                                    tint = MutedSlate,
-                                                    modifier = Modifier
-                                                        .size(13.dp)
-                                                        .clickable { browserPrefs.removeBookmark(bm.url) },
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        BrowserSubTray.HISTORY -> {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState())
-                                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                if (historyEntries.isNotEmpty()) {
-                                    Surface(
-                                        color = if (confirmClearHistory) CrimsonAlert else CrimsonAlert.copy(alpha = 0.14f),
-                                        shape = RoundedCornerShape(50),
-                                        border = BorderStroke(0.75.dp, CrimsonAlert.copy(alpha = 0.6f)),
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(50))
-                                            .clickable {
-                                                if (confirmClearHistory) {
-                                                    confirmClearHistory = false
-                                                    browserPrefs.clearHistory()
-                                                } else {
-                                                    confirmClearHistory = true
-                                                }
-                                            },
-                                    ) {
-                                        Text(
-                                            text = if (confirmClearHistory) "TAP CLEAR" else "CLEAR ALL",
-                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                            color = if (confirmClearHistory) Color.White else CrimsonAlert,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                        )
-                                    }
-                                }
-                                if (historyEntries.isEmpty()) {
-                                    Text(
-                                        text = "No history recorded yet",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MutedSlate,
-                                        modifier = Modifier.padding(vertical = 4.dp),
-                                    )
-                                } else {
-                                    historyEntries.take(25).forEach { entry ->
-                                        Surface(
-                                            color = NightTrayPill,
-                                            shape = RoundedCornerShape(50),
-                                            border = BorderStroke(0.75.dp, GlassStrokeBright.copy(alpha = 0.2f)),
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(50))
-                                                .clickable {
-                                                    openUrlInActiveTab(entry.url)
-                                                    activeSubTray = null
-                                                    showToolsBar = false
-                                                },
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Rounded.History,
-                                                    contentDescription = null,
-                                                    tint = MutedSlate,
-                                                    modifier = Modifier.size(13.dp),
-                                                )
-                                                Spacer(modifier = Modifier.width(5.dp))
-                                                Text(
-                                                    text = entry.title,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = ChromeSilver,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    modifier = Modifier.widthIn(max = 150.dp),
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
                         null -> Unit
                     }
                 }
             }
         }
 
-        // (Settings & features popup is rendered as a floating Samsung-style card overlay at Box level)
-
-        // 6. Inline Tab Manager Strip (Zero Popup — Nocturnal)
-        AnimatedVisibility(
-            visible = showTabsBarTray,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut(),
-        ) {
-            Surface(
-                color = NightChromeSurface,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 10.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        tabs.forEachIndexed { idx, t ->
-                            val selected = idx == activeTabIndex
-                            Surface(
-                                color = if (selected) NightTabSelected else NightTrayPill,
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(
-                                    0.85.dp,
-                                    if (selected) NeonCyan.copy(alpha = 0.7f) else NightHairline,
-                                ),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        activeTabIndex = idx
-                                        showTabsBarTray = false
-                                    },
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Text(
-                                        text = "${idx + 1}. ${t.title}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (selected) ChromeSilver else MutedSlate,
-                                        maxLines = 1,
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Icon(
-                                        imageVector = Icons.Rounded.Close,
-                                        contentDescription = "Close tab",
-                                        tint = MutedSlate,
-                                        modifier = Modifier
-                                            .size(14.dp)
-                                            .clickable { closeTab(idx) },
-                                    )
-                                }
-                            }
-                        }
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(0.8.dp, GlassStrokeBright.copy(alpha = 0.22f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { openNewTab() },
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Add,
-                                    contentDescription = "Add tab",
-                                    tint = NeonCyan,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "New tab",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-                        Surface(
-                            color = NightTrayPill,
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(0.8.dp, PlasmaViolet.copy(alpha = 0.45f)),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { openNewTab(incognito = true) },
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.VisibilityOff,
-                                    contentDescription = "Add private tab",
-                                    tint = PlasmaViolet,
-                                    modifier = Modifier.size(15.dp),
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "Private",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ChromeSilver,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // (Settings popup & Samsung-Browser-style Tabs overview are rendered at root Box level)
 
         // 7. Compact Nocturnal Bottom Navigation Bar (Back, Forward, Home, Pull, Cookies, [Tabs], More)
         HorizontalDivider(color = NightHairline, thickness = 0.7.dp)
@@ -2229,6 +2088,9 @@ fun DownloadedVideosBrowserPanel(
                     .minimumInteractiveComponentSize()
                     .clip(RoundedCornerShape(12.dp))
                     .clickable {
+                        if (!showTabsBarTray && !activeTab.isHome) {
+                            captureTabThumbnail(activeTab.id, webViews[activeTab.id])
+                        }
                         showTabsBarTray = !showTabsBarTray
                         if (showTabsBarTray) showToolsBar = false
                     }
@@ -2341,16 +2203,12 @@ fun DownloadedVideosBrowserPanel(
                     .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
             ) {
-                // --- Section 1: Navigation, Downloads & Bookmarks ---
+                // --- Section 1: Navigation, Downloads, Bookmarks & Settings ---
                 BrowserMenuFeatureRow(
                     icon = Icons.Rounded.History,
                     label = "History",
                     badgeText = historyEntries.size.takeIf { it > 0 }?.toString(),
-                    onClick = {
-                        confirmClearHistory = false
-                        activeSubTray = if (activeSubTray == BrowserSubTray.HISTORY) null else BrowserSubTray.HISTORY
-                        showToolsBar = false
-                    },
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.HISTORY) },
                     modifier = Modifier.testTag("browser_history_tray_button"),
                 )
 
@@ -2358,12 +2216,8 @@ fun DownloadedVideosBrowserPanel(
                 BrowserMenuFeatureRow(
                     icon = Icons.Rounded.ArrowDownward,
                     label = "Downloads",
-                    enabled = canPullFromMenu,
-                    iconTint = if (canPullFromMenu) NeonCyan else DimSlate,
-                    onClick = {
-                        triggerPullFromTopUrl()
-                        showToolsBar = false
-                    },
+                    iconTint = if (canPullFromMenu) NeonCyan else ChromeSilver,
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.DOWNLOADS) },
                     modifier = Modifier.testTag("browser_pull_video_button"),
                 )
 
@@ -2371,25 +2225,24 @@ fun DownloadedVideosBrowserPanel(
                     icon = Icons.Rounded.Bookmarks,
                     label = "Saved pages",
                     badgeText = bookmarks.size.takeIf { it > 0 }?.toString(),
-                    onClick = {
-                        activeSubTray = if (activeSubTray == BrowserSubTray.BOOKMARKS) null else BrowserSubTray.BOOKMARKS
-                        showToolsBar = false
-                    },
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.BOOKMARKS) },
                     modifier = Modifier.testTag("browser_bookmarks_tray_button"),
                 )
 
                 BrowserMenuFeatureRow(
                     icon = if (isCurrentBookmarked) Icons.Rounded.Bookmark else Icons.Rounded.Add,
-                    label = if (isCurrentBookmarked) "Saved in bookmarks" else "Add page to",
+                    label = "Add page to",
                     enabled = !activeTab.isHome,
-                    isActive = isCurrentBookmarked,
-                    onClick = {
-                        val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
-                        val added = browserPrefs.toggleBookmark(targetUrl, activeTab.title)
-                        localStatusBanner = if (added) "Bookmark saved" else "Bookmark removed"
-                        showToolsBar = false
-                    },
+                    isActive = isCurrentBookmarked || isCurrentPinnedToHome,
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.ADD_PAGE_TO) },
                     modifier = Modifier.testTag("browser_bookmark_toggle_button"),
+                )
+
+                BrowserMenuFeatureRow(
+                    icon = Icons.Outlined.Settings,
+                    label = "Settings",
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.SETTINGS) },
+                    modifier = Modifier.testTag("browser_open_settings_window_button"),
                 )
 
                 if (enableEditableSpeedDials) {
@@ -2431,21 +2284,6 @@ fun DownloadedVideosBrowserPanel(
                         modifier = Modifier.testTag("browser_pin_to_home_button"),
                     )
                 }
-
-                BrowserMenuFeatureRow(
-                    icon = Icons.Outlined.Lock,
-                    label = "Cookie Sync",
-                    badgeText = if (syncedDomains.isNotEmpty()) "${syncedDomains.size}" else null,
-                    badgeColor = EmeraldPulse,
-                    isActive = syncedDomains.isNotEmpty(),
-                    activeAccent = EmeraldPulse,
-                    onClick = {
-                        onManualSyncCookies(
-                            if (activeTab.isHome) "https://www.instagram.com/" else activeTab.url,
-                        )
-                    },
-                    modifier = Modifier.testTag("browser_sync_cookies_button"),
-                )
 
                 // Dotted Separator (matching Samsung Browser popup menu)
                 Canvas(
@@ -2497,11 +2335,7 @@ fun DownloadedVideosBrowserPanel(
                         else -> "ON"
                     },
                     badgeColor = if (adBlockEnabled) NeonCyan else MutedSlate,
-                    onClick = {
-                        val next = !adBlockEnabled
-                        browserPrefs.setAdBlockEnabled(next)
-                        localStatusBanner = if (next) "Ad blocker enabled" else "Ad blocker paused"
-                    },
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.AD_BLOCKERS) },
                     modifier = Modifier.testTag("browser_adblock_button"),
                 )
 
@@ -2512,18 +2346,18 @@ fun DownloadedVideosBrowserPanel(
                     activeAccent = EmeraldPulse,
                     badgeText = if (isVpnActive) "ON" else null,
                     badgeColor = EmeraldPulse,
-                    onClick = { toggleCloudflareVpn() },
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.VPN) },
                     modifier = Modifier.testTag("browser_vpn_1111_button"),
                 )
 
                 BrowserMenuFeatureRow(
                     icon = Icons.Rounded.VerifiedUser,
-                    label = if (isPermanentCookieLock) "Privacy lock" else "Temp session",
-                    isActive = isPermanentCookieLock,
+                    label = "Privacy",
+                    isActive = isPermanentCookieLock || syncedDomains.isNotEmpty(),
                     activeAccent = EmeraldPulse,
                     badgeText = if (storedCookieCount > 0) "$storedCookieCount" else if (isPermanentCookieLock) "AES" else null,
                     badgeColor = EmeraldPulse,
-                    onClick = { onTogglePermanentCookieLock() },
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.PRIVACY) },
                     modifier = Modifier.testTag("browser_permanent_cookie_lock_button"),
                 )
 
@@ -2531,10 +2365,7 @@ fun DownloadedVideosBrowserPanel(
                     icon = Icons.Outlined.Public,
                     label = "Search engine",
                     badgeText = searchEngine.label,
-                    onClick = {
-                        val nextEngine = browserPrefs.cycleSearchEngine()
-                        localStatusBanner = "Search engine: ${nextEngine.label}"
-                    },
+                    onClick = { openFeatureWindow(BrowserFeatureWindow.SEARCH_ENGINE) },
                     modifier = Modifier.testTag("browser_search_engine_button"),
                 )
 
@@ -2555,11 +2386,12 @@ fun DownloadedVideosBrowserPanel(
                     modifier = Modifier.testTag("browser_find_button"),
                 )
 
-                // Text Size / Page Zoom Stepper Row
+                // Text Size / Page Zoom Row (tap label for full Text Size window, or use quick steppers)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 48.dp)
+                        .clickable { openFeatureWindow(BrowserFeatureWindow.TEXT_SIZE) }
                         .padding(horizontal = 18.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -2669,28 +2501,138 @@ fun DownloadedVideosBrowserPanel(
                     },
                     modifier = Modifier.testTag("browser_share_button"),
                 )
-
-                if (storedCookieCount > 0) {
-                    BrowserMenuFeatureRow(
-                        icon = Icons.Outlined.DeleteOutline,
-                        label = if (confirmClearCookies) "Tap again to clear" else "Clear vault",
-                        iconTint = CrimsonAlert,
-                        textColor = CrimsonAlert,
-                        onClick = {
-                            if (confirmClearCookies) {
-                                confirmClearCookies = false
-                                onClearCookies()
-                                showToolsBar = false
-                            } else {
-                                confirmClearCookies = true
-                            }
-                        },
-                        modifier = Modifier.testTag("browser_clear_cookies_button"),
-                    )
-                }
             }
         }
     }
+
+    // Full-screen Samsung-Browser-Style Tabs Overview Overlay
+    val tabPreviewItems = tabs.mapIndexed { idx, tab ->
+        BrowserTabPreviewItem(
+            index = idx,
+            id = tab.id,
+            title = tab.title,
+            url = tab.url,
+            isHome = tab.isHome,
+            isIncognito = tab.isIncognito,
+            isActive = idx == activeTabIndex,
+            thumbnail = tabThumbnails[tab.id],
+            favicon = tabFavicons[tab.id],
+        )
+    }
+    BrowserTabsOverviewOverlay(
+        visible = showTabsBarTray,
+        tabs = tabPreviewItems,
+        activeThumbnail = tabThumbnails[activeTab.id],
+        onSelectTab = { idx ->
+            if (!activeTab.isHome && activeTabIndex != idx) {
+                captureTabThumbnail(activeTab.id, webViews[activeTab.id])
+            }
+            activeTabIndex = idx
+            showTabsBarTray = false
+        },
+        onCloseTab = { idx -> closeTab(idx) },
+        onAddTab = { incognito -> openNewTab(incognito = incognito) },
+        onCloseAllTabs = { incognitoOnly -> closeAllTabs(incognitoOnly) },
+        onDismiss = { showTabsBarTray = false },
+    )
+
+    // Real Modal Windows for Every Browser Feature & Setting
+    val activePageLiveUrl = webViews[activeTab.id]?.url ?: activeTab.url
+    BrowserFeatureWindowHost(
+        currentWindow = activeFeatureWindow,
+        canNavigateBackInWindow = featureWindowStack.size > 1,
+        onNavigateToWindow = { next -> openFeatureWindow(next) },
+        onBackWindow = { popFeatureWindow() },
+        onCloseAllWindows = { closeAllFeatureWindows() },
+        isHomeTab = activeTab.isHome,
+        activePageUrl = activePageLiveUrl,
+        activePageTitle = activeTab.title,
+        isCurrentBookmarked = isCurrentBookmarked,
+        isCurrentPinnedToHome = isCurrentPinnedToHome,
+        enableEditableSpeedDials = enableEditableSpeedDials,
+        activeDetectedVideo = if (activeTab.isHome) null else activeDetectedVideo,
+        statusMessage = statusMessage ?: localStatusBanner,
+        historyEntries = historyEntries,
+        bookmarks = bookmarks,
+        adBlockEnabled = adBlockEnabled,
+        blockedAdsCount = blockedAdsCount,
+        isVpnActive = isVpnActive,
+        isDesktopMode = isDesktopMode,
+        isPermanentCookieLock = isPermanentCookieLock,
+        syncedDomains = syncedDomains,
+        storedCookieCount = storedCookieCount,
+        searchEngine = searchEngine,
+        zoomPercent = zoomPercent,
+        onOpenUrl = { url -> openUrlInActiveTab(url) },
+        onRemoveHistoryEntry = { url -> browserPrefs.removeHistoryEntry(url) },
+        onClearHistory = { browserPrefs.clearHistory() },
+        onRemoveBookmark = { url -> browserPrefs.removeBookmark(url) },
+        onToggleBookmark = {
+            val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
+            val added = browserPrefs.toggleBookmark(targetUrl, activeTab.title)
+            localStatusBanner = if (added) "Bookmark saved" else "Bookmark removed"
+        },
+        onTogglePinToHome = {
+            val targetUrl = webViews[activeTab.id]?.url ?: activeTab.url
+            val normalizedTarget = targetUrl.trim().trimEnd('/')
+            val existingPinned = pinnedSites.firstOrNull {
+                it.url.trim().trimEnd('/').equals(normalizedTarget, ignoreCase = true)
+            }
+            if (existingPinned != null) {
+                browserPrefs.deletePinnedSite(existingPinned.id)
+                localStatusBanner = "تمت إزالة الموقع من الواجهة الرئيسية"
+            } else {
+                val addedSite = browserPrefs.addPinnedSite(activeTab.title, targetUrl)
+                if (addedSite != null) {
+                    localStatusBanner = "تم تثبيت الموقع في الواجهة الرئيسية مع جلب الشعار"
+                    if (addedSite.logoPath.isNullOrBlank()) {
+                        coroutineScope.launch {
+                            val fetched = SiteLogoFetcher.fetchAndCacheLogo(
+                                context = context,
+                                siteUrl = addedSite.url,
+                                forceRefresh = true,
+                            )
+                            if (!fetched.isNullOrBlank()) {
+                                browserPrefs.updatePinnedSiteLogo(addedSite.id, fetched)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        onResetPinnedSites = {
+            browserPrefs.resetPinnedSitesToDefault()
+            localStatusBanner = "تمت استعادة المواقع المثبتة الافتراضية"
+        },
+        onPullCurrentPage = { triggerPullFromTopUrl() },
+        onPullCustomUrl = { custom -> triggerPullFromTopUrl(explicitUrl = custom) },
+        onCopyUrl = { copyActiveUrl() },
+        onShareUrl = { shareActiveUrl() },
+        onToggleDesktopMode = { toggleDesktopMode() },
+        onOpenPrivateTab = { openNewTab(incognito = true) },
+        onSetAdBlockEnabled = { enabled ->
+            browserPrefs.setAdBlockEnabled(enabled)
+            localStatusBanner = if (enabled) "Ad blocker enabled" else "Ad blocker paused"
+        },
+        onReloadCurrentPage = { webViews[activeTab.id]?.reload() },
+        onToggleVpn = { toggleCloudflareVpn() },
+        onTogglePermanentCookieLock = { onTogglePermanentCookieLock() },
+        onManualSyncCookies = {
+            onManualSyncCookies(if (activeTab.isHome) "https://www.instagram.com/" else activePageLiveUrl)
+        },
+        onClearCookies = { onClearCookies() },
+        onClearBrowserCache = {
+            webViews.values.forEach { wv -> runCatching { wv.clearCache(true) } }
+            browserPrefs.clearHistory()
+            localStatusBanner = "Browser cache & history cleared"
+        },
+        onSelectSearchEngine = { engine ->
+            browserPrefs.setSearchEngine(engine)
+            localStatusBanner = "Search engine: ${engine.label}"
+        },
+        onSetZoomPercent = { pct -> applyZoomPercent(pct) },
+        onResetZoom = { resetZoom() },
+    )
     }
 }
 
