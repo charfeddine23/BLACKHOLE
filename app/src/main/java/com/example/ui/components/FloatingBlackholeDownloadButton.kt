@@ -668,10 +668,10 @@ fun FloatingBlackholeDownloadOverlay(
     }
 }
 
-private val candidateThumbCache = object : LruCache<String, ImageBitmap>(36) {}
+internal val candidateThumbCache = object : LruCache<String, ImageBitmap>(36) {}
 
 @Composable
-private fun CandidateVideoThumbnail(
+internal fun CandidateVideoThumbnail(
     candidate: ResolvedMediaCandidate,
     index: Int,
 ) {
@@ -797,7 +797,7 @@ private fun CandidateVideoThumbnail(
     }
 }
 
-private suspend fun loadCandidatePreviewBitmap(
+internal suspend fun loadCandidatePreviewBitmap(
     thumbnailUrl: String?,
     streamUrl: String,
     headers: Map<String, String>,

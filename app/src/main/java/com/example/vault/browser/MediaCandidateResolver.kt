@@ -24,6 +24,7 @@ data class ResolvedMediaCandidate(
     val isActiveVideoMatch: Boolean = false,
     val distinctGroupKey: String = stream.streamUrl.substringBefore("?").substringBefore("#"),
     val thumbnailUrl: String? = null,
+    val durationSeconds: Double = 0.0,
 )
 
 sealed interface CandidateResolutionOutcome {
@@ -61,6 +62,23 @@ class MediaCandidateResolver(
     private val cookieVault: CookieVaultManager,
 ) {
 
+    suspend fun resolveForInspection(
+        targetPageUrl: String,
+        snapshot: VaultWebSnapshot?,
+        interceptedMedia: List<InterceptedMediaRequest>,
+        extraSniffedVideos: List<String> = emptyList(),
+        extraSniffedAudios: List<String> = emptyList(),
+        actionTimestampMs: Long = System.currentTimeMillis(),
+    ): CandidateResolutionOutcome = resolveInternal(
+        targetPageUrl = targetPageUrl,
+        snapshot = snapshot,
+        interceptedMedia = interceptedMedia,
+        extraSniffedVideos = extraSniffedVideos,
+        extraSniffedAudios = extraSniffedAudios,
+        actionTimestampMs = actionTimestampMs,
+        alwaysReturnPickerCandidates = true,
+    )
+
     suspend fun resolve(
         targetPageUrl: String,
         snapshot: VaultWebSnapshot?,
@@ -68,6 +86,24 @@ class MediaCandidateResolver(
         extraSniffedVideos: List<String> = emptyList(),
         extraSniffedAudios: List<String> = emptyList(),
         actionTimestampMs: Long = System.currentTimeMillis(),
+    ): CandidateResolutionOutcome = resolveInternal(
+        targetPageUrl = targetPageUrl,
+        snapshot = snapshot,
+        interceptedMedia = interceptedMedia,
+        extraSniffedVideos = extraSniffedVideos,
+        extraSniffedAudios = extraSniffedAudios,
+        actionTimestampMs = actionTimestampMs,
+        alwaysReturnPickerCandidates = false,
+    )
+
+    private suspend fun resolveInternal(
+        targetPageUrl: String,
+        snapshot: VaultWebSnapshot?,
+        interceptedMedia: List<InterceptedMediaRequest>,
+        extraSniffedVideos: List<String>,
+        extraSniffedAudios: List<String>,
+        actionTimestampMs: Long,
+        alwaysReturnPickerCandidates: Boolean,
     ): CandidateResolutionOutcome {
         val cleanPageUrl = targetPageUrl.trim()
         val platform = PlatformBadge.fromUrl(cleanPageUrl)
@@ -286,6 +322,13 @@ class MediaCandidateResolver(
                 isActiveVideoMatch = exactVideoMatch || (isBlobActive && isFromStreamResolver),
                 distinctGroupKey = groupKey,
                 thumbnailUrl = resolvedThumbnail,
+                durationSeconds = matchedTelemetry?.durationSeconds
+                    ?.takeIf { it > 0.0 }
+                    ?: if (exactVideoMatch || isFromStreamResolver) {
+                        activeVideo?.durationSeconds?.takeIf { it > 0.0 } ?: 0.0
+                    } else {
+                        0.0
+                    },
             )
         }.sortedWith(
             compareByDescending<ResolvedMediaCandidate> { it.matchScore }
@@ -296,10 +339,7 @@ class MediaCandidateResolver(
 
         val distinctGroups = scored.distinctBy { it.distinctGroupKey }
 
-        // 5. Strict 1-vs-Many rule:
-        //    - Single unique video link -> start downloading immediately in highest quality
-        //    - Multiple unique video links -> present all links cleanly so the user chooses which to download
-        if (distinctGroups.size >= 2) {
+        if (alwaysReturnPickerCandidates || distinctGroups.size >= 2) {
             return CandidateResolutionOutcome.NeedsPicker(
                 candidates = distinctGroups.take(12),
             )

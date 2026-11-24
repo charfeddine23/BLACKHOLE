@@ -21,6 +21,9 @@ import com.example.vault.browser.InterceptedMediaKind
 import com.example.vault.browser.InterceptedMediaRequest
 import com.example.vault.browser.MediaCandidateResolver
 import com.example.vault.browser.ResolvedMediaCandidate
+import com.example.vault.browser.StreamMetadataResolver
+import com.example.vault.browser.VaultCaptureSnapshot
+import com.example.vault.browser.VaultInspectorUiState
 import com.example.vault.browser.VaultWebSnapshot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -90,8 +93,36 @@ class VaultBrowserDownloadEngine(
         universalDownloader = universalDownloader,
         cookieVault = cookieVault,
     ),
+    private val backendBaseUrlProvider: () -> String = { "" },
 ) {
     private val appContext = context.applicationContext
+    private val metadataResolver = StreamMetadataResolver(
+        okHttpClient = okHttpClient,
+        candidateResolver = candidateResolver,
+        backendBaseUrlProvider = backendBaseUrlProvider,
+    )
+
+    suspend fun inspectStreamMetadata(
+        pageUrl: String,
+        snapshot: VaultCaptureSnapshot? = null,
+        interceptedMedia: List<InterceptedMediaRequest> = emptyList(),
+        extraSniffedVideos: List<String> = emptyList(),
+        extraSniffedAudios: List<String> = emptyList(),
+    ): VaultInspectorUiState = withContext(Dispatchers.IO) {
+        val cleanPageUrl = pageUrl.trim()
+        if (cleanPageUrl.startsWith("http://", ignoreCase = true) ||
+            cleanPageUrl.startsWith("https://", ignoreCase = true)
+        ) {
+            runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
+        }
+        metadataResolver.inspect(
+            targetUrl = cleanPageUrl,
+            snapshot = snapshot,
+            interceptedMedia = interceptedMedia,
+            extraSniffedVideos = extraSniffedVideos,
+            extraSniffedAudios = extraSniffedAudios,
+        )
+    }
 
     suspend fun downloadPageVideoToVault(
         pageUrl: String,
@@ -200,15 +231,26 @@ class VaultBrowserDownloadEngine(
         pageUrl: String,
         pageTitle: String? = null,
         fallbackAudioUrl: String? = null,
+        sessionReferer: String? = null,
+        sessionCookies: String? = null,
         isCancelled: () -> Boolean,
         onState: (VaultBrowserDownloadState) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
         val cleanPageUrl = pageUrl.trim().ifBlank { candidate.stream.streamUrl }
         runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
+        val extraHeaders = buildMap {
+            val ref = sessionReferer?.takeIf { it.isNotBlank() } ?: cleanPageUrl
+            put("Referer", ref)
+            val ck = sessionCookies?.takeIf { it.isNotBlank() }
+            if (ck != null) put("Cookie", ck)
+        }
+        val enrichedStream = candidate.stream.copy(
+            headers = candidate.stream.headers + extraHeaders,
+        )
         executeDownloadPipeline(
             cleanPageUrl = cleanPageUrl,
             pageTitle = pageTitle,
-            combinedCandidates = listOf(candidate.stream),
+            combinedCandidates = listOf(enrichedStream),
             fallbackAudioUrl = fallbackAudioUrl ?: candidate.stream.audioStreamUrl,
             isCancelled = isCancelled,
             onState = onState,

@@ -19,6 +19,8 @@ import com.example.vault.data.VaultFileEntry
 import com.example.vault.data.VaultStorageMode
 import com.example.vault.browser.InterceptedMediaRequest
 import com.example.vault.browser.ResolvedMediaCandidate
+import com.example.vault.browser.VaultCaptureSnapshot
+import com.example.vault.browser.VaultInspectorUiState
 import com.example.vault.browser.VaultWebSnapshot
 import com.example.vault.data.VaultTempShareHelper
 import com.example.vault.data.VaultTransferStage
@@ -100,10 +102,18 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = SafVaultRepository(application.applicationContext, vaultCipher)
     private val deviceBrowser = DeviceMediaBrowser(application.applicationContext)
     private val browserDownloadEngine by lazy {
-        VaultBrowserDownloadEngine(application.applicationContext, repository)
+        VaultBrowserDownloadEngine(
+            context = application.applicationContext,
+            vaultRepository = repository,
+            backendBaseUrlProvider = { appPreferences.ytDlpBackendUrl.value },
+        )
     }
 
     val noScreenshotEnabled: StateFlow<Boolean> = appPreferences.noScreenshotEnabled
+    val ytDlpBackendUrl: StateFlow<String> = appPreferences.ytDlpBackendUrl
+
+    private val _inspectorState = MutableStateFlow<VaultInspectorUiState>(VaultInspectorUiState.Idle)
+    val inspectorState: StateFlow<VaultInspectorUiState> = _inspectorState.asStateFlow()
 
     private val _uiState = MutableStateFlow(VaultUiState())
     val uiState: StateFlow<VaultUiState> = _uiState.asStateFlow()
@@ -111,6 +121,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private var activeTransferJob: Job? = null
     private var pickerLoadJob: Job? = null
     private var browserDownloadJob: Job? = null
+    private var browserInspectJob: Job? = null
     private val browserDownloadCancelled = AtomicBoolean(false)
 
     @Volatile
@@ -288,6 +299,162 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setYtDlpBackendUrl(url: String) {
+        appPreferences.setYtDlpBackendUrl(url)
+    }
+
+    fun inspectCurrentPage(
+        pageUrl: String,
+        snapshot: VaultCaptureSnapshot? = null,
+        domVideoUrls: List<String> = emptyList(),
+        sniffedVideoUrls: List<String> = emptyList(),
+        sniffedAudioUrls: List<String> = emptyList(),
+        interceptedMedia: List<InterceptedMediaRequest> = emptyList(),
+    ) {
+        if (_uiState.value.isLocked) return
+        if (browserDownloadJob?.isActive == true) return
+        browserInspectJob?.cancel()
+        val cleanPageUrl = pageUrl.trim()
+        _inspectorState.value = VaultInspectorUiState.Inspecting(
+            pageUrl = cleanPageUrl,
+            snapshot = snapshot,
+        )
+        browserInspectJob = viewModelScope.launch {
+            val extraVideos = (snapshot?.domCandidateUrls.orEmpty() + domVideoUrls + sniffedVideoUrls).distinct()
+            val result = browserDownloadEngine.inspectStreamMetadata(
+                pageUrl = cleanPageUrl,
+                snapshot = snapshot,
+                interceptedMedia = interceptedMedia,
+                extraSniffedVideos = extraVideos,
+                extraSniffedAudios = sniffedAudioUrls.distinct(),
+            )
+            _inspectorState.value = result
+        }
+    }
+
+    fun reInspectManualUrl(customUrl: String) {
+        val trimmed = customUrl.trim()
+        if (trimmed.isBlank()) return
+        inspectCurrentPage(
+            pageUrl = trimmed,
+            snapshot = null,
+            domVideoUrls = emptyList(),
+            sniffedVideoUrls = emptyList(),
+            sniffedAudioUrls = emptyList(),
+            interceptedMedia = emptyList(),
+        )
+    }
+
+    fun selectInspectorCandidate(index: Int) {
+        val current = _inspectorState.value as? VaultInspectorUiState.PreviewReady ?: return
+        _inspectorState.value = VaultInspectorUiState.PreviewReady(
+            metadata = current.metadata.withSelectedIndex(index),
+        )
+    }
+
+    fun confirmInspectorDownload(overrideStreamUrl: String? = null) {
+        if (_uiState.value.isLocked || browserDownloadJob?.isActive == true) return
+        val current = _inspectorState.value as? VaultInspectorUiState.PreviewReady ?: return
+        val meta = current.metadata
+        val baseCandidate = meta.selectedCandidate ?: return
+        val manualUrl = overrideStreamUrl?.trim()?.takeIf {
+            it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+        }
+        val finalCandidate = if (manualUrl != null &&
+            manualUrl != meta.pageUrl &&
+            manualUrl != baseCandidate.stream.streamUrl
+        ) {
+            baseCandidate.copy(
+                stream = baseCandidate.stream.copy(
+                    streamUrl = manualUrl,
+                    isHls = manualUrl.contains(".m3u8", ignoreCase = true),
+                ),
+            )
+        } else {
+            baseCandidate
+        }
+
+        browserDownloadCancelled.set(false)
+        _inspectorState.value = VaultInspectorUiState.Downloading(
+            metadata = meta,
+            selectedCandidate = finalCandidate,
+            progress = 0.02f,
+            stageLabel = "جاري بدء التحميل إلى الخزنة...",
+        )
+
+        browserDownloadJob = viewModelScope.launch {
+            try {
+                val ok = browserDownloadEngine.downloadResolvedCandidateToVault(
+                    candidate = finalCandidate,
+                    pageUrl = meta.pageUrl,
+                    pageTitle = meta.title,
+                    sessionReferer = meta.referer,
+                    sessionCookies = meta.cookies,
+                    isCancelled = { browserDownloadCancelled.get() },
+                    onState = { dlState ->
+                        _uiState.update { it.copy(browserDownloadState = dlState) }
+                        when (dlState.phase) {
+                            VaultBrowserDownloadPhase.DOWNLOADING,
+                            VaultBrowserDownloadPhase.MERGING,
+                            VaultBrowserDownloadPhase.ENCRYPTING,
+                            VaultBrowserDownloadPhase.EXTRACTING,
+                            VaultBrowserDownloadPhase.INSPECTING,
+                            -> {
+                                _inspectorState.value = VaultInspectorUiState.Downloading(
+                                    metadata = meta,
+                                    selectedCandidate = finalCandidate,
+                                    progress = dlState.progress,
+                                    bytesDownloaded = dlState.bytesDownloaded,
+                                    totalBytes = dlState.totalBytes,
+                                    speedBytesPerSec = dlState.speedBytesPerSec,
+                                    stageLabel = dlState.message ?: "جاري التحميل...",
+                                )
+                            }
+                            VaultBrowserDownloadPhase.COMPLETED -> {
+                                _inspectorState.value = VaultInspectorUiState.Completed(
+                                    title = meta.title,
+                                    pageUrl = meta.pageUrl,
+                                )
+                            }
+                            VaultBrowserDownloadPhase.ERROR -> {
+                                _inspectorState.value = VaultInspectorUiState.Failed(
+                                    reason = dlState.message ?: "فشل تحميل الفيديو.",
+                                    pageUrl = meta.pageUrl,
+                                    lastUrlInput = finalCandidate.stream.streamUrl,
+                                    debugDetails = meta.debugTrace,
+                                )
+                            }
+                            else -> Unit
+                        }
+                    },
+                )
+                if (ok) {
+                    refreshEntries()
+                    delay(3_200L)
+                    if (_uiState.value.browserDownloadState.phase == VaultBrowserDownloadPhase.COMPLETED) {
+                        _uiState.update { it.copy(browserDownloadState = VaultBrowserDownloadState()) }
+                    }
+                    if (_inspectorState.value is VaultInspectorUiState.Completed) {
+                        _inspectorState.value = VaultInspectorUiState.Idle
+                    }
+                }
+            } catch (_: CancellationException) {
+                _uiState.update { it.copy(browserDownloadState = VaultBrowserDownloadState()) }
+                _inspectorState.value = VaultInspectorUiState.Idle
+            }
+        }
+    }
+
+    fun dismissInspector() {
+        browserInspectJob?.cancel()
+        browserInspectJob = null
+        val current = _inspectorState.value
+        if (current is VaultInspectorUiState.Downloading) {
+            cancelBrowserDownload()
+        }
+        _inspectorState.value = VaultInspectorUiState.Idle
+    }
+
     fun cancelBrowserDownload() {
         browserDownloadCancelled.set(true)
         browserDownloadJob?.cancel()
@@ -298,6 +465,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     phase = VaultBrowserDownloadPhase.IDLE,
                 ),
             )
+        }
+        if (_inspectorState.value is VaultInspectorUiState.Downloading) {
+            _inspectorState.value = VaultInspectorUiState.Idle
         }
     }
 
@@ -313,9 +483,12 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         activeTransferJob = null
         pickerLoadJob?.cancel()
         pickerLoadJob = null
+        browserInspectJob?.cancel()
+        browserInspectJob = null
         browserDownloadCancelled.set(true)
         browserDownloadJob?.cancel()
         browserDownloadJob = null
+        _inspectorState.value = VaultInspectorUiState.Idle
         VaultTempShareHelper.clearTempShareCache(getApplication())
         _uiState.update {
             it.copy(
@@ -989,6 +1162,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         activeTransferJob?.cancel()
         pickerLoadJob?.cancel()
+        browserInspectJob?.cancel()
         browserDownloadCancelled.set(true)
         browserDownloadJob?.cancel()
         VaultTempShareHelper.clearTempShareCache(getApplication())

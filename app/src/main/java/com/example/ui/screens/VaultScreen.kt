@@ -80,6 +80,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.components.DownloadedVideosBrowserPanel
 import com.example.ui.components.FloatingBlackholeDownloadOverlay
+import com.example.ui.components.PreDownloadInspectorSheet
 import com.example.ui.components.collectLiveWebViewMediaCandidates
 import com.example.ui.components.rememberSafeScreenInsets
 import com.example.ui.theme.ChromeSilver
@@ -91,7 +92,8 @@ import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeViewModel
-import com.example.vault.browser.VaultWebViewMonitor
+import com.example.vault.browser.VaultInspectorUiState
+import com.example.vault.browser.VaultWebViewInspector
 import com.example.vault.data.VaultCategory
 import com.example.vault.ui.VaultUiState
 import com.example.vault.ui.VaultViewModel
@@ -110,9 +112,12 @@ fun VaultScreen(
     val uiState by vaultViewModel.uiState.collectAsStateWithLifecycle()
     val blackholeUiState by viewModel.uiState.collectAsStateWithLifecycle()
     val noScreenshotEnabled by vaultViewModel.noScreenshotEnabled.collectAsStateWithLifecycle()
+    val inspectorState by vaultViewModel.inspectorState.collectAsStateWithLifecycle()
+    val ytDlpBackendUrl by vaultViewModel.ytDlpBackendUrl.collectAsStateWithLifecycle()
     val browserScope = rememberCoroutineScope()
-    val vaultWebViewMonitor = remember { VaultWebViewMonitor() }
-    val activeDetectedVideo by vaultWebViewMonitor.activeVideoTelemetry.collectAsStateWithLifecycle()
+    val vaultWebViewInspector = remember { VaultWebViewInspector() }
+    val vaultWebViewMonitor = vaultWebViewInspector.monitor
+    val activeDetectedVideo by vaultWebViewInspector.activeVideoTelemetry.collectAsStateWithLifecycle()
     var showVaultSettings by remember { mutableStateOf(false) }
     var vaultBrowserWebViewRef by remember { mutableStateOf<WebView?>(null) }
 
@@ -160,6 +165,7 @@ fun VaultScreen(
 
     BackHandler {
         when {
+            inspectorState !is VaultInspectorUiState.Idle -> vaultViewModel.dismissInspector()
             uiState.activePlayback != null -> vaultViewModel.closePlayer()
             uiState.devicePicker.isOpen -> {
                 if (!vaultViewModel.navigateUpDeviceDirectory()) {
@@ -548,20 +554,26 @@ fun VaultScreen(
                         onTogglePermanentCookieLock = viewModel::togglePermanentCookieLock,
                         onClearCookies = viewModel::clearAllCookies,
                         onPullCurrentPage = { pageUrl ->
-                            vaultViewModel.downloadPageVideoToVault(pageUrl = pageUrl)
+                            vaultViewModel.inspectCurrentPage(pageUrl = pageUrl)
                         },
                         webViewMonitor = vaultWebViewMonitor,
                         onPullCurrentPageWithMedia = { pageUrl, liveWebView, sniffedVideos, sniffedAudios, snapshot, interceptedMedia ->
-                            collectLiveWebViewMediaCandidates(liveWebView) { pageTitle, domUrls ->
-                                vaultViewModel.downloadPageVideoToVault(
-                                    pageUrl = pageUrl,
-                                    pageTitle = snapshot?.pageTitle ?: pageTitle,
-                                    domVideoUrls = (snapshot?.domCandidateUrls.orEmpty() + domUrls).distinct(),
-                                    sniffedVideoUrls = sniffedVideos,
-                                    sniffedAudioUrls = sniffedAudios,
-                                    snapshot = snapshot,
-                                    interceptedMedia = interceptedMedia,
-                                )
+                            browserScope.launch {
+                                val freshCapture = if (liveWebView != null) {
+                                    vaultWebViewInspector.captureFreshPlaybackSnapshot(liveWebView, pageUrl)
+                                } else {
+                                    null
+                                }
+                                collectLiveWebViewMediaCandidates(liveWebView) { _, domUrls ->
+                                    vaultViewModel.inspectCurrentPage(
+                                        pageUrl = pageUrl,
+                                        snapshot = freshCapture,
+                                        domVideoUrls = (snapshot?.domCandidateUrls.orEmpty() + freshCapture?.domCandidateUrls.orEmpty() + domUrls).distinct(),
+                                        sniffedVideoUrls = sniffedVideos,
+                                        sniffedAudioUrls = sniffedAudios,
+                                        interceptedMedia = interceptedMedia,
+                                    )
+                                }
                             }
                         },
                         onExitBrowser = vaultViewModel::closePrivateBrowser,
@@ -571,7 +583,7 @@ fun VaultScreen(
                         exitButtonLabel = "الخزنة",
                         onBeforeExternalFlow = vaultViewModel::beginExternalSystemFlow,
                         onDirectDownloadIntercepted = { dlUrl, _ ->
-                            vaultViewModel.downloadPageVideoToVault(pageUrl = dlUrl)
+                            vaultViewModel.inspectCurrentPage(pageUrl = dlUrl)
                             true
                         },
                         viewportOverlayContent = { currentPageUrl, isHomeTab, activeWebView, sniffedVideos, sniffedAudios, getInterceptedMedia ->
@@ -583,19 +595,18 @@ fun VaultScreen(
                                 onTapBlackhole = {
                                     val capturedIntercepted = if (isHomeTab) emptyList() else getInterceptedMedia()
                                     browserScope.launch {
-                                        val freshSnapshot = if (!isHomeTab && activeWebView != null) {
-                                            vaultWebViewMonitor.captureFreshSnapshot(activeWebView, currentPageUrl)
+                                        val freshCapture = if (!isHomeTab && activeWebView != null) {
+                                            vaultWebViewInspector.captureFreshPlaybackSnapshot(activeWebView, currentPageUrl)
                                         } else {
                                             null
                                         }
-                                        collectLiveWebViewMediaCandidates(activeWebView) { pageTitle, domUrls ->
-                                            vaultViewModel.downloadPageVideoToVault(
+                                        collectLiveWebViewMediaCandidates(activeWebView) { _, domUrls ->
+                                            vaultViewModel.inspectCurrentPage(
                                                 pageUrl = currentPageUrl,
-                                                pageTitle = freshSnapshot?.pageTitle ?: pageTitle,
-                                                domVideoUrls = (freshSnapshot?.domCandidateUrls.orEmpty() + domUrls).distinct(),
+                                                snapshot = freshCapture,
+                                                domVideoUrls = (freshCapture?.domCandidateUrls.orEmpty() + domUrls).distinct(),
                                                 sniffedVideoUrls = sniffedVideos,
                                                 sniffedAudioUrls = sniffedAudios,
-                                                snapshot = freshSnapshot,
                                                 interceptedMedia = capturedIntercepted,
                                             )
                                         }
@@ -716,6 +727,18 @@ fun VaultScreen(
                         onClose = vaultViewModel::closePlayer,
                     )
                 }
+            }
+
+            if (inspectorState !is VaultInspectorUiState.Idle) {
+                PreDownloadInspectorSheet(
+                    state = inspectorState,
+                    ytDlpBackendUrl = ytDlpBackendUrl,
+                    onSelectCandidate = vaultViewModel::selectInspectorCandidate,
+                    onReInspectUrl = vaultViewModel::reInspectManualUrl,
+                    onConfirmDownload = vaultViewModel::confirmInspectorDownload,
+                    onSaveYtDlpBackendUrl = vaultViewModel::setYtDlpBackendUrl,
+                    onCancelOrDismiss = vaultViewModel::dismissInspector,
+                )
             }
         }
     }

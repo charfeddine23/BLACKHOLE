@@ -26,6 +26,17 @@ class AppPreferences private constructor(context: Context) {
         _noScreenshotEnabled.value = enabled
     }
 
+    private val _ytDlpBackendUrl = MutableStateFlow(
+        prefs.getString(KEY_YTDLP_BACKEND_URL, "").orEmpty(),
+    )
+    val ytDlpBackendUrl: StateFlow<String> = _ytDlpBackendUrl.asStateFlow()
+
+    fun setYtDlpBackendUrl(url: String) {
+        val cleaned = url.trim()
+        prefs.edit().putString(KEY_YTDLP_BACKEND_URL, cleaned).apply()
+        _ytDlpBackendUrl.value = cleaned
+    }
+
     fun hasRequestedStartupPermissions(): Boolean {
         return prefs.getBoolean(KEY_STARTUP_PERMISSIONS_REQUESTED, false)
     }
@@ -45,6 +56,7 @@ class AppPreferences private constructor(context: Context) {
     companion object {
         private const val PREFS_NAME = "blackhole_app_settings"
         private const val KEY_NO_SCREENSHOT_ENABLED = "no_screenshot_enabled"
+        private const val KEY_YTDLP_BACKEND_URL = "ytdlp_backend_url"
         private const val KEY_STARTUP_PERMISSIONS_REQUESTED = "startup_permissions_requested"
         private const val KEY_MEDIA_STORAGE_SETUP_PROMPTED = "media_storage_setup_prompted_v2"
 

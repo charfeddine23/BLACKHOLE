@@ -138,6 +138,7 @@ class VaultWebViewMonitor {
         interceptedByTab.remove(tabId)
         _activeVideoTelemetry.value = null
         _trackedVideos.value = emptyList()
+        android.util.Log.d(VaultWebViewInspector.TAG, "Cleared stale intercepted & video telemetry for tab=$tabId")
     }
 
     fun clearActiveTelemetry() {
