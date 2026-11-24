@@ -46,6 +46,8 @@ data class VideoElementTelemetry(
     val score: Double = 0.0,
     val pageUrl: String = "",
     val pageTitle: String = "",
+    val posterUrl: String = "",
+    val titleHint: String = "",
 ) {
     val isBlobOrMediaSource: Boolean
         get() = currentSrc.startsWith("blob:", ignoreCase = true) ||
@@ -81,6 +83,7 @@ data class InterceptedMediaRequest(
 data class VaultWebSnapshot(
     val pageUrl: String = "",
     val pageTitle: String? = null,
+    val pagePosterUrl: String = "",
     val activeVideo: VideoElementTelemetry? = null,
     val allVideos: List<VideoElementTelemetry> = emptyList(),
     val domCandidateUrls: List<String> = emptyList(),
@@ -248,6 +251,7 @@ class VaultWebViewMonitor {
         val obj = JSONObject(jsonString)
         val pageUrl = obj.optString("pageUrl").ifBlank { fallbackPageUrl }
         val pageTitle = obj.optString("pageTitle").takeIf { it.isNotBlank() }
+        val pagePosterUrl = obj.optString("pagePosterUrl").trim()
         val videosArr = obj.optJSONArray("videos") ?: JSONArray()
         val parsedVideos = buildList {
             for (i in 0 until videosArr.length()) {
@@ -284,6 +288,8 @@ class VaultWebViewMonitor {
                         score = item.optDouble("score", 0.0),
                         pageUrl = pageUrl,
                         pageTitle = pageTitle.orEmpty(),
+                        posterUrl = item.optString("posterUrl").trim(),
+                        titleHint = item.optString("titleHint").trim(),
                     ),
                 )
             }
@@ -306,6 +312,7 @@ class VaultWebViewMonitor {
         VaultWebSnapshot(
             pageUrl = pageUrl,
             pageTitle = pageTitle,
+            pagePosterUrl = pagePosterUrl,
             activeVideo = active,
             allVideos = parsedVideos,
             domCandidateUrls = domUrls,
@@ -502,7 +509,58 @@ class VaultWebViewMonitor {
                   video.addEventListener('timeupdate', onTimeUpdate, { passive: true });
                 }
 
-                function buildSnapshotObject() {
+                function findPosterAndTitle(video, allowFrameCapture) {
+                  var poster = video.poster || video.getAttribute('poster') || video.getAttribute('data-poster') || '';
+                  var titleHint = (video.getAttribute('title') || video.getAttribute('aria-label') || '').trim();
+                  try {
+                    var container = video.closest ? video.closest('article, [role="article"], figure, ytm-video-with-context-renderer, ytd-video-renderer, [data-testid*="video"], .video-card, .post, li') : null;
+                    if (!container && video.parentElement) {
+                      container = video.parentElement.parentElement || video.parentElement;
+                    }
+                    if (container) {
+                      if (!poster) {
+                        var imgs = container.querySelectorAll ? container.querySelectorAll('img') : [];
+                        var bestImgScore = 0;
+                        for (var ii = 0; ii < imgs.length; ii++) {
+                          var img = imgs[ii];
+                          var imgSrc = img.currentSrc || img.src || img.getAttribute('data-src') || '';
+                          if (!imgSrc || /^data:image\/svg/i.test(imgSrc)) continue;
+                          var iw = Number(img.naturalWidth || img.width || 0);
+                          var ih = Number(img.naturalHeight || img.height || 0);
+                          var area = iw * ih;
+                          if ((iw >= 80 || ih >= 60 || area === 0) && area >= bestImgScore) {
+                            bestImgScore = area;
+                            poster = imgSrc;
+                          }
+                        }
+                      }
+                      if (!titleHint) {
+                        var heading = container.querySelector ? container.querySelector('h1, h2, h3, h4, [class*="title"], [class*="caption"], figcaption') : null;
+                        if (heading && heading.textContent) {
+                          titleHint = heading.textContent.trim().slice(0, 80);
+                        }
+                      }
+                    }
+                  } catch (domThumbErr) {}
+
+                  if (!poster && allowFrameCapture && Number(video.readyState || 0) >= 2 && Number(video.videoWidth || 0) > 0 && Number(video.videoHeight || 0) > 0) {
+                    try {
+                      var cw = 160;
+                      var ch = Math.max(68, Math.round((cw * Number(video.videoHeight)) / Number(video.videoWidth)));
+                      var canvas = document.createElement('canvas');
+                      canvas.width = cw;
+                      canvas.height = ch;
+                      var ctx = canvas.getContext('2d');
+                      if (ctx) {
+                        ctx.drawImage(video, 0, 0, cw, ch);
+                        poster = canvas.toDataURL('image/jpeg', 0.65);
+                      }
+                    } catch (corsErr) {}
+                  }
+                  return { poster: poster, titleHint: titleHint };
+                }
+
+                function buildSnapshotObject(includeFrames) {
                   var videos = [];
                   collectVideosFromRoot(document, videos);
                   var now = Date.now();
@@ -531,6 +589,7 @@ class VaultWebViewMonitor {
                     var vw = Number(v.videoWidth || 0);
                     var vh = Number(v.videoHeight || 0);
                     var likelyAd = isLikelyAdElement(v, st) && (hasLongUnmutedVideo || videos.length > 1);
+                    var metaHint = findPosterAndTitle(v, !!includeFrames && entries.length < 8);
 
                     var sourceUrls = [];
                     try {
@@ -572,7 +631,9 @@ class VaultWebViewMonitor {
                       lastAdvanceMs: st.lastAdvanceMs,
                       lastUpdatedMs: st.lastUpdatedMs,
                       isLikelyAd: likelyAd,
-                      score: score
+                      score: score,
+                      posterUrl: metaHint.poster || '',
+                      titleHint: metaHint.titleHint || ''
                     });
                   }
 
@@ -603,7 +664,12 @@ class VaultWebViewMonitor {
                       item.sourceUrls.forEach(pushDom);
                     }
                   });
+                  var pagePosterUrl = '';
                   try {
+                    var ogImg = document.querySelector('meta[property="og:image"], meta[name="twitter:image"], link[rel="image_src"]');
+                    if (ogImg) {
+                      pagePosterUrl = ogImg.getAttribute('content') || ogImg.getAttribute('href') || '';
+                    }
                     document.querySelectorAll('meta[property*="og:video"], meta[name*="twitter:player:stream"]').forEach(function(m) {
                       pushDom(m.getAttribute('content'));
                     });
@@ -622,14 +688,15 @@ class VaultWebViewMonitor {
                   return {
                     pageUrl: window.location.href || '',
                     pageTitle: document.title || '',
+                    pagePosterUrl: pagePosterUrl || '',
                     activeIndex: activeIndex,
                     videos: entries.slice(0, 12),
                     domUrls: domUrls.slice(0, 20)
                   };
                 }
 
-                window.__bhBuildSnapshotJson = function() {
-                  return JSON.stringify(buildSnapshotObject());
+                window.__bhBuildSnapshotJson = function(includeFrames) {
+                  return JSON.stringify(buildSnapshotObject(!!includeFrames));
                 };
 
                 window.__bhPublishSnapshot = function(force) {
@@ -680,7 +747,7 @@ class VaultWebViewMonitor {
             (function() {
               try {
                 if (typeof window.__bhBuildSnapshotJson === 'function') {
-                  return window.__bhBuildSnapshotJson();
+                  return window.__bhBuildSnapshotJson(true);
                 }
               } catch (e) {}
               return null;

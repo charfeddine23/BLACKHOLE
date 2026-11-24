@@ -23,6 +23,7 @@ data class ResolvedMediaCandidate(
     val isFromBlobFallback: Boolean = false,
     val isActiveVideoMatch: Boolean = false,
     val distinctGroupKey: String = stream.streamUrl.substringBefore("?").substringBefore("#"),
+    val thumbnailUrl: String? = null,
 )
 
 sealed interface CandidateResolutionOutcome {
@@ -252,14 +253,39 @@ class MediaCandidateResolver(
                 score -= 3_500
             }
 
-            val groupKey = deriveDistinctStreamGroupKey(stream.streamUrl)
+            // Resolve best matching thumbnail & title hint for this candidate so the user can visually identify it
+            val matchedTelemetry = matchTelemetryForStream(
+                streamUrl = stream.streamUrl,
+                isFromStreamResolver = isFromStreamResolver,
+                activeVideo = activeVideo,
+                allVideos = snapshot?.allVideos.orEmpty(),
+            )
+            val resolvedThumbnail = resolveThumbnailForCandidate(
+                streamUrl = stream.streamUrl,
+                pageUrl = cleanPageUrl,
+                matchedTelemetry = matchedTelemetry,
+                isActiveOrRouted = exactVideoMatch || isFromStreamResolver,
+                pagePosterUrl = snapshot?.pagePosterUrl.orEmpty(),
+            )
+            val enrichedStream = if (
+                matchedTelemetry != null &&
+                matchedTelemetry.titleHint.isNotBlank() &&
+                (stream.title.isBlank() || stream.title == resolvedTitle)
+            ) {
+                stream.copy(title = matchedTelemetry.titleHint)
+            } else {
+                stream
+            }
+
+            val groupKey = deriveDistinctStreamGroupKey(enrichedStream.streamUrl)
             ResolvedMediaCandidate(
-                stream = stream,
+                stream = enrichedStream,
                 matchScore = score,
-                matchReason = reasons.firstOrNull() ?: "أعلى جودة متاحة (${stream.qualityLabel})",
-                isFromBlobFallback = isBlobActive && (isFromStreamResolver || stream.isHls),
+                matchReason = reasons.firstOrNull() ?: "أعلى جودة متاحة (${enrichedStream.qualityLabel})",
+                isFromBlobFallback = isBlobActive && (isFromStreamResolver || enrichedStream.isHls),
                 isActiveVideoMatch = exactVideoMatch || (isBlobActive && isFromStreamResolver),
                 distinctGroupKey = groupKey,
+                thumbnailUrl = resolvedThumbnail,
             )
         }.sortedWith(
             compareByDescending<ResolvedMediaCandidate> { it.matchScore }
@@ -497,6 +523,75 @@ class MediaCandidateResolver(
             host.endsWith(".cdninstagram.com") -> "cdninstagram.com"
             host.endsWith(".fbcdn.net") -> "fbcdn.net"
             else -> host.replace(Regex("""^(cdn|edge|media|s|v)\d+\."""), "$1.")
+        }
+    }
+
+    private fun matchTelemetryForStream(
+        streamUrl: String,
+        isFromStreamResolver: Boolean,
+        activeVideo: VideoElementTelemetry?,
+        allVideos: List<VideoElementTelemetry>,
+    ): VideoElementTelemetry? {
+        val cleanStream = streamUrl.substringBefore("#")
+        val directMatch = allVideos.firstOrNull { vid ->
+            val candidates = listOfNotNull(vid.bestDirectHttpUrl, vid.currentSrc, vid.src) + vid.sourceUrls
+            candidates.any { it.substringBefore("#").equals(cleanStream, ignoreCase = true) }
+        }
+        if (directMatch != null) return directMatch
+
+        val streamTokens = extractCorrelationTokens(streamUrl)
+        if (streamTokens.isNotEmpty()) {
+            val tokenMatch = allVideos.firstOrNull { vid ->
+                val vidTokens = extractCorrelationTokens(vid.bestDirectHttpUrl ?: vid.currentSrc)
+                vidTokens.intersect(streamTokens).isNotEmpty()
+            }
+            if (tokenMatch != null) return tokenMatch
+        }
+
+        if (isFromStreamResolver || activeVideo?.isBlobOrMediaSource == true) {
+            return activeVideo
+        }
+        return null
+    }
+
+    private fun resolveThumbnailForCandidate(
+        streamUrl: String,
+        pageUrl: String,
+        matchedTelemetry: VideoElementTelemetry?,
+        isActiveOrRouted: Boolean,
+        pagePosterUrl: String,
+    ): String? {
+        val telemetryPoster = matchedTelemetry?.posterUrl?.trim()?.takeIf {
+            it.startsWith("http://", ignoreCase = true) ||
+                it.startsWith("https://", ignoreCase = true) ||
+                it.startsWith("data:image/", ignoreCase = true)
+        }
+        if (telemetryPoster != null) return telemetryPoster
+
+        val ytId = extractYouTubeVideoId(streamUrl) ?: if (isActiveOrRouted) extractYouTubeVideoId(pageUrl) else null
+        if (!ytId.isNullOrBlank()) {
+            return "https://i.ytimg.com/vi/$ytId/hqdefault.jpg"
+        }
+
+        if (isActiveOrRouted &&
+            (pagePosterUrl.startsWith("http://", ignoreCase = true) || pagePosterUrl.startsWith("https://", ignoreCase = true))
+        ) {
+            return pagePosterUrl
+        }
+        return null
+    }
+
+    private fun extractYouTubeVideoId(url: String): String? {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
+        val host = uri.host?.lowercase().orEmpty()
+        return when {
+            host.contains("youtu.be") -> uri.lastPathSegment?.takeIf { it.length in 8..16 }
+            host.contains("youtube.com") -> {
+                uri.getQueryParameter("v")?.takeIf { it.length in 8..16 }
+                    ?: uri.pathSegments.dropWhile { it != "shorts" && it != "embed" && it != "live" }
+                        .getOrNull(1)?.takeIf { it.length in 8..16 }
+            }
+            else -> null
         }
     }
 

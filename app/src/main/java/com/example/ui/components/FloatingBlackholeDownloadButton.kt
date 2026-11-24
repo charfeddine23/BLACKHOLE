@@ -1,5 +1,10 @@
 package com.example.ui.components
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
+import android.util.Base64
+import android.util.LruCache
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
@@ -14,7 +19,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +32,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -39,15 +47,18 @@ import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -57,11 +68,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -87,6 +101,11 @@ import com.example.vault.browser.ResolvedMediaCandidate
 import com.example.vault.browser.VideoElementTelemetry
 import com.example.vault.data.VaultBrowserDownloadPhase
 import com.example.vault.data.VaultBrowserDownloadState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.math.roundToInt
 
 /**
@@ -349,15 +368,15 @@ fun FloatingBlackholeDownloadOverlay(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 320.dp)
+                                .heightIn(max = 390.dp)
                                 .verticalScroll(rememberScrollState())
                                 .padding(top = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(7.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             downloadState.pickerCandidates.forEachIndexed { idx, cand ->
                                 val cleanUrlPreview = cand.stream.streamUrl
                                     .substringAfter("://")
-                                    .take(56)
+                                    .take(52)
                                 val sizePart = if (cand.stream.estimatedBytes > 0L) {
                                     " · ${formatByteSize(cand.stream.estimatedBytes)}"
                                 } else {
@@ -365,51 +384,34 @@ fun FloatingBlackholeDownloadOverlay(
                                 }
                                 Surface(
                                     color = if (cand.isActiveVideoMatch) Color(0xFF10242B) else Color(0xFF121C2E),
-                                    shape = RoundedCornerShape(12.dp),
+                                    shape = RoundedCornerShape(14.dp),
                                     border = BorderStroke(
                                         width = if (cand.isActiveVideoMatch) 1.dp else 0.75.dp,
                                         color = if (cand.isActiveVideoMatch) {
-                                            EmeraldPulse.copy(alpha = 0.65f)
+                                            EmeraldPulse.copy(alpha = 0.68f)
                                         } else {
-                                            NeonCyan.copy(alpha = 0.35f)
+                                            NeonCyan.copy(alpha = 0.34f)
                                         },
                                     ),
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
+                                        .minimumInteractiveComponentSize()
+                                        .clip(RoundedCornerShape(14.dp))
                                         .clickable { onSelectCandidate(cand) }
                                         .testTag("vault_browser_candidate_pick_$idx"),
                                 ) {
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                                            .padding(horizontal = 9.dp, vertical = 9.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                     ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(24.dp)
-                                                .clip(CircleShape)
-                                                .background(
-                                                    if (cand.isActiveVideoMatch) {
-                                                        EmeraldPulse.copy(alpha = 0.2f)
-                                                    } else {
-                                                        NeonCyan.copy(alpha = 0.16f)
-                                                    },
-                                                ),
-                                            contentAlignment = Alignment.Center,
-                                        ) {
-                                            Text(
-                                                text = "${idx + 1}",
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    fontSize = 10.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                ),
-                                                color = if (cand.isActiveVideoMatch) EmeraldPulse else NeonCyan,
-                                            )
-                                        }
-                                        Spacer(modifier = Modifier.width(8.dp))
+                                        CandidateVideoThumbnail(
+                                            candidate = cand,
+                                            index = idx + 1,
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
                                         Column(modifier = Modifier.weight(1f)) {
                                             Row(
                                                 verticalAlignment = Alignment.CenterVertically,
@@ -456,12 +458,21 @@ fun FloatingBlackholeDownloadOverlay(
                                             )
                                         }
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Icon(
-                                            imageVector = Icons.Rounded.ArrowDownward,
-                                            contentDescription = "تحميل هذا الرابط",
-                                            tint = EmeraldPulse,
-                                            modifier = Modifier.size(19.dp),
-                                        )
+                                        Box(
+                                            modifier = Modifier
+                                                .size(34.dp)
+                                                .clip(CircleShape)
+                                                .background(EmeraldPulse.copy(alpha = 0.14f))
+                                                .border(0.75.dp, EmeraldPulse.copy(alpha = 0.45f), CircleShape),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.ArrowDownward,
+                                                contentDescription = "تحميل هذا الرابط",
+                                                tint = EmeraldPulse,
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -655,4 +666,251 @@ fun FloatingBlackholeDownloadOverlay(
             }
         }
     }
+}
+
+private val candidateThumbCache = object : LruCache<String, ImageBitmap>(36) {}
+
+@Composable
+private fun CandidateVideoThumbnail(
+    candidate: ResolvedMediaCandidate,
+    index: Int,
+) {
+    val cacheKey = remember(candidate.stream.streamUrl, candidate.thumbnailUrl) {
+        "${candidate.thumbnailUrl.orEmpty()}|${candidate.stream.streamUrl}"
+    }
+    val thumbnail by produceState<ImageBitmap?>(
+        initialValue = candidateThumbCache.get(cacheKey),
+        key1 = cacheKey,
+    ) {
+        if (value != null) return@produceState
+        val loaded = withContext(Dispatchers.IO) {
+            loadCandidatePreviewBitmap(
+                thumbnailUrl = candidate.thumbnailUrl,
+                streamUrl = candidate.stream.streamUrl,
+                headers = candidate.stream.headers,
+            )
+        }
+        if (loaded != null) {
+            candidateThumbCache.put(cacheKey, loaded)
+            value = loaded
+        }
+    }
+
+    val accent = if (candidate.isActiveVideoMatch) EmeraldPulse else NeonCyan
+
+    Box(
+        modifier = Modifier
+            .width(96.dp)
+            .height(60.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                Brush.linearGradient(
+                    colors = listOf(
+                        Color(0xFF0A1322),
+                        Color(0xFF142138),
+                    ),
+                ),
+            )
+            .border(
+                width = 0.85.dp,
+                color = if (candidate.isActiveVideoMatch) accent.copy(alpha = 0.65f) else GlassStrokeBright.copy(alpha = 0.25f),
+                shape = RoundedCornerShape(10.dp),
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (thumbnail != null) {
+            Image(
+                bitmap = thumbnail!!,
+                contentDescription = candidate.stream.title.ifBlank { "معاينة الفيديو #$index" },
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+            // Subtle bottom gradient vignette so quality badge remains crisp over bright frames
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color.Transparent,
+                                Color(0x88050A14),
+                            ),
+                        ),
+                    ),
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(accent.copy(alpha = 0.14f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.PlayArrow,
+                    contentDescription = null,
+                    tint = accent.copy(alpha = 0.9f),
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+
+        // Top-start index badge
+        Surface(
+            color = ObsidianVoid.copy(alpha = 0.82f),
+            shape = RoundedCornerShape(6.dp),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(4.dp),
+        ) {
+            Text(
+                text = "$index",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight.Bold,
+                ),
+                color = accent,
+                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+            )
+        }
+
+        // Bottom-end resolution badge
+        if (candidate.stream.qualityLabel.isNotBlank()) {
+            Surface(
+                color = ObsidianVoid.copy(alpha = 0.82f),
+                shape = RoundedCornerShape(6.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(4.dp),
+            ) {
+                Text(
+                    text = candidate.stream.qualityLabel,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 8.5.sp,
+                        fontWeight = FontWeight.Bold,
+                    ),
+                    color = ChromeSilver,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                )
+            }
+        }
+    }
+}
+
+private suspend fun loadCandidatePreviewBitmap(
+    thumbnailUrl: String?,
+    streamUrl: String,
+    headers: Map<String, String>,
+): ImageBitmap? {
+    // 1. Decode inline canvas-captured data URI if present
+    if (!thumbnailUrl.isNullOrBlank() && thumbnailUrl.startsWith("data:image/", ignoreCase = true)) {
+        val base64Part = thumbnailUrl.substringAfter("base64,", "")
+        if (base64Part.isNotBlank()) {
+            runCatching {
+                val decoded = Base64.decode(base64Part, Base64.DEFAULT)
+                val bmp = BitmapFactory.decodeByteArray(decoded, 0, decoded.size)
+                if (bmp != null) return bmp.asImageBitmap()
+            }
+        }
+    }
+
+    // 2. Fetch remote poster / YouTube / og:image thumbnail using session headers
+    if (!thumbnailUrl.isNullOrBlank() &&
+        (thumbnailUrl.startsWith("http://", ignoreCase = true) || thumbnailUrl.startsWith("https://", ignoreCase = true))
+    ) {
+        val fetched = withTimeoutOrNull(3800L) {
+            runCatching {
+                val conn = (URL(thumbnailUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 3000
+                    readTimeout = 3500
+                    instanceFollowRedirects = true
+                    headers.forEach { (k, v) ->
+                        if (k.isNotBlank() && v.isNotBlank()) setRequestProperty(k, v)
+                    }
+                    if (!headers.keys.any { it.equals("User-Agent", ignoreCase = true) }) {
+                        setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/128.0 Mobile Safari/537.36")
+                    }
+                }
+                try {
+                    val cType = conn.contentType.orEmpty().lowercase()
+                    if (conn.responseCode in 200..299 && !cType.startsWith("video/") && !cType.startsWith("text/html")) {
+                        val bytes = conn.inputStream.use { input ->
+                            val out = java.io.ByteArrayOutputStream()
+                            val buf = ByteArray(8192)
+                            var total = 0
+                            while (total < 2 * 1024 * 1024) {
+                                val read = input.read(buf)
+                                if (read <= 0) break
+                                out.write(buf, 0, read)
+                                total += read
+                            }
+                            out.toByteArray()
+                        }
+                        if (bytes.isNotEmpty()) {
+                            decodeSampledBitmap(bytes, targetWidth = 280)?.asImageBitmap()
+                        } else {
+                            null
+                        }
+                    } else {
+                        null
+                    }
+                } finally {
+                    conn.disconnect()
+                }
+            }.getOrNull()
+        }
+        if (fetched != null) return fetched
+    }
+
+    // 3. Extract a real preview frame directly from the video stream (.mp4 / .m3u8) with cookies & referer
+    if (streamUrl.startsWith("http://", ignoreCase = true) || streamUrl.startsWith("https://", ignoreCase = true)) {
+        return withTimeoutOrNull(4500L) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(streamUrl, headers)
+                val frame = retriever.getFrameAtTime(600_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.frameAtTime
+                frame?.let { scaleDownBitmap(it, maxDim = 280).asImageBitmap() }
+            } catch (_: Throwable) {
+                null
+            } finally {
+                runCatching { retriever.release() }
+            }
+        }
+    }
+    return null
+}
+
+private fun decodeSampledBitmap(bytes: ByteArray, targetWidth: Int): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    var sample = 1
+    if (bounds.outWidth > targetWidth * 2) {
+        val halfW = bounds.outWidth / 2
+        while (halfW / sample >= targetWidth) {
+            sample *= 2
+        }
+    }
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = sample
+        inPreferredConfig = Bitmap.Config.RGB_565
+    }
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.let {
+        scaleDownBitmap(it, targetWidth)
+    }
+}
+
+private fun scaleDownBitmap(source: Bitmap, maxDim: Int): Bitmap {
+    val w = source.width
+    val h = source.height
+    if (w <= maxDim && h <= maxDim) return source
+    val scale = maxDim.toFloat() / maxOf(w, h).toFloat()
+    val nw = (w * scale).roundToInt().coerceAtLeast(1)
+    val nh = (h * scale).roundToInt().coerceAtLeast(1)
+    val scaled = Bitmap.createScaledBitmap(source, nw, nh, true)
+    if (scaled !== source) {
+        source.recycle()
+    }
+    return scaled
 }
