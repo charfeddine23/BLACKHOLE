@@ -57,6 +57,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -90,9 +91,11 @@ import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeViewModel
+import com.example.vault.browser.VaultWebViewMonitor
 import com.example.vault.data.VaultCategory
 import com.example.vault.ui.VaultUiState
 import com.example.vault.ui.VaultViewModel
+import kotlinx.coroutines.launch
 
 @Suppress("UNUSED_PARAMETER")
 @Composable
@@ -107,6 +110,9 @@ fun VaultScreen(
     val uiState by vaultViewModel.uiState.collectAsStateWithLifecycle()
     val blackholeUiState by viewModel.uiState.collectAsStateWithLifecycle()
     val noScreenshotEnabled by vaultViewModel.noScreenshotEnabled.collectAsStateWithLifecycle()
+    val browserScope = rememberCoroutineScope()
+    val vaultWebViewMonitor = remember { VaultWebViewMonitor() }
+    val activeDetectedVideo by vaultWebViewMonitor.activeVideoTelemetry.collectAsStateWithLifecycle()
     var showVaultSettings by remember { mutableStateOf(false) }
     var vaultBrowserWebViewRef by remember { mutableStateOf<WebView?>(null) }
 
@@ -544,14 +550,17 @@ fun VaultScreen(
                         onPullCurrentPage = { pageUrl ->
                             vaultViewModel.downloadPageVideoToVault(pageUrl = pageUrl)
                         },
-                        onPullCurrentPageWithMedia = { pageUrl, liveWebView, sniffedVideos, sniffedAudios ->
+                        webViewMonitor = vaultWebViewMonitor,
+                        onPullCurrentPageWithMedia = { pageUrl, liveWebView, sniffedVideos, sniffedAudios, snapshot, interceptedMedia ->
                             collectLiveWebViewMediaCandidates(liveWebView) { pageTitle, domUrls ->
                                 vaultViewModel.downloadPageVideoToVault(
                                     pageUrl = pageUrl,
-                                    pageTitle = pageTitle,
-                                    domVideoUrls = domUrls,
+                                    pageTitle = snapshot?.pageTitle ?: pageTitle,
+                                    domVideoUrls = (snapshot?.domCandidateUrls.orEmpty() + domUrls).distinct(),
                                     sniffedVideoUrls = sniffedVideos,
                                     sniffedAudioUrls = sniffedAudios,
+                                    snapshot = snapshot,
+                                    interceptedMedia = interceptedMedia,
                                 )
                             }
                         },
@@ -565,22 +574,34 @@ fun VaultScreen(
                             vaultViewModel.downloadPageVideoToVault(pageUrl = dlUrl)
                             true
                         },
-                        viewportOverlayContent = { currentPageUrl, isHomeTab, activeWebView, sniffedVideos, sniffedAudios ->
+                        viewportOverlayContent = { currentPageUrl, isHomeTab, activeWebView, sniffedVideos, sniffedAudios, getInterceptedMedia ->
                             FloatingBlackholeDownloadOverlay(
                                 downloadState = uiState.browserDownloadState,
                                 sniffedCandidatesCount = if (isHomeTab) 0 else sniffedVideos.size,
                                 isPageActive = !isHomeTab,
+                                activeDetectedVideo = if (isHomeTab) null else activeDetectedVideo,
                                 onTapBlackhole = {
-                                    collectLiveWebViewMediaCandidates(activeWebView) { pageTitle, domUrls ->
-                                        vaultViewModel.downloadPageVideoToVault(
-                                            pageUrl = currentPageUrl,
-                                            pageTitle = pageTitle,
-                                            domVideoUrls = domUrls,
-                                            sniffedVideoUrls = sniffedVideos,
-                                            sniffedAudioUrls = sniffedAudios,
-                                        )
+                                    val capturedIntercepted = if (isHomeTab) emptyList() else getInterceptedMedia()
+                                    browserScope.launch {
+                                        val freshSnapshot = if (!isHomeTab && activeWebView != null) {
+                                            vaultWebViewMonitor.captureFreshSnapshot(activeWebView, currentPageUrl)
+                                        } else {
+                                            null
+                                        }
+                                        collectLiveWebViewMediaCandidates(activeWebView) { pageTitle, domUrls ->
+                                            vaultViewModel.downloadPageVideoToVault(
+                                                pageUrl = currentPageUrl,
+                                                pageTitle = freshSnapshot?.pageTitle ?: pageTitle,
+                                                domVideoUrls = (freshSnapshot?.domCandidateUrls.orEmpty() + domUrls).distinct(),
+                                                sniffedVideoUrls = sniffedVideos,
+                                                sniffedAudioUrls = sniffedAudios,
+                                                snapshot = freshSnapshot,
+                                                interceptedMedia = capturedIntercepted,
+                                            )
+                                        }
                                     }
                                 },
+                                onSelectCandidate = vaultViewModel::downloadSelectedCandidate,
                                 onCancelDownload = vaultViewModel::cancelBrowserDownload,
                                 onDismissStatus = vaultViewModel::dismissBrowserDownloadStatus,
                             )

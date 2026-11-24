@@ -79,13 +79,15 @@ import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.util.formatTransferSpeed
+import com.example.vault.browser.ResolvedMediaCandidate
+import com.example.vault.browser.VideoElementTelemetry
 import com.example.vault.data.VaultBrowserDownloadPhase
 import com.example.vault.data.VaultBrowserDownloadState
 import kotlin.math.roundToInt
 
 /**
  * Floating, draggable Blackhole download sphere overlaid on top of the Vault Private Browser.
- * Tapping it captures the video from the active web page in highest quality and stores it
+ * Tapping it captures the active playing video from the web page in highest quality and stores it
  * directly encrypted (AES-256) inside the Vault Videos folder.
  */
 @Composable
@@ -97,6 +99,8 @@ fun FloatingBlackholeDownloadOverlay(
     onCancelDownload: () -> Unit,
     onDismissStatus: () -> Unit,
     modifier: Modifier = Modifier,
+    activeDetectedVideo: VideoElementTelemetry? = null,
+    onSelectCandidate: (ResolvedMediaCandidate) -> Unit = {},
 ) {
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
@@ -137,12 +141,18 @@ fun FloatingBlackholeDownloadOverlay(
     val primaryGlow = when (downloadState.phase) {
         VaultBrowserDownloadPhase.COMPLETED -> EmeraldPulse
         VaultBrowserDownloadPhase.ERROR -> CrimsonAlert
+        VaultBrowserDownloadPhase.CANDIDATE_PICKER -> PlasmaViolet
+        VaultBrowserDownloadPhase.INSPECTING,
         VaultBrowserDownloadPhase.EXTRACTING,
         VaultBrowserDownloadPhase.DOWNLOADING,
         VaultBrowserDownloadPhase.MERGING,
         VaultBrowserDownloadPhase.ENCRYPTING,
         -> NeonCyan
-        VaultBrowserDownloadPhase.IDLE -> if (sniffedCandidatesCount > 0 || isPageActive) NeonCyan else ElectricBlue
+        VaultBrowserDownloadPhase.IDLE -> when {
+            activeDetectedVideo != null && !activeDetectedVideo.isLikelyAd -> EmeraldPulse
+            sniffedCandidatesCount > 0 || isPageActive -> NeonCyan
+            else -> ElectricBlue
+        }
     }
     val secondaryGlow = when (downloadState.phase) {
         VaultBrowserDownloadPhase.COMPLETED -> NeonCyan
@@ -175,7 +185,58 @@ fun FloatingBlackholeDownloadOverlay(
         val resolvedX = (if (offsetX < 0f) maxX else offsetX).coerceIn(minX, maxX)
         val resolvedY = (if (offsetY < 0f) maxY else offsetY).coerceIn(minY, maxY)
 
-        // Top compact telemetry pill whenever downloading, completed, or reporting status
+        // Active detected <video> telemetry indicator when idle on a live page
+        val showActiveVideoBadge = downloadState.phase == VaultBrowserDownloadPhase.IDLE &&
+            isPageActive &&
+            activeDetectedVideo != null &&
+            !activeDetectedVideo.isLikelyAd
+        AnimatedVisibility(
+            visible = showActiveVideoBadge,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            val video = activeDetectedVideo
+            if (video != null) {
+                Surface(
+                    color = Color(0xFF0A111D).copy(alpha = 0.88f),
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(0.75.dp, EmeraldPulse.copy(alpha = 0.55f)),
+                    modifier = Modifier.testTag("vault_browser_active_video_indicator"),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(if (!video.paused && video.isAdvancing) EmeraldPulse else NeonCyan),
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        val resPart = video.resolutionLabel.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
+                        val modePart = when {
+                            video.isBlobOrMediaSource -> " · MSE/HLS"
+                            !video.paused && video.isAdvancing -> " · قيد التشغيل"
+                            else -> ""
+                        }
+                        Text(
+                            text = "فيديو نشط$resPart$modePart",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            ),
+                            color = ChromeSilver,
+                        )
+                    }
+                }
+            }
+        }
+
+        // Top compact telemetry pill OR CandidatePicker whenever resolving/downloading/reporting status
         AnimatedVisibility(
             visible = downloadState.phase != VaultBrowserDownloadPhase.IDLE,
             enter = fadeIn(),
@@ -278,7 +339,61 @@ fun FloatingBlackholeDownloadOverlay(
                         }
                     }
 
-                    if (downloadState.isActive) {
+                    if (downloadState.phase == VaultBrowserDownloadPhase.CANDIDATE_PICKER &&
+                        downloadState.pickerCandidates.isNotEmpty()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            downloadState.pickerCandidates.forEachIndexed { idx, cand ->
+                                Surface(
+                                    color = Color(0xFF121C2E),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(0.75.dp, NeonCyan.copy(alpha = 0.35f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable { onSelectCandidate(cand) }
+                                        .testTag("vault_browser_candidate_pick_$idx"),
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = cand.stream.title.ifBlank { "فيديو #${idx + 1}" },
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                                color = ChromeSilver,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            Text(
+                                                text = "${cand.stream.qualityLabel} · ${if (cand.stream.isHls) "HLS" else "MP4"} · ${cand.matchReason}",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                                color = NeonCyan,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Icon(
+                                            imageVector = Icons.Rounded.ArrowDownward,
+                                            contentDescription = "تحميل هذا الفيديو",
+                                            tint = EmeraldPulse,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else if (downloadState.isActive) {
                         LinearProgressIndicator(
                             progress = { smoothProgress.coerceAtLeast(0.05f) },
                             color = primaryGlow,
@@ -412,13 +527,19 @@ fun FloatingBlackholeDownloadOverlay(
                             modifier = Modifier.size(22.dp),
                         )
                     }
+                    VaultBrowserDownloadPhase.INSPECTING,
                     VaultBrowserDownloadPhase.EXTRACTING,
                     VaultBrowserDownloadPhase.DOWNLOADING,
                     VaultBrowserDownloadPhase.MERGING,
                     VaultBrowserDownloadPhase.ENCRYPTING,
                     -> {
+                        val pctLabel = if (phase == VaultBrowserDownloadPhase.INSPECTING) {
+                            "•••"
+                        } else {
+                            "${(smoothProgress * 100f).roundToInt()}%"
+                        }
                         Text(
-                            text = "${(smoothProgress * 100f).roundToInt()}%",
+                            text = pctLabel,
                             style = MaterialTheme.typography.labelSmall.copy(
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,

@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.TypedValue
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -63,6 +64,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalContext
@@ -218,13 +221,24 @@ private fun BlackholeScreenContent(
                 .fillMaxSize()
                 .background(ObsidianVoid),
         ) {
+            val context = LocalContext.current
             val density = LocalDensity.current
             val maxHeightPx = remember(maxHeight, density) {
                 with(density) { maxHeight.toPx().coerceAtLeast(1f) }
             }
+            // Exact physical 0.5 cm (5 mm) dead zone at the bottom edge of the screen
+            val bottomEdgeExclusionPx = remember(context, density) {
+                TypedValue.applyDimension(
+                    TypedValue.COMPLEX_UNIT_MM,
+                    5f,
+                    context.resources.displayMetrics,
+                ).takeIf { it > 0f } ?: with(density) { 31.5.dp.toPx() }
+            }
 
             var liveDragProgress by remember { mutableFloatStateOf(0f) }
             var dragStartedOpen by remember { mutableStateOf(false) }
+            var lastPointerDownY by remember { mutableFloatStateOf(-1f) }
+            var ignoreBottomEdgeDrag by remember { mutableStateOf(false) }
 
             val snapDrawer: (Boolean) -> Unit = remember(coroutineScope) {
                 { shouldOpen ->
@@ -273,10 +287,13 @@ private fun BlackholeScreenContent(
             }
 
             val scrollState = rememberScrollState()
-            val homeNestedScroll = remember(maxHeightPx, scrollState) {
+            val homeNestedScroll = remember(maxHeightPx, scrollState, bottomEdgeExclusionPx) {
                 object : NestedScrollConnection {
                     override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                         if (source != NestedScrollSource.UserInput) return Offset.Zero
+                        val startedInBottomDeadZone = drawerProgress.value <= 0.001f &&
+                            lastPointerDownY >= (maxHeightPx - bottomEdgeExclusionPx)
+                        if (startedInBottomDeadZone) return Offset.Zero
                         val atBottom = scrollState.maxValue == 0 || scrollState.value >= scrollState.maxValue
                         if (drawerProgress.value > 0.001f || (available.y < 0f && atBottom)) {
                             applyDragDeltaPx(available.y)
@@ -305,22 +322,48 @@ private fun BlackholeScreenContent(
                         scaleY = scale
                         alpha = 1f - 0.42f * p
                     }
-                    .pointerInput(maxHeightPx) {
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val downChange = event.changes.firstOrNull { it.changedToDownIgnoreConsumed() }
+                                if (downChange != null) {
+                                    lastPointerDownY = downChange.position.y
+                                }
+                            }
+                        }
+                    }
+                    .pointerInput(maxHeightPx, bottomEdgeExclusionPx) {
                         val velocityTracker = VelocityTracker()
                         detectVerticalDragGestures(
-                            onDragStart = {
+                            onDragStart = { startOffset ->
                                 velocityTracker.resetTracking()
-                                beginDrag()
+                                val originY = if (lastPointerDownY >= 0f) lastPointerDownY else startOffset.y
+                                val blockedAtBottomEdge = drawerProgress.value <= 0.001f &&
+                                    originY >= (maxHeightPx - bottomEdgeExclusionPx)
+                                ignoreBottomEdgeDrag = blockedAtBottomEdge
+                                if (!blockedAtBottomEdge) {
+                                    beginDrag()
+                                }
                             },
                             onVerticalDrag = { change, dragAmount ->
+                                if (ignoreBottomEdgeDrag) return@detectVerticalDragGestures
                                 change.consume()
                                 velocityTracker.addPosition(change.uptimeMillis, change.position)
                                 applyDragDeltaPx(dragAmount)
                             },
                             onDragEnd = {
+                                if (ignoreBottomEdgeDrag) {
+                                    ignoreBottomEdgeDrag = false
+                                    return@detectVerticalDragGestures
+                                }
                                 finishDragWithVelocity(velocityTracker.calculateVelocity().y)
                             },
                             onDragCancel = {
+                                if (ignoreBottomEdgeDrag) {
+                                    ignoreBottomEdgeDrag = false
+                                    return@detectVerticalDragGestures
+                                }
                                 finishDragWithVelocity(0f)
                             },
                         )

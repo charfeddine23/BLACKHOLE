@@ -17,6 +17,9 @@ import com.example.vault.data.VaultCategory
 import com.example.vault.data.VaultCipher
 import com.example.vault.data.VaultFileEntry
 import com.example.vault.data.VaultStorageMode
+import com.example.vault.browser.InterceptedMediaRequest
+import com.example.vault.browser.ResolvedMediaCandidate
+import com.example.vault.browser.VaultWebSnapshot
 import com.example.vault.data.VaultTempShareHelper
 import com.example.vault.data.VaultTransferStage
 import kotlinx.coroutines.CancellationException
@@ -210,6 +213,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         domVideoUrls: List<String> = emptyList(),
         sniffedVideoUrls: List<String> = emptyList(),
         sniffedAudioUrls: List<String> = emptyList(),
+        snapshot: VaultWebSnapshot? = null,
+        interceptedMedia: List<InterceptedMediaRequest> = emptyList(),
     ) {
         if (_uiState.value.isLocked || browserDownloadJob?.isActive == true) return
         browserDownloadCancelled.set(false)
@@ -221,6 +226,44 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     domVideoUrls = domVideoUrls,
                     sniffedVideoUrls = sniffedVideoUrls,
                     sniffedAudioUrls = sniffedAudioUrls,
+                    snapshot = snapshot,
+                    interceptedMedia = interceptedMedia,
+                    isCancelled = { browserDownloadCancelled.get() },
+                    onState = { dlState ->
+                        _uiState.update { it.copy(browserDownloadState = dlState) }
+                    },
+                )
+                if (ok) {
+                    refreshEntries()
+                    delay(4_000L)
+                    if (_uiState.value.browserDownloadState.phase == VaultBrowserDownloadPhase.COMPLETED) {
+                        _uiState.update { it.copy(browserDownloadState = VaultBrowserDownloadState()) }
+                    }
+                }
+            } catch (_: CancellationException) {
+                _uiState.update {
+                    it.copy(
+                        browserDownloadState = VaultBrowserDownloadState(
+                            phase = VaultBrowserDownloadPhase.IDLE,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun downloadSelectedCandidate(candidate: ResolvedMediaCandidate) {
+        if (_uiState.value.isLocked || browserDownloadJob?.isActive == true) return
+        val currentDlState = _uiState.value.browserDownloadState
+        val pageUrl = currentDlState.activePageUrl.ifBlank { candidate.stream.streamUrl }
+        val pageTitle = currentDlState.title.takeIf { it.isNotBlank() } ?: candidate.stream.title
+        browserDownloadCancelled.set(false)
+        browserDownloadJob = viewModelScope.launch {
+            try {
+                val ok = browserDownloadEngine.downloadResolvedCandidateToVault(
+                    candidate = candidate,
+                    pageUrl = pageUrl,
+                    pageTitle = pageTitle,
                     isCancelled = { browserDownloadCancelled.get() },
                     onState = { dlState ->
                         _uiState.update { it.copy(browserDownloadState = dlState) }

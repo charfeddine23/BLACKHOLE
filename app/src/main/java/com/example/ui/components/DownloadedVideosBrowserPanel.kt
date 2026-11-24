@@ -167,6 +167,9 @@ import com.example.data.local.BrowserSearchEngine
 import com.example.data.local.SiteLogoFetcher
 import com.example.engine.network.ClientSpoofer
 import com.example.engine.network.CloudflareDnsVpnService
+import com.example.vault.browser.InterceptedMediaRequest
+import com.example.vault.browser.VaultWebSnapshot
+import com.example.vault.browser.VaultWebViewMonitor
 import org.json.JSONObject
 import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.AmberWarning
@@ -377,11 +380,14 @@ fun DownloadedVideosBrowserPanel(
     exitButtonLabel: String = "VIDEOS",
     onBeforeExternalFlow: () -> Unit = {},
     onDirectDownloadIntercepted: ((url: String, mimeType: String?) -> Boolean)? = null,
+    webViewMonitor: VaultWebViewMonitor = remember { VaultWebViewMonitor() },
     onPullCurrentPageWithMedia: ((
         pageUrl: String,
         activeWebView: WebView?,
         sniffedVideoUrls: List<String>,
         sniffedAudioUrls: List<String>,
+        snapshot: VaultWebSnapshot?,
+        interceptedMedia: List<InterceptedMediaRequest>,
     ) -> Unit)? = null,
     viewportOverlayContent: @Composable BoxScope.(
         currentPageUrl: String,
@@ -389,7 +395,8 @@ fun DownloadedVideosBrowserPanel(
         activeWebView: WebView?,
         sniffedVideoUrls: List<String>,
         sniffedAudioUrls: List<String>,
-    ) -> Unit = { _, _, _, _, _ -> },
+        getInterceptedMedia: () -> List<InterceptedMediaRequest>,
+    ) -> Unit = { _, _, _, _, _, _ -> },
 ) {
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
@@ -503,12 +510,17 @@ fun DownloadedVideosBrowserPanel(
         if (!isUrlFocused) {
             addressText = if (activeTab.isHome) "" else activeTab.url
         }
-        if (activeTab.isHome && activeSubTray == BrowserSubTray.FIND) {
-            activeSubTray = null
+        if (activeTab.isHome) {
+            webViewMonitor.clearActiveTelemetry()
+            if (activeSubTray == BrowserSubTray.FIND) {
+                activeSubTray = null
+            }
+        } else {
+            webViewMonitor.injectMonitor(activeWebView)
         }
     }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(webViewMonitor) {
         onDispose {
             runCatching { customViewCallback?.onCustomViewHidden() }
             customFullscreenView = null
@@ -523,8 +535,10 @@ fun DownloadedVideosBrowserPanel(
                 }
             }
             onBindWebViewRef(null)
-            webViews.values.forEach { wv ->
+            webViews.forEach { (id, wv) ->
                 runCatching {
+                    webViewMonitor.detachFrom(wv)
+                    webViewMonitor.clearTab(id)
                     wv.stopLoading()
                     wv.destroy()
                 }
@@ -705,7 +719,7 @@ fun DownloadedVideosBrowserPanel(
         val targetUrl = resolveTopBarDownloadUrl()
         if (targetUrl.isNullOrBlank()) {
             if (onPullCurrentPageWithMedia != null) {
-                onPullCurrentPageWithMedia("", null, emptyList(), emptyList())
+                onPullCurrentPageWithMedia("", null, emptyList(), emptyList(), null, emptyList())
             } else {
                 localStatusBanner = "أدخل رابط الفيديو في الشريط بالأعلى أو افتح صفحة أولاً"
             }
@@ -716,18 +730,34 @@ fun DownloadedVideosBrowserPanel(
         addressText = targetUrl
         onAutoSyncCookies(targetUrl)
 
-        val loadedUrl = webViews[activeTab.id]?.url?.takeIf { it.startsWith("http", ignoreCase = true) }
+        val tabId = activeTab.id
+        val loadedUrl = webViews[tabId]?.url?.takeIf { it.startsWith("http", ignoreCase = true) }
             ?: activeTab.url.takeIf { it.startsWith("http", ignoreCase = true) }
         val matchesLiveWebView = !activeTab.isHome &&
             activeWebView != null &&
             urlsMatchSamePage(targetUrl, loadedUrl)
 
         val matchedWebView = if (matchesLiveWebView) activeWebView else null
-        val sniffedVideos = if (matchesLiveWebView) sniffedVideoUrlsByTab[activeTab.id].orEmpty() else emptyList()
-        val sniffedAudios = if (matchesLiveWebView) sniffedAudioUrlsByTab[activeTab.id].orEmpty() else emptyList()
+        val sniffedVideos = if (matchesLiveWebView) sniffedVideoUrlsByTab[tabId].orEmpty() else emptyList()
+        val sniffedAudios = if (matchesLiveWebView) sniffedAudioUrlsByTab[tabId].orEmpty() else emptyList()
+        val intercepted = if (matchesLiveWebView) webViewMonitor.getInterceptedRequests(tabId) else emptyList()
 
         if (onPullCurrentPageWithMedia != null) {
-            onPullCurrentPageWithMedia(targetUrl, matchedWebView, sniffedVideos, sniffedAudios)
+            coroutineScope.launch {
+                val snapshot = if (matchedWebView != null) {
+                    webViewMonitor.captureFreshSnapshot(matchedWebView, targetUrl)
+                } else {
+                    null
+                }
+                onPullCurrentPageWithMedia(
+                    targetUrl,
+                    matchedWebView,
+                    sniffedVideos,
+                    sniffedAudios,
+                    snapshot,
+                    intercepted,
+                )
+            }
         } else {
             onPullCurrentPage(targetUrl)
         }
@@ -738,8 +768,10 @@ fun DownloadedVideosBrowserPanel(
         val removed = tabs[index]
         sniffedVideoUrlsByTab.remove(removed.id)
         sniffedAudioUrlsByTab.remove(removed.id)
+        webViewMonitor.clearTab(removed.id)
         webViews.remove(removed.id)?.let { wv ->
             runCatching {
+                webViewMonitor.detachFrom(wv)
                 wv.stopLoading()
                 wv.destroy()
             }
@@ -1350,6 +1382,8 @@ fun DownloadedVideosBrowserPanel(
                                         }
                                         val reqUrl = request?.url?.toString().orEmpty()
                                         if (reqUrl.isNotBlank()) {
+                                            val activePage = tabs.firstOrNull { it.id == tabId }?.url.orEmpty()
+                                            webViewMonitor.recordInterceptedRequest(tabId, request, activePage)
                                             when {
                                                 isInterceptableAudioStream(reqUrl) -> {
                                                     view?.post {
@@ -1434,6 +1468,7 @@ fun DownloadedVideosBrowserPanel(
                                         super.onPageStarted(view, url, favicon)
                                         sniffedVideoUrlsByTab.remove(tabId)
                                         sniffedAudioUrlsByTab.remove(tabId)
+                                        webViewMonitor.resetForNavigation(tabId)
                                         if (!url.isNullOrBlank()) {
                                             updateTabById(tabId) {
                                                 it.copy(
@@ -1443,6 +1478,7 @@ fun DownloadedVideosBrowserPanel(
                                                 )
                                             }
                                         }
+                                        webViewMonitor.injectMonitor(view)
                                     }
 
                                     override fun doUpdateVisitedHistory(
@@ -1462,6 +1498,7 @@ fun DownloadedVideosBrowserPanel(
                                             if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
                                                 addressText = url
                                             }
+                                            webViewMonitor.injectMonitor(view)
                                         }
                                     }
 
@@ -1520,6 +1557,7 @@ fun DownloadedVideosBrowserPanel(
                                             if (isDesktopMode) DESKTOP_VIEWPORT_JS else UNLOCK_VIEWPORT_JS,
                                             null,
                                         )
+                                        webViewMonitor.injectMonitor(view)
                                     }
                                 }
 
@@ -1584,6 +1622,7 @@ fun DownloadedVideosBrowserPanel(
                                 }
 
                                 webViews[tabId] = this
+                                webViewMonitor.attachTo(this)
                                 onBindWebViewRef(this)
                                 loadUrl(activeTab.url)
                             }
@@ -1639,6 +1678,13 @@ fun DownloadedVideosBrowserPanel(
                 if (overlayMatchesWebView) activeWebView else null,
                 if (overlayMatchesWebView) sniffedVideoUrlsByTab[activeTab.id].orEmpty() else emptyList(),
                 if (overlayMatchesWebView) sniffedAudioUrlsByTab[activeTab.id].orEmpty() else emptyList(),
+                {
+                    if (overlayMatchesWebView) {
+                        webViewMonitor.getInterceptedRequests(activeTab.id)
+                    } else {
+                        emptyList()
+                    }
+                },
             )
         }
 

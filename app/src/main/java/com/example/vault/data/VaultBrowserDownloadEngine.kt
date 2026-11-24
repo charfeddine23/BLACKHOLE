@@ -16,6 +16,12 @@ import com.example.engine.model.ExtractionResult
 import com.example.engine.model.PlatformBadge
 import com.example.engine.network.ClientSpoofer
 import com.example.util.formatQualityLabel
+import com.example.vault.browser.CandidateResolutionOutcome
+import com.example.vault.browser.InterceptedMediaKind
+import com.example.vault.browser.InterceptedMediaRequest
+import com.example.vault.browser.MediaCandidateResolver
+import com.example.vault.browser.ResolvedMediaCandidate
+import com.example.vault.browser.VaultWebSnapshot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -27,6 +33,8 @@ import java.util.concurrent.atomic.AtomicLong
 
 enum class VaultBrowserDownloadPhase {
     IDLE,
+    INSPECTING,
+    CANDIDATE_PICKER,
     EXTRACTING,
     DOWNLOADING,
     MERGING,
@@ -44,9 +52,12 @@ data class VaultBrowserDownloadState(
     val totalBytes: Long = -1L,
     val speedBytesPerSec: Long = 0L,
     val message: String? = null,
+    val activePageUrl: String = "",
+    val pickerCandidates: List<ResolvedMediaCandidate> = emptyList(),
 ) {
     val isActive: Boolean
-        get() = phase == VaultBrowserDownloadPhase.EXTRACTING ||
+        get() = phase == VaultBrowserDownloadPhase.INSPECTING ||
+            phase == VaultBrowserDownloadPhase.EXTRACTING ||
             phase == VaultBrowserDownloadPhase.DOWNLOADING ||
             phase == VaultBrowserDownloadPhase.MERGING ||
             phase == VaultBrowserDownloadPhase.ENCRYPTING
@@ -73,15 +84,23 @@ class VaultBrowserDownloadEngine(
         streamExtractor = extractor,
     ),
     private val hlsDownloader: HlsSegmentDownloader = HlsSegmentDownloader(okHttpClient),
+    private val candidateResolver: MediaCandidateResolver = MediaCandidateResolver(
+        okHttpClient = okHttpClient,
+        extractor = extractor,
+        universalDownloader = universalDownloader,
+        cookieVault = cookieVault,
+    ),
 ) {
     private val appContext = context.applicationContext
 
     suspend fun downloadPageVideoToVault(
         pageUrl: String,
-        pageTitle: String?,
-        domVideoUrls: List<String>,
-        sniffedVideoUrls: List<String>,
-        sniffedAudioUrls: List<String>,
+        pageTitle: String? = null,
+        domVideoUrls: List<String> = emptyList(),
+        sniffedVideoUrls: List<String> = emptyList(),
+        sniffedAudioUrls: List<String> = emptyList(),
+        snapshot: VaultWebSnapshot? = null,
+        interceptedMedia: List<InterceptedMediaRequest> = emptyList(),
         isCancelled: () -> Boolean,
         onState: (VaultBrowserDownloadState) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
@@ -98,63 +117,118 @@ class VaultBrowserDownloadEngine(
             return@withContext false
         }
 
+        val resolvedPageTitle = snapshot?.pageTitle?.takeIf { it.isNotBlank() } ?: pageTitle
+
         onState(
             VaultBrowserDownloadState(
-                phase = VaultBrowserDownloadPhase.EXTRACTING,
-                title = pageTitle?.takeIf { it.isNotBlank() } ?: "",
-                message = "جاري البحث عن الفيديو بأعلى جودة...",
+                phase = VaultBrowserDownloadPhase.INSPECTING,
+                title = resolvedPageTitle?.takeIf { it.isNotBlank() } ?: "",
+                activePageUrl = cleanPageUrl,
+                message = "جاري فحص الفيديو النشط ومطابقة روابط البث بأعلى جودة...",
             ),
         )
 
         // Capture any fresh login/session cookies from the live WebView before making HTTP requests
         runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
 
-        val platform = PlatformBadge.fromUrl(cleanPageUrl)
-        val routedOutcome = runCatching { universalDownloader.routeAndExtract(cleanPageUrl) }.getOrNull()
-        val routedStreams = when (val res = routedOutcome?.result) {
-            is ExtractionResult.Success -> res.candidates.ifEmpty { listOf(res.bestStream) }
-            else -> emptyList()
-        }
-
-        // Probe live WebView DOM + intercepted network URLs as universal fallback/upgrade
-        val liveSniffedStreams = probeLiveCapturedMedia(
-            pageUrl = routedOutcome?.canonicalUrl ?: cleanPageUrl,
-            pageTitle = pageTitle,
-            platform = routedOutcome?.platform ?: platform,
-            candidateUrls = (domVideoUrls + sniffedVideoUrls).distinct().take(16),
-            audioUrls = sniffedAudioUrls.distinct(),
+        val resolution = candidateResolver.resolve(
+            targetPageUrl = cleanPageUrl,
+            snapshot = snapshot ?: VaultWebSnapshot(
+                pageUrl = cleanPageUrl,
+                pageTitle = resolvedPageTitle,
+                domCandidateUrls = domVideoUrls,
+            ),
+            interceptedMedia = interceptedMedia,
+            extraSniffedVideos = (domVideoUrls + sniffedVideoUrls).distinct(),
+            extraSniffedAudios = sniffedAudioUrls.distinct(),
         )
 
-        val combinedCandidates = extractor.rankBestStreams(routedStreams + liveSniffedStreams)
-            .take(6)
-
-        if (combinedCandidates.isEmpty()) {
-            val errorMsg = when (val res = routedOutcome?.result) {
-                is ExtractionResult.NeedsAuth ->
-                    "يتطلب هذا الفيديو تسجيل الدخول في المتصفح ثم الضغط مجدداً على دائرة الثقب الأسود."
-                is ExtractionResult.Error ->
-                    "تعذر العثور على فيديو قابل للتحميل في هذه الصفحة — شغّل الفيديو أولاً ثم اضغط الدائرة."
-                else ->
-                    "لم يتم رصد أي رابط فيديو في الصفحة الحالية — شغّل الفيديو لثانية ثم حاول."
+        val candidatesToDownload: List<ExtractedStream> = when (resolution) {
+            is CandidateResolutionOutcome.NeedsPicker -> {
+                onState(
+                    VaultBrowserDownloadState(
+                        phase = VaultBrowserDownloadPhase.CANDIDATE_PICKER,
+                        title = resolvedPageTitle?.takeIf { it.isNotBlank() } ?: "",
+                        activePageUrl = cleanPageUrl,
+                        pickerCandidates = resolution.candidates,
+                        message = "تم رصد عدة مقاطع فيديو — اختر الفيديو المطلوب تحميله:",
+                    ),
+                )
+                return@withContext false
             }
-            onState(
-                VaultBrowserDownloadState(
-                    phase = VaultBrowserDownloadPhase.ERROR,
-                    message = errorMsg,
-                ),
-            )
-            return@withContext false
+            is CandidateResolutionOutcome.NeedsAuth -> {
+                onState(
+                    VaultBrowserDownloadState(
+                        phase = VaultBrowserDownloadPhase.ERROR,
+                        activePageUrl = cleanPageUrl,
+                        message = resolution.reason,
+                    ),
+                )
+                return@withContext false
+            }
+            is CandidateResolutionOutcome.Failed -> {
+                onState(
+                    VaultBrowserDownloadState(
+                        phase = VaultBrowserDownloadPhase.ERROR,
+                        activePageUrl = cleanPageUrl,
+                        message = resolution.reason,
+                    ),
+                )
+                return@withContext false
+            }
+            is CandidateResolutionOutcome.Resolved -> {
+                listOf(resolution.primary.stream) + resolution.fallbacks.map { it.stream }
+            }
         }
 
-        val fallbackAudioUrl = combinedCandidates.firstNotNullOfOrNull { it.audioStreamUrl }
+        val fallbackAudioUrl = candidatesToDownload.firstNotNullOfOrNull { it.audioStreamUrl }
+            ?: interceptedMedia.firstOrNull { !it.isLikelyAd && it.mediaKind == InterceptedMediaKind.AUDIO_STREAM }?.url
             ?: sniffedAudioUrls.firstOrNull()
 
+        executeDownloadPipeline(
+            cleanPageUrl = cleanPageUrl,
+            pageTitle = resolvedPageTitle,
+            combinedCandidates = candidatesToDownload,
+            fallbackAudioUrl = fallbackAudioUrl,
+            isCancelled = isCancelled,
+            onState = onState,
+        )
+    }
+
+    suspend fun downloadResolvedCandidateToVault(
+        candidate: ResolvedMediaCandidate,
+        pageUrl: String,
+        pageTitle: String? = null,
+        fallbackAudioUrl: String? = null,
+        isCancelled: () -> Boolean,
+        onState: (VaultBrowserDownloadState) -> Unit,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val cleanPageUrl = pageUrl.trim().ifBlank { candidate.stream.streamUrl }
+        runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
+        executeDownloadPipeline(
+            cleanPageUrl = cleanPageUrl,
+            pageTitle = pageTitle,
+            combinedCandidates = listOf(candidate.stream),
+            fallbackAudioUrl = fallbackAudioUrl ?: candidate.stream.audioStreamUrl,
+            isCancelled = isCancelled,
+            onState = onState,
+        )
+    }
+
+    private suspend fun executeDownloadPipeline(
+        cleanPageUrl: String,
+        pageTitle: String?,
+        combinedCandidates: List<ExtractedStream>,
+        fallbackAudioUrl: String?,
+        isCancelled: () -> Boolean,
+        onState: (VaultBrowserDownloadState) -> Unit,
+    ): Boolean {
         val stagingRoot = File(appContext.cacheDir, "vault_browser_dl").apply {
             mkdirs()
             listFiles()?.forEach { runCatching { it.deleteRecursively() } }
         }
 
-        try {
+        return try {
             var completed = false
             for ((index, candidate) in combinedCandidates.withIndex()) {
                 if (isCancelled()) throw CancellationException("Cancelled")
@@ -167,9 +241,12 @@ class VaultBrowserDownloadEngine(
                 val extension = if (candidate.isHls) "mp4" else extensionForMime(candidate.mimeType)
                 val stagingFile = File(stagingRoot, "${resolvedTitle}_${System.currentTimeMillis()}.$extension")
 
+                val liveCookie = runCatching { CookieManager.getInstance().getCookie(candidate.streamUrl) }.getOrNull()
+                    ?: runCatching { CookieManager.getInstance().getCookie(cleanPageUrl) }.getOrNull()
+                val cookieOverride = if (!liveCookie.isNullOrBlank()) mapOf("Cookie" to liveCookie) else emptyMap()
                 val mergedHeaders = ClientSpoofer.buildDownloadHeaders(
                     streamUrl = candidate.streamUrl,
-                    streamHeaders = candidate.headers + mapOf("Referer" to cleanPageUrl),
+                    streamHeaders = candidate.headers + mapOf("Referer" to cleanPageUrl) + cookieOverride,
                 )
 
                 onState(
@@ -333,79 +410,6 @@ class VaultBrowserDownloadEngine(
         } finally {
             runCatching { stagingRoot.deleteRecursively() }
         }
-    }
-
-    private fun probeLiveCapturedMedia(
-        pageUrl: String,
-        pageTitle: String?,
-        platform: PlatformBadge,
-        candidateUrls: List<String>,
-        audioUrls: List<String>,
-    ): List<ExtractedStream> {
-        if (candidateUrls.isEmpty()) return emptyList()
-        val out = mutableListOf<ExtractedStream>()
-        val fallbackAudio = audioUrls.firstOrNull()
-        val webViewCookie = runCatching { CookieManager.getInstance().getCookie(pageUrl) }.getOrNull()
-        val headers = ClientSpoofer.buildHeadersForUrl(
-            targetUrl = pageUrl,
-            profile = ClientSpoofer.profiles.first(),
-            refererOverride = pageUrl,
-        ).toMutableMap().apply {
-            if (!webViewCookie.isNullOrBlank()) {
-                put("Cookie", webViewCookie)
-            }
-        }
-
-        for (rawUrl in candidateUrls) {
-            if (!rawUrl.startsWith("http://", ignoreCase = true) &&
-                !rawUrl.startsWith("https://", ignoreCase = true)
-            ) {
-                continue
-            }
-            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(rawUrl)) continue
-
-            val probed = extractor.probeDirectMediaOrHls(rawUrl, platform, headers)
-            if (probed != null) {
-                if (probed.estimatedBytes in 1L..16_383L) continue
-                val needsAudio = fallbackAudio != null && !probed.isHls && (
-                    rawUrl.contains("mime=video", ignoreCase = true) ||
-                        platform == PlatformBadge.YOUTUBE ||
-                        MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(rawUrl) ||
-                        ((platform == PlatformBadge.INSTAGRAM || platform == PlatformBadge.FACEBOOK) &&
-                            !MetaVideoPowerExtractor.isMetaProgressiveUrl(rawUrl))
-                    )
-                out.add(
-                    probed.copy(
-                        title = pageTitle?.takeIf { it.isNotBlank() } ?: probed.title,
-                        headers = headers,
-                        audioStreamUrl = if (needsAudio) fallbackAudio else probed.audioStreamUrl,
-                    ),
-                )
-            } else if (extractor.looksLikeHlsUrl(rawUrl) || extractor.looksLikeDownloadableVideoUrl(rawUrl)) {
-                val isHls = extractor.looksLikeHlsUrl(rawUrl)
-                val height = extractor.inferResolutionHeight(rawUrl)
-                val needsAudio = !isHls && fallbackAudio != null && (
-                    rawUrl.contains("mime=video", ignoreCase = true) ||
-                        platform == PlatformBadge.YOUTUBE ||
-                        MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(rawUrl)
-                    )
-                out.add(
-                    ExtractedStream(
-                        streamUrl = rawUrl,
-                        title = pageTitle?.takeIf { it.isNotBlank() } ?: extractor.deriveTitleFromUrl(pageUrl),
-                        platform = platform,
-                        qualityLabel = formatQualityLabel(height),
-                        resolutionHeight = height,
-                        mimeType = if (isHls) "application/vnd.apple.mpegurl" else extractor.resolveMimeType("", rawUrl),
-                        estimatedBytes = -1L,
-                        headers = headers,
-                        audioStreamUrl = if (needsAudio) fallbackAudio else null,
-                        isHls = isHls,
-                    ),
-                )
-            }
-        }
-        return extractor.expandHlsCandidates(out)
     }
 
     private suspend fun downloadHlsToStaging(
