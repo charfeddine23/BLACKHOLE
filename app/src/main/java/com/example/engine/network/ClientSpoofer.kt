@@ -27,62 +27,20 @@ object ClientSpoofer {
 
     val profiles: List<SpoofedClientProfile> = listOf(
         SpoofedClientProfile(
-            id = "CHROME_DESKTOP",
-            userAgent = CHROME_DESKTOP_USER_AGENT,
-            extraHeaders = mapOf(
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8",
-                "Accept-Language" to "en-US,en;q=0.9",
-                "Sec-CH-UA" to "\"Chromium\";v=\"133\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"133\"",
-                "Sec-CH-UA-Mobile" to "?0",
-                "Sec-CH-UA-Platform" to "\"Windows\"",
-                "Sec-Fetch-Dest" to "document",
-                "Sec-Fetch-Mode" to "navigate",
-                "Sec-Fetch-Site" to "none",
-                "Upgrade-Insecure-Requests" to "1",
-            ),
-        ),
-        SpoofedClientProfile(
             id = "ANDROID_CHROME",
             userAgent = ANDROID_CHROME_USER_AGENT,
             extraHeaders = mapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.9",
-                "Sec-CH-UA" to "\"Chromium\";v=\"133\", \"Google Chrome\";v=\"133\"",
+                "Sec-CH-UA" to "\"Chromium\";v=\"131\", \"Google Chrome\";v=\"131\"",
                 "Sec-CH-UA-Mobile" to "?1",
                 "Sec-CH-UA-Platform" to "\"Android\"",
             ),
         ),
-        SpoofedClientProfile(
-            id = "SAFARI_IOS_MOBILE",
-            userAgent = TIKTOK_IOS_USER_AGENT,
-            extraHeaders = mapOf(
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language" to "en-US,en;q=0.9",
-            ),
-        ),
-        SpoofedClientProfile(
-            id = "EMBED_PLAYER_BOT",
-            userAgent = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-            extraHeaders = mapOf(
-                "Accept" to "*/*",
-                "Accept-Language" to "en-US,en;q=0.9",
-            ),
-        ),
     )
 
-    private val rotatingUserAgents = listOf(
-        TIKTOK_IOS_USER_AGENT,
-        CHROME_DESKTOP_USER_AGENT,
-        ANDROID_CHROME_USER_AGENT,
-    )
-
-    fun nextRotatedUserAgent(targetUrl: String): String {
-        val lower = targetUrl.lowercase()
-        if (lower.contains("tiktok.com") || lower.contains("tiktokcdn")) {
-            return TIKTOK_IOS_USER_AGENT
-        }
-        val idx = (rotationIndex.getAndIncrement() and Int.MAX_VALUE) % rotatingUserAgents.size
-        return rotatingUserAgents[idx]
+    fun nextRotatedUserAgent(@Suppress("UNUSED_PARAMETER") targetUrl: String): String {
+        return ANDROID_CHROME_USER_AGENT
     }
 
     fun refererForUrl(targetUrl: String): String {
@@ -128,19 +86,11 @@ object ClientSpoofer {
         }
 
         val headers = LinkedHashMap<String, String>()
-        headers["User-Agent"] = if (isTikTok) TIKTOK_IOS_USER_AGENT else profile.userAgent
-        if (!isTikTok) {
-            headers.putAll(profile.extraHeaders)
-        } else {
-            headers["Accept"] = "*/*"
-            headers["Accept-Language"] = "en-US,en;q=0.9"
-        }
+        headers["User-Agent"] = profile.userAgent
+        headers.putAll(profile.extraHeaders)
         headers["Referer"] = resolvedReferer
         if (!origin.isNullOrBlank()) {
             headers["Origin"] = origin
-        }
-        if (isInstagram && !lower.contains("cdninstagram")) {
-            headers["X-IG-App-ID"] = "936619743392459"
         }
         return headers
     }
@@ -149,19 +99,15 @@ object ClientSpoofer {
         streamUrl: String,
         streamHeaders: Map<String, String>,
     ): Map<String, String> {
-        val ua = streamHeaders["User-Agent"].orEmpty()
+        val sanitizedStreamHeaders = streamHeaders.filterKeys { !it.equals("Cookie", ignoreCase = true) }
+        val ua = sanitizedStreamHeaders["User-Agent"].orEmpty()
         if (ua.isNotBlank()) {
-            val out = LinkedHashMap<String, String>(streamHeaders)
+            val out = LinkedHashMap<String, String>(sanitizedStreamHeaders)
             out.putIfAbsent("Accept", "*/*")
             out.putIfAbsent("Accept-Language", "en-US,en;q=0.9")
-            val isNativeYoutubeClientUa = ua.startsWith("com.google.ios.youtube", ignoreCase = true) ||
-                ua.startsWith("com.google.android.apps.youtube", ignoreCase = true) ||
-                ua.startsWith("com.google.android.youtube", ignoreCase = true)
-            if (!isNativeYoutubeClientUa) {
-                out.putIfAbsent("Referer", refererForUrl(streamUrl))
-            }
+            out.putIfAbsent("Referer", refererForUrl(streamUrl))
             return out
         }
-        return buildHeadersForUrl(streamUrl, profiles.first()) + streamHeaders
+        return buildHeadersForUrl(streamUrl, profiles.first()) + sanitizedStreamHeaders
     }
 }

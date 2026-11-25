@@ -97,6 +97,7 @@ import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.util.formatByteSize
 import com.example.util.formatTransferSpeed
+import com.example.vault.browser.RateLimiterUiStatus
 import com.example.vault.browser.ResolvedMediaCandidate
 import com.example.vault.browser.VideoElementTelemetry
 import com.example.vault.data.VaultBrowserDownloadPhase
@@ -123,6 +124,7 @@ fun FloatingBlackholeDownloadOverlay(
     onDismissStatus: () -> Unit,
     modifier: Modifier = Modifier,
     activeDetectedVideo: VideoElementTelemetry? = null,
+    rateLimiterStatus: RateLimiterUiStatus = RateLimiterUiStatus(),
     onSelectCandidate: (ResolvedMediaCandidate) -> Unit = {},
 ) {
     val haptic = LocalHapticFeedback.current
@@ -632,12 +634,23 @@ fun FloatingBlackholeDownloadOverlay(
                         )
                     }
                     else -> {
-                        Icon(
-                            imageVector = Icons.Rounded.ArrowDownward,
-                            contentDescription = "تحميل الفيديو إلى الخزنة",
-                            tint = primaryGlow,
-                            modifier = Modifier.size(22.dp),
-                        )
+                        if (rateLimiterStatus.remainingCooldownSeconds > 0 && !downloadState.isActive) {
+                            Text(
+                                text = "${rateLimiterStatus.remainingCooldownSeconds}ث",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                ),
+                                color = if (rateLimiterStatus.isBackoffActive) CrimsonAlert else NeonCyan,
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Rounded.ArrowDownward,
+                                contentDescription = "تحميل الفيديو إلى الخزنة",
+                                tint = primaryGlow,
+                                modifier = Modifier.size(22.dp),
+                            )
+                        }
                     }
                 }
             }

@@ -2,7 +2,6 @@ package com.example.vault.data
 
 import android.content.Context
 import android.net.Uri
-import android.webkit.CookieManager
 import com.example.engine.UniversalDownloader
 import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.extractor.MetaVideoPowerExtractor
@@ -20,8 +19,10 @@ import com.example.vault.browser.CandidateResolutionOutcome
 import com.example.vault.browser.InterceptedMediaKind
 import com.example.vault.browser.InterceptedMediaRequest
 import com.example.vault.browser.MediaCandidateResolver
+import com.example.vault.browser.RequestRateLimiter
 import com.example.vault.browser.ResolvedMediaCandidate
 import com.example.vault.browser.StreamMetadataResolver
+import com.example.vault.browser.UrlSanitizer
 import com.example.vault.browser.VaultCaptureSnapshot
 import com.example.vault.browser.VaultInspectorUiState
 import com.example.vault.browser.VaultWebSnapshot
@@ -87,11 +88,13 @@ class VaultBrowserDownloadEngine(
         streamExtractor = extractor,
     ),
     private val hlsDownloader: HlsSegmentDownloader = HlsSegmentDownloader(okHttpClient),
+    private val rateLimiter: RequestRateLimiter? = null,
     private val candidateResolver: MediaCandidateResolver = MediaCandidateResolver(
         okHttpClient = okHttpClient,
         extractor = extractor,
         universalDownloader = universalDownloader,
         cookieVault = cookieVault,
+        rateLimiter = rateLimiter,
     ),
     private val backendBaseUrlProvider: () -> String = { "" },
 ) {
@@ -100,6 +103,7 @@ class VaultBrowserDownloadEngine(
         okHttpClient = okHttpClient,
         candidateResolver = candidateResolver,
         backendBaseUrlProvider = backendBaseUrlProvider,
+        rateLimiter = rateLimiter,
     )
 
     suspend fun inspectStreamMetadata(
@@ -109,12 +113,8 @@ class VaultBrowserDownloadEngine(
         extraSniffedVideos: List<String> = emptyList(),
         extraSniffedAudios: List<String> = emptyList(),
     ): VaultInspectorUiState = withContext(Dispatchers.IO) {
-        val cleanPageUrl = pageUrl.trim()
-        if (cleanPageUrl.startsWith("http://", ignoreCase = true) ||
-            cleanPageUrl.startsWith("https://", ignoreCase = true)
-        ) {
-            runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
-        }
+        val sanitized = UrlSanitizer.sanitizePublicUrl(pageUrl)
+        val cleanPageUrl = sanitized.sanitizedUrl.ifBlank { pageUrl.trim() }
         metadataResolver.inspect(
             targetUrl = cleanPageUrl,
             snapshot = snapshot,
@@ -159,11 +159,11 @@ class VaultBrowserDownloadEngine(
             ),
         )
 
-        // Capture any fresh login/session cookies from the live WebView before making HTTP requests
-        runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
+        val sanitizedPage = UrlSanitizer.sanitizePublicUrl(cleanPageUrl)
+        val publicPageUrl = sanitizedPage.sanitizedUrl.ifBlank { cleanPageUrl }
 
         val resolution = candidateResolver.resolve(
-            targetPageUrl = cleanPageUrl,
+            targetPageUrl = publicPageUrl,
             snapshot = snapshot ?: VaultWebSnapshot(
                 pageUrl = cleanPageUrl,
                 pageTitle = resolvedPageTitle,
@@ -232,21 +232,20 @@ class VaultBrowserDownloadEngine(
         pageTitle: String? = null,
         fallbackAudioUrl: String? = null,
         sessionReferer: String? = null,
-        sessionCookies: String? = null,
+        @Suppress("UNUSED_PARAMETER") sessionCookies: String? = null,
         isCancelled: () -> Boolean,
         onState: (VaultBrowserDownloadState) -> Unit,
     ): Boolean = withContext(Dispatchers.IO) {
-        val cleanPageUrl = pageUrl.trim().ifBlank { candidate.stream.streamUrl }
-        runCatching { cookieVault.syncFromWebView(cleanPageUrl) }
-        val extraHeaders = buildMap {
-            val ref = sessionReferer?.takeIf { it.isNotBlank() } ?: cleanPageUrl
-            put("Referer", ref)
-            val ck = sessionCookies?.takeIf { it.isNotBlank() }
-            if (ck != null) put("Cookie", ck)
-        }
-        val enrichedStream = candidate.stream.copy(
-            headers = candidate.stream.headers + extraHeaders,
-        )
+        val rawPageUrl = pageUrl.trim().ifBlank { candidate.stream.streamUrl }
+        val sanitized = UrlSanitizer.sanitizePublicUrl(rawPageUrl)
+        val cleanPageUrl = sanitized.sanitizedUrl.ifBlank { rawPageUrl }
+        val safeReferer = sessionReferer?.takeIf { it.isNotBlank() }
+            ?: sanitized.cleanOrigin.ifBlank { cleanPageUrl }
+        val cookieFreeHeaders = candidate.stream.headers
+            .filterKeys { !it.equals("Cookie", ignoreCase = true) }
+            .toMutableMap()
+            .apply { put("Referer", safeReferer) }
+        val enrichedStream = candidate.stream.copy(headers = cookieFreeHeaders)
         executeDownloadPipeline(
             cleanPageUrl = cleanPageUrl,
             pageTitle = pageTitle,
@@ -283,12 +282,13 @@ class VaultBrowserDownloadEngine(
                 val extension = if (candidate.isHls) "mp4" else extensionForMime(candidate.mimeType)
                 val stagingFile = File(stagingRoot, "${resolvedTitle}_${System.currentTimeMillis()}.$extension")
 
-                val liveCookie = runCatching { CookieManager.getInstance().getCookie(candidate.streamUrl) }.getOrNull()
-                    ?: runCatching { CookieManager.getInstance().getCookie(cleanPageUrl) }.getOrNull()
-                val cookieOverride = if (!liveCookie.isNullOrBlank()) mapOf("Cookie" to liveCookie) else emptyMap()
+                val sanitizedOrigin = UrlSanitizer.sanitizePublicUrl(cleanPageUrl).cleanOrigin.ifBlank { cleanPageUrl }
+                val cookieFreeStreamHeaders = candidate.headers
+                    .filterKeys { !it.equals("Cookie", ignoreCase = true) } +
+                    mapOf("Referer" to sanitizedOrigin)
                 val mergedHeaders = ClientSpoofer.buildDownloadHeaders(
                     streamUrl = candidate.streamUrl,
-                    streamHeaders = candidate.headers + mapOf("Referer" to cleanPageUrl) + cookieOverride,
+                    streamHeaders = cookieFreeStreamHeaders,
                 )
 
                 onState(

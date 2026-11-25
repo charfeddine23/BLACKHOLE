@@ -1,7 +1,6 @@
 package com.example.vault.browser
 
 import android.net.Uri
-import android.webkit.CookieManager
 import com.example.engine.UniversalDownloader
 import com.example.engine.cookies.CookieVaultManager
 import com.example.engine.extractor.MetaVideoPowerExtractor
@@ -55,11 +54,13 @@ sealed interface CandidateResolutionOutcome {
  * - Detects genuine multi-video ambiguity and surfaces CandidatePicker only when distinct
  *   non-ad streams compete without a locked active playback match.
  */
+@Suppress("UNUSED_PARAMETER")
 class MediaCandidateResolver(
     private val okHttpClient: OkHttpClient,
     private val extractor: VideoStreamExtractor,
     private val universalDownloader: UniversalDownloader,
     private val cookieVault: CookieVaultManager,
+    private val rateLimiter: RequestRateLimiter? = null,
 ) {
 
     suspend fun resolveForInspection(
@@ -105,14 +106,16 @@ class MediaCandidateResolver(
         actionTimestampMs: Long,
         alwaysReturnPickerCandidates: Boolean,
     ): CandidateResolutionOutcome {
-        val cleanPageUrl = targetPageUrl.trim()
+        val sanitizedPage = UrlSanitizer.sanitizePublicUrl(targetPageUrl)
+        val cleanPageUrl = sanitizedPage.sanitizedUrl.ifBlank { targetPageUrl.trim() }
+        val cleanReferer = sanitizedPage.cleanOrigin.ifBlank { cleanPageUrl }
         val platform = PlatformBadge.fromUrl(cleanPageUrl)
         val activeVideo = snapshot?.activeVideo
         val resolvedTitle = snapshot?.pageTitle
             ?.takeIf { it.isNotBlank() }
             ?: activeVideo?.pageTitle?.takeIf { it.isNotBlank() }
 
-        val sessionHeaders = buildSessionHeaders(cleanPageUrl)
+        val sessionHeaders = buildCookieFreeHeaders(cleanPageUrl, cleanReferer)
         val nonAdIntercepted = interceptedMedia.filterNot { it.isLikelyAd }
         val nonAdAudioUrls = (
             nonAdIntercepted.filter { it.mediaKind == InterceptedMediaKind.AUDIO_STREAM }.map { it.url } +
@@ -158,7 +161,7 @@ class MediaCandidateResolver(
             VaultWebViewMonitor.isLikelyAdMediaUrl(it.streamUrl) ||
                 MetaVideoPowerExtractor.isMetaAudioOnlyUrl(it.streamUrl)
         }.map { stream ->
-            val merged = mergeStreamHeaders(stream, cleanPageUrl, sessionHeaders)
+            val merged = mergeCookieFreeHeaders(stream, cleanReferer, sessionHeaders)
             if (resolvedTitle != null && stream.title.isBlank()) {
                 merged.copy(title = resolvedTitle)
             } else {
@@ -353,36 +356,31 @@ class MediaCandidateResolver(
         )
     }
 
-    private fun buildSessionHeaders(pageUrl: String): MutableMap<String, String> {
-        val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull()
-        val liveCookie = runCatching { cookieManager?.getCookie(pageUrl) }.getOrNull()
-        val vaultCookie = runCatching { cookieVault.getCookieHeaderForUrl(pageUrl) }.getOrNull()
-        val combinedCookie = liveCookie?.takeIf { it.isNotBlank() } ?: vaultCookie
-
+    private fun buildCookieFreeHeaders(pageUrl: String, refererOrigin: String): MutableMap<String, String> {
         return ClientSpoofer.buildHeadersForUrl(
             targetUrl = pageUrl,
             profile = ClientSpoofer.profiles.first(),
-            refererOverride = pageUrl,
-        ).toMutableMap().apply {
-            put("Referer", pageUrl)
-            if (!combinedCookie.isNullOrBlank()) {
-                put("Cookie", combinedCookie)
+            refererOverride = refererOrigin,
+        ).filterKeys { !it.equals("Cookie", ignoreCase = true) }
+            .toMutableMap()
+            .apply {
+                put("User-Agent", SafeWebViewConfig.STANDARD_ANDROID_CHROME_USER_AGENT)
+                put("Referer", refererOrigin)
             }
-        }
     }
 
-    private fun mergeStreamHeaders(
+    private fun mergeCookieFreeHeaders(
         stream: ExtractedStream,
-        pageUrl: String,
-        sessionHeaders: Map<String, String>,
+        refererOrigin: String,
+        baseHeaders: Map<String, String>,
     ): ExtractedStream {
-        val streamCookie = runCatching { CookieManager.getInstance().getCookie(stream.streamUrl) }.getOrNull()
-        val merged = sessionHeaders.toMutableMap().apply {
-            putAll(stream.headers)
-            if (!containsKey("Referer")) put("Referer", pageUrl)
-            if (!streamCookie.isNullOrBlank()) {
-                put("Cookie", streamCookie)
+        val merged = baseHeaders.toMutableMap().apply {
+            stream.headers.forEach { (k, v) ->
+                if (!k.equals("Cookie", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) {
+                    put(k, v)
+                }
             }
+            if (!containsKey("Referer")) put("Referer", refererOrigin)
         }
         return stream.copy(headers = merged)
     }
@@ -399,6 +397,7 @@ class MediaCandidateResolver(
         if (candidateUrls.isEmpty()) return emptyList()
         val out = mutableListOf<ExtractedStream>()
         val fallbackAudio = audioUrls.firstOrNull()
+        val cookieFreeHeaders = baseHeaders.filterKeys { !it.equals("Cookie", ignoreCase = true) }
 
         for (rawUrl in candidateUrls) {
             if (!rawUrl.startsWith("http://", ignoreCase = true) &&
@@ -408,20 +407,13 @@ class MediaCandidateResolver(
             }
             if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(rawUrl)) continue
 
-            val streamCookie = runCatching { CookieManager.getInstance().getCookie(rawUrl) }.getOrNull()
-            val perUrlHeaders = baseHeaders.toMutableMap().apply {
-                if (!streamCookie.isNullOrBlank()) {
-                    put("Cookie", streamCookie)
-                }
-            }
-
             if (rawUrl.substringBefore("?").endsWith(".mpd", ignoreCase = true)) {
-                val mpdStreams = parseDashBaseUrls(rawUrl, pageTitle, platform, perUrlHeaders, fallbackAudio)
+                val mpdStreams = parseDashBaseUrls(rawUrl, pageTitle, platform, cookieFreeHeaders, fallbackAudio)
                 out.addAll(mpdStreams)
                 continue
             }
 
-            val probed = extractor.probeDirectMediaOrHls(rawUrl, platform, perUrlHeaders)
+            val probed = extractor.probeDirectMediaOrHls(rawUrl, platform, cookieFreeHeaders)
             if (probed != null) {
                 if (probed.estimatedBytes in 1L..16_383L) continue
                 val needsAudio = fallbackAudio != null && !probed.isHls && (
@@ -434,7 +426,7 @@ class MediaCandidateResolver(
                 out.add(
                     probed.copy(
                         title = pageTitle?.takeIf { it.isNotBlank() } ?: probed.title,
-                        headers = perUrlHeaders,
+                        headers = cookieFreeHeaders,
                         audioStreamUrl = if (needsAudio) fallbackAudio else probed.audioStreamUrl,
                     ),
                 )
@@ -459,7 +451,7 @@ class MediaCandidateResolver(
                         resolutionHeight = height,
                         mimeType = if (isHls) "application/vnd.apple.mpegurl" else extractor.resolveMimeType("", rawUrl),
                         estimatedBytes = -1L,
-                        headers = perUrlHeaders,
+                        headers = cookieFreeHeaders,
                         audioStreamUrl = if (needsAudio) fallbackAudio else null,
                         isHls = isHls,
                     ),
@@ -477,8 +469,10 @@ class MediaCandidateResolver(
         fallbackAudio: String?,
     ): List<ExtractedStream> = runCatching {
         val reqBuilder = Request.Builder().url(mpdUrl).get()
-        headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+        headers.filterKeys { !it.equals("Cookie", ignoreCase = true) }
+            .forEach { (k, v) -> reqBuilder.header(k, v) }
         val xml = okHttpClient.newCall(reqBuilder.build()).execute().use { resp ->
+            rateLimiter?.recordHttpStatus(resp.code)
             if (!resp.isSuccessful) return@runCatching emptyList()
             resp.body?.string()?.take(128_000).orEmpty()
         }

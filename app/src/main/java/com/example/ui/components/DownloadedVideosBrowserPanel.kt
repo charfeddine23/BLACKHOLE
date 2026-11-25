@@ -13,13 +13,10 @@ import android.os.Environment
 import android.os.Message
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -85,6 +82,7 @@ import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.DesktopWindows
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.History
@@ -95,11 +93,13 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.VpnLock
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material.icons.rounded.ZoomIn
 import androidx.compose.material.icons.rounded.ZoomOut
 import androidx.compose.material3.Button
@@ -166,9 +166,12 @@ import com.example.data.local.BrowserPinnedSite
 import com.example.data.local.BrowserPreferencesStore
 import com.example.data.local.BrowserSearchEngine
 import com.example.data.local.SiteLogoFetcher
-import com.example.engine.network.ClientSpoofer
 import com.example.engine.network.CloudflareDnsVpnService
+import com.example.vault.browser.EphemeralSessionManager
 import com.example.vault.browser.InterceptedMediaRequest
+import com.example.vault.browser.RateLimiterUiStatus
+import com.example.vault.browser.SafeWebViewConfig
+import com.example.vault.browser.UrlSanitizer
 import com.example.vault.browser.VaultWebSnapshot
 import com.example.vault.browser.VaultWebViewMonitor
 import org.json.JSONObject
@@ -359,6 +362,7 @@ fun collectLiveWebViewMediaCandidates(
 }
 
 @SuppressLint("SetJavaScriptEnabled")
+@Suppress("UNUSED_PARAMETER")
 @Composable
 fun DownloadedVideosBrowserPanel(
     syncedDomains: List<String>,
@@ -380,6 +384,8 @@ fun DownloadedVideosBrowserPanel(
     onBeforeExternalFlow: () -> Unit = {},
     onDirectDownloadIntercepted: ((url: String, mimeType: String?) -> Boolean)? = null,
     webViewMonitor: VaultWebViewMonitor = remember { VaultWebViewMonitor() },
+    ephemeralSessionManager: EphemeralSessionManager = remember { EphemeralSessionManager(initialEphemeralMode = true) },
+    rateLimiterStatus: RateLimiterUiStatus = RateLimiterUiStatus(),
     onPullCurrentPageWithMedia: ((
         pageUrl: String,
         activeWebView: WebView?,
@@ -407,8 +413,9 @@ fun DownloadedVideosBrowserPanel(
     val searchEngine by browserPrefs.searchEngine.collectAsStateWithLifecycle()
     val pinnedSites by browserPrefs.pinnedSites.collectAsStateWithLifecycle()
     val isVpnActive by CloudflareDnsVpnService.isVpnActive.collectAsStateWithLifecycle()
+    val isEphemeralSession by ephemeralSessionManager.isEphemeralMode.collectAsStateWithLifecycle()
 
-    val tabs = remember { mutableStateListOf(BrowserTabState()) }
+    val tabs = remember { mutableStateListOf(BrowserTabState(isIncognito = true)) }
     var activeTabIndex by remember { mutableIntStateOf(0) }
     val activeTab = tabs.getOrElse(activeTabIndex) { tabs.first() }
 
@@ -420,6 +427,7 @@ fun DownloadedVideosBrowserPanel(
     var addressText by remember { mutableStateOf("") }
     var isUrlFocused by remember { mutableStateOf(false) }
     var showPromoBanner by remember { mutableStateOf(true) }
+    var showPrivacySafeguardNotice by remember { mutableStateOf(true) }
     var showToolsBar by remember { mutableStateOf(false) }
     var showTabsBarTray by remember { mutableStateOf(false) }
     var activeSubTray by remember { mutableStateOf<BrowserSubTray?>(null) }
@@ -520,11 +528,6 @@ fun DownloadedVideosBrowserPanel(
         }
     }
 
-    // Ensure AES-256 permanently saved cookies are injected into WebView CookieManager on entry
-    LaunchedEffect(Unit) {
-        onRestoreCookiesToBrowser()
-    }
-
     LaunchedEffect(activeTab.id, activeTab.url, activeWebView) {
         onBindWebViewRef(if (activeTab.isHome) null else activeWebView)
         if (!isUrlFocused) {
@@ -535,34 +538,23 @@ fun DownloadedVideosBrowserPanel(
             if (activeSubTray == BrowserSubTray.FIND) {
                 activeSubTray = null
             }
-        } else {
-            webViewMonitor.injectMonitor(activeWebView)
         }
     }
 
-    DisposableEffect(webViewMonitor) {
+    DisposableEffect(webViewMonitor, ephemeralSessionManager) {
         onDispose {
             runCatching { customViewCallback?.onCustomViewHidden() }
             customFullscreenView = null
             customViewCallback = null
-            val currentTab = tabs.getOrNull(activeTabIndex)
-            if (currentTab != null && !currentTab.isIncognito) {
-                val currentUrl = webViews[currentTab.id]?.url ?: currentTab.url
-                if (currentUrl.startsWith("http", ignoreCase = true)) {
-                    onAutoSyncCookies(currentUrl)
-                } else {
-                    onAutoSyncCookies("https://www.instagram.com/")
-                }
-            }
             onBindWebViewRef(null)
             webViews.forEach { (id, wv) ->
                 runCatching {
                     webViewMonitor.detachFrom(wv)
                     webViewMonitor.clearTab(id)
-                    wv.stopLoading()
-                    wv.destroy()
+                    ephemeralSessionManager.disposeWebView(wv)
                 }
             }
+            ephemeralSessionManager.clearSessionData(null)
             webViews.clear()
             tabThumbnails.clear()
             tabFavicons.clear()
@@ -638,20 +630,12 @@ fun DownloadedVideosBrowserPanel(
     }
 
     fun resolveNativeMobileUserAgent(ctx: Context): String {
-        return runCatching {
-            WebSettings.getDefaultUserAgent(ctx)
-                .replace(Regex(";\\s*wv\\b"), "")
-                .replace("Version/4.0 ", "")
-        }.getOrElse { ClientSpoofer.ANDROID_CHROME_USER_AGENT }
+        return SafeWebViewConfig.resolveConsistentUserAgent(ctx)
     }
 
     fun applyDesktopSettings(wv: WebView, desktop: Boolean) {
         wv.settings.apply {
-            userAgentString = if (desktop) {
-                ClientSpoofer.CHROME_DESKTOP_USER_AGENT
-            } else {
-                resolveNativeMobileUserAgent(wv.context)
-            }
+            userAgentString = resolveNativeMobileUserAgent(wv.context)
             useWideViewPort = true
             loadWithOverviewMode = true
         }
@@ -764,9 +748,9 @@ fun DownloadedVideosBrowserPanel(
     }
 
     fun triggerPullFromTopUrl(explicitUrl: String? = null) {
-        val targetUrl = explicitUrl?.let { extractDirectUrlFromAddressBar(it) ?: it.trim().takeIf { s -> s.startsWith("http", ignoreCase = true) } }
+        val rawCandidate = explicitUrl?.let { extractDirectUrlFromAddressBar(it) ?: it.trim().takeIf { s -> s.startsWith("http", ignoreCase = true) } }
             ?: resolveTopBarDownloadUrl()
-        if (targetUrl.isNullOrBlank()) {
+        if (rawCandidate.isNullOrBlank()) {
             if (onPullCurrentPageWithMedia != null) {
                 onPullCurrentPageWithMedia("", null, emptyList(), emptyList(), null, emptyList())
             } else {
@@ -774,19 +758,21 @@ fun DownloadedVideosBrowserPanel(
             }
             return
         }
+        val sanitized = UrlSanitizer.sanitizePublicUrl(rawCandidate)
+        val targetUrl = sanitized.sanitizedUrl.ifBlank { rawCandidate }
+
         focusManager.clearFocus()
         isUrlFocused = false
         if (explicitUrl == null) {
             addressText = targetUrl
         }
-        onAutoSyncCookies(targetUrl)
 
         val tabId = activeTab.id
         val loadedUrl = webViews[tabId]?.url?.takeIf { it.startsWith("http", ignoreCase = true) }
             ?: activeTab.url.takeIf { it.startsWith("http", ignoreCase = true) }
         val matchesLiveWebView = !activeTab.isHome &&
             activeWebView != null &&
-            urlsMatchSamePage(targetUrl, loadedUrl)
+            urlsMatchSamePage(rawCandidate, loadedUrl)
 
         val matchedWebView = if (matchesLiveWebView) activeWebView else null
         val sniffedVideos = if (matchesLiveWebView) sniffedVideoUrlsByTab[tabId].orEmpty() else emptyList()
@@ -825,12 +811,11 @@ fun DownloadedVideosBrowserPanel(
         webViews.remove(removed.id)?.let { wv ->
             runCatching {
                 webViewMonitor.detachFrom(wv)
-                wv.stopLoading()
-                wv.destroy()
+                ephemeralSessionManager.disposeWebView(wv)
             }
         }
         if (tabs.size == 1) {
-            tabs[0] = BrowserTabState()
+            tabs[0] = BrowserTabState(isIncognito = true)
             activeTabIndex = 0
             addressText = ""
             zoomPercent = 100
@@ -860,8 +845,7 @@ fun DownloadedVideosBrowserPanel(
             webViews.remove(removed.id)?.let { wv ->
                 runCatching {
                     webViewMonitor.detachFrom(wv)
-                    wv.stopLoading()
-                    wv.destroy()
+                    ephemeralSessionManager.disposeWebView(wv)
                 }
             }
         }
@@ -1320,6 +1304,83 @@ fun DownloadedVideosBrowserPanel(
             } else {
                 HorizontalDivider(color = NightHairline, thickness = 0.6.dp)
             }
+
+            // Ephemeral Isolation Safeguard & Cooldown Status Strip
+            if (showPrivacySafeguardNotice || !rateLimiterStatus.canStartRequest) {
+                Surface(
+                    color = if (!rateLimiterStatus.canStartRequest && rateLimiterStatus.isBackoffActive) {
+                        CrimsonAlert.copy(alpha = 0.14f)
+                    } else {
+                        Color(0xFF0D1420)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (rateLimiterStatus.remainingCooldownSeconds > 0) {
+                                Icons.Rounded.WarningAmber
+                            } else {
+                                Icons.Rounded.Shield
+                            },
+                            contentDescription = null,
+                            tint = if (rateLimiterStatus.remainingCooldownSeconds > 0) AmberWarning else EmeraldPulse,
+                            modifier = Modifier.size(13.dp),
+                        )
+                        Text(
+                            text = when {
+                                rateLimiterStatus.statusMessage != null -> rateLimiterStatus.statusMessage!!
+                                isEphemeralSession -> "جلسة معزولة (لا تحفظ الكوكيز) — تجنب تسجيل الدخول لحساباتك الشخصية أو الفحص المتكرر"
+                                else -> "وضع المتصفح المعزول — الكوكيز لا تُرسل أبداً للخارج"
+                            },
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = if (rateLimiterStatus.remainingCooldownSeconds > 0) AmberWarning else MutedSlate,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .clickable {
+                                    ephemeralSessionManager.clearSessionData(activeWebView)
+                                    localStatusBanner = "تم مسح بيانات الجلسة والكوكيز فوراً"
+                                }
+                                .testTag("browser_quick_clear_session_button"),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.DeleteSweep,
+                                contentDescription = "مسح الجلسة",
+                                tint = NeonCyan,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
+                        if (showPrivacySafeguardNotice && rateLimiterStatus.canStartRequest) {
+                            Box(
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .clip(CircleShape)
+                                    .clickable { showPrivacySafeguardNotice = false },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Close,
+                                    contentDescription = "إخفاء التنبيه",
+                                    tint = MutedSlate,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 3. Browser Viewport: Samsung-Style Start Page OR Live WebView Page
@@ -1396,42 +1457,16 @@ fun DownloadedVideosBrowserPanel(
                                 (existing.parent as? ViewGroup)?.removeView(existing)
                                 return@AndroidView existing
                             }
-                            CookieManager.getInstance().setAcceptCookie(true)
                             WebView(ctx).apply {
                                 setBackgroundColor(android.graphics.Color.parseColor("#050709"))
                                 layoutParams = FrameLayout.LayoutParams(
                                     ViewGroup.LayoutParams.MATCH_PARENT,
                                     ViewGroup.LayoutParams.MATCH_PARENT,
                                 )
-                                val cookieManager = CookieManager.getInstance()
-                                cookieManager.setAcceptCookie(true)
-                                cookieManager.setAcceptThirdPartyCookies(this, true)
-
-                                settings.apply {
-                                    javaScriptEnabled = true
-                                    javaScriptCanOpenWindowsAutomatically = true
-                                    setSupportMultipleWindows(true)
-                                    domStorageEnabled = true
-                                    databaseEnabled = !activeTab.isIncognito
-                                    saveFormData = !activeTab.isIncognito
-                                    cacheMode = if (activeTab.isIncognito) {
-                                        WebSettings.LOAD_NO_CACHE
-                                    } else {
-                                        WebSettings.LOAD_DEFAULT
-                                    }
-                                    useWideViewPort = true
-                                    loadWithOverviewMode = true
-                                    setSupportZoom(true)
-                                    builtInZoomControls = true
-                                    displayZoomControls = false
-                                    mediaPlaybackRequiresUserGesture = false
-                                    mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                                    userAgentString = if (isDesktopMode) {
-                                        ClientSpoofer.CHROME_DESKTOP_USER_AGENT
-                                    } else {
-                                        resolveNativeMobileUserAgent(ctx)
-                                    }
-                                }
+                                SafeWebViewConfig.configure(
+                                    webView = this,
+                                    isEphemeralSession = isEphemeralSession || activeTab.isIncognito,
+                                )
 
                                 setFindListener { activeMatchOrdinal, numberOfMatches, _ ->
                                     if (tabId == tabs.getOrNull(activeTabIndex)?.id) {
@@ -1453,9 +1488,6 @@ fun DownloadedVideosBrowserPanel(
                                             setMimeType(mimetype)
                                             if (!userAgent.isNullOrBlank()) {
                                                 addRequestHeader("User-Agent", userAgent)
-                                            }
-                                            CookieManager.getInstance().getCookie(dlUrl)?.let { cookie ->
-                                                addRequestHeader("Cookie", cookie)
                                             }
                                             setNotificationVisibility(
                                                 DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
@@ -1568,8 +1600,6 @@ fun DownloadedVideosBrowserPanel(
                                         }
                                     }
 
-                                    private var retriedGoogleMismatch = false
-
                                     override fun onPageStarted(
                                         view: WebView?,
                                         url: String?,
@@ -1588,7 +1618,6 @@ fun DownloadedVideosBrowserPanel(
                                                 )
                                             }
                                         }
-                                        webViewMonitor.injectMonitor(view)
                                     }
 
                                     override fun doUpdateVisitedHistory(
@@ -1616,35 +1645,13 @@ fun DownloadedVideosBrowserPanel(
                                             if (tabId == tabs.getOrNull(activeTabIndex)?.id && !isUrlFocused) {
                                                 addressText = url
                                             }
-                                            webViewMonitor.injectMonitor(view)
                                         }
                                     }
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
-                                        val isPrivate = tabs.firstOrNull { it.id == tabId }?.isIncognito == true
-                                        val cm = CookieManager.getInstance()
-                                        cm.setAcceptCookie(true)
-                                        view?.let { cm.setAcceptThirdPartyCookies(it, true) }
-                                        cm.flush()
+                                        val isPrivate = tabs.firstOrNull { it.id == tabId }?.isIncognito == true || isEphemeralSession
                                         val loaded = url.orEmpty()
-                                        if (loaded.contains("CookieMismatch", ignoreCase = true)) {
-                                            if (!retriedGoogleMismatch) {
-                                                retriedGoogleMismatch = true
-                                                cm.removeAllCookies {
-                                                    runCatching { WebStorage.getInstance().deleteAllData() }
-                                                    cm.setAcceptCookie(true)
-                                                    view?.let { cm.setAcceptThirdPartyCookies(it, true) }
-                                                    cm.flush()
-                                                    onRestoreCookiesToBrowser()
-                                                    view?.clearCache(true)
-                                                    view?.postDelayed({
-                                                        view.loadUrl("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fm.youtube.com%2F")
-                                                    }, 280L)
-                                                }
-                                            }
-                                            return
-                                        }
                                         if (loaded.isNotBlank()) {
                                             val pageTitle = view?.title?.takeIf { it.isNotBlank() }
                                                 ?: deriveHostLabel(loaded)
@@ -1661,21 +1668,12 @@ fun DownloadedVideosBrowserPanel(
                                             }
                                             if (!isPrivate) {
                                                 browserPrefs.recordHistory(loaded, pageTitle)
-                                                val lowerLoaded = loaded.lowercase()
-                                                val midGoogleAuth = lowerLoaded.contains("accounts.google.") ||
-                                                    lowerLoaded.contains("accounts.youtube.") ||
-                                                    lowerLoaded.contains("consent.google.") ||
-                                                    lowerLoaded.contains("consent.youtube.")
-                                                if (!midGoogleAuth) {
-                                                    onAutoSyncCookies(loaded)
-                                                }
                                             }
                                         }
                                         view?.evaluateJavascript(
                                             if (isDesktopMode) DESKTOP_VIEWPORT_JS else UNLOCK_VIEWPORT_JS,
                                             null,
                                         )
-                                        webViewMonitor.injectMonitor(view)
                                         view?.postDelayed({
                                             captureTabThumbnail(tabId, view)
                                         }, 250L)

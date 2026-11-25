@@ -82,6 +82,7 @@ import com.example.ui.theme.PlasmaViolet
 import com.example.util.formatByteSize
 import com.example.util.formatTransferSpeed
 import com.example.vault.browser.InspectedStreamMetadata
+import com.example.vault.browser.RateLimiterUiStatus
 import com.example.vault.browser.VaultInspectorUiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -103,6 +104,7 @@ fun PreDownloadInspectorSheet(
     onConfirmDownload: (overrideStreamUrl: String?) -> Unit,
     onSaveYtDlpBackendUrl: (String) -> Unit,
     onCancelOrDismiss: () -> Unit,
+    rateLimiterStatus: RateLimiterUiStatus = RateLimiterUiStatus(),
 ) {
     if (state is VaultInspectorUiState.Idle) return
 
@@ -203,6 +205,7 @@ fun PreDownloadInspectorSheet(
                     PreviewReadySection(
                         metadata = state.metadata,
                         ytDlpBackendUrl = ytDlpBackendUrl,
+                        rateLimiterStatus = rateLimiterStatus,
                         onSelectCandidate = onSelectCandidate,
                         onReInspectUrl = onReInspectUrl,
                         onConfirmDownload = onConfirmDownload,
@@ -232,6 +235,7 @@ fun PreDownloadInspectorSheet(
                         reason = state.reason,
                         initialUrl = state.lastUrlInput,
                         debugDetails = state.debugDetails,
+                        rateLimiterStatus = rateLimiterStatus,
                         onRetryUrl = onReInspectUrl,
                         onDismiss = onCancelOrDismiss,
                     )
@@ -244,6 +248,7 @@ fun PreDownloadInspectorSheet(
                         reason = state.reason,
                         initialUrl = state.pageUrl,
                         debugDetails = state.debugDetails,
+                        rateLimiterStatus = rateLimiterStatus,
                         onRetryUrl = onReInspectUrl,
                         onDismiss = onCancelOrDismiss,
                     )
@@ -314,6 +319,7 @@ private fun InspectingSection(
 private fun PreviewReadySection(
     metadata: InspectedStreamMetadata,
     ytDlpBackendUrl: String,
+    rateLimiterStatus: RateLimiterUiStatus,
     onSelectCandidate: (Int) -> Unit,
     onReInspectUrl: (String) -> Unit,
     onConfirmDownload: (overrideStreamUrl: String?) -> Unit,
@@ -331,10 +337,8 @@ private fun PreviewReadySection(
     }
 
     val selectedCandidate = metadata.selectedCandidate
-    val previewHeaders = selectedCandidate?.stream?.headers ?: buildMap {
-        put("Referer", metadata.referer)
-        if (metadata.cookies.isNotBlank()) put("Cookie", metadata.cookies)
-    }
+    val previewHeaders = (selectedCandidate?.stream?.headers ?: mapOf("Referer" to metadata.referer))
+        .filterKeys { !it.equals("Cookie", ignoreCase = true) }
     val heroCacheKey = remember(metadata.thumbnailUrl, metadata.resolvedStreamUrl) {
         "${metadata.thumbnailUrl.orEmpty()}|${metadata.resolvedStreamUrl}"
     }
@@ -505,7 +509,7 @@ private fun PreviewReadySection(
                                 modifier = Modifier.size(12.dp),
                             )
                             Text(
-                                text = if (metadata.cookies.isNotBlank()) "كوكيز الجلسة + Referer مرفقة" else "Referer مرفق",
+                                text = "جلسة معزولة بدون كوكيز · رابط عام منظف",
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 color = EmeraldPulse,
                             )
@@ -650,15 +654,24 @@ private fun PreviewReadySection(
         trailingIcon = {
             IconButton(
                 onClick = { onReInspectUrl(editableUrl) },
+                enabled = rateLimiterStatus.canStartRequest,
                 modifier = Modifier
                     .minimumInteractiveComponentSize()
                     .testTag("inspector_reinspect_button"),
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.Refresh,
-                    contentDescription = "إعادة فحص الرابط",
-                    tint = NeonCyan,
-                )
+                if (rateLimiterStatus.remainingCooldownSeconds > 0) {
+                    Text(
+                        text = "${rateLimiterStatus.remainingCooldownSeconds}ث",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MutedSlate,
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Rounded.Refresh,
+                        contentDescription = "إعادة فحص الرابط",
+                        tint = NeonCyan,
+                    )
+                }
             }
         },
         colors = OutlinedTextFieldDefaults.colors(
@@ -945,6 +958,7 @@ private fun ErrorOrDrmSection(
     reason: String,
     initialUrl: String,
     debugDetails: String,
+    rateLimiterStatus: RateLimiterUiStatus,
     onRetryUrl: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1026,16 +1040,24 @@ private fun ErrorOrDrmSection(
                 }
                 Button(
                     onClick = { onRetryUrl(retryUrl) },
+                    enabled = rateLimiterStatus.canStartRequest,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = NeonCyan,
                         contentColor = ObsidianVoid,
+                        disabledContainerColor = Color(0xFF1B273A),
+                        disabledContentColor = MutedSlate,
                     ),
                     modifier = Modifier
                         .weight(0.6f)
                         .minimumInteractiveComponentSize()
                         .testTag("inspector_retry_inspect_button"),
                 ) {
-                    Text("إعادة الفحص", fontWeight = FontWeight.Bold)
+                    val label = if (rateLimiterStatus.remainingCooldownSeconds > 0) {
+                        "انتظر ${rateLimiterStatus.remainingCooldownSeconds}ث"
+                    } else {
+                        "إعادة الفحص"
+                    }
+                    Text(label, fontWeight = FontWeight.Bold)
                 }
             }
         }

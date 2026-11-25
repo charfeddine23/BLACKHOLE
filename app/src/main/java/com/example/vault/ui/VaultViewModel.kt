@@ -18,7 +18,11 @@ import com.example.vault.data.VaultCipher
 import com.example.vault.data.VaultFileEntry
 import com.example.vault.data.VaultStorageMode
 import com.example.vault.browser.InterceptedMediaRequest
+import com.example.vault.browser.RateLimitAcquireResult
+import com.example.vault.browser.RateLimiterUiStatus
+import com.example.vault.browser.RequestRateLimiter
 import com.example.vault.browser.ResolvedMediaCandidate
+import com.example.vault.browser.UrlSanitizer
 import com.example.vault.browser.VaultCaptureSnapshot
 import com.example.vault.browser.VaultInspectorUiState
 import com.example.vault.browser.VaultWebSnapshot
@@ -101,10 +105,14 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val vaultCipher = VaultCipher(application.applicationContext)
     private val repository = SafVaultRepository(application.applicationContext, vaultCipher)
     private val deviceBrowser = DeviceMediaBrowser(application.applicationContext)
+    private val requestRateLimiter = RequestRateLimiter()
+    val rateLimiterStatus: StateFlow<RateLimiterUiStatus> = requestRateLimiter.status
+
     private val browserDownloadEngine by lazy {
         VaultBrowserDownloadEngine(
             context = application.applicationContext,
             vaultRepository = repository,
+            rateLimiter = requestRateLimiter,
             backendBaseUrlProvider = { appPreferences.ytDlpBackendUrl.value },
         )
     }
@@ -313,22 +321,51 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         if (_uiState.value.isLocked) return
         if (browserDownloadJob?.isActive == true) return
+        val sanitized = UrlSanitizer.sanitizePublicUrl(pageUrl)
+        val cleanPageUrl = sanitized.sanitizedUrl.ifBlank { pageUrl.trim() }
+
+        when (val acquired = requestRateLimiter.tryAcquire()) {
+            is RateLimitAcquireResult.Blocked -> {
+                _inspectorState.value = VaultInspectorUiState.Failed(
+                    reason = acquired.reason,
+                    pageUrl = cleanPageUrl,
+                    lastUrlInput = cleanPageUrl,
+                )
+                return
+            }
+            RateLimitAcquireResult.Acquired -> Unit
+        }
+
         browserInspectJob?.cancel()
-        val cleanPageUrl = pageUrl.trim()
         _inspectorState.value = VaultInspectorUiState.Inspecting(
             pageUrl = cleanPageUrl,
             snapshot = snapshot,
         )
         browserInspectJob = viewModelScope.launch {
-            val extraVideos = (snapshot?.domCandidateUrls.orEmpty() + domVideoUrls + sniffedVideoUrls).distinct()
-            val result = browserDownloadEngine.inspectStreamMetadata(
-                pageUrl = cleanPageUrl,
-                snapshot = snapshot,
-                interceptedMedia = interceptedMedia,
-                extraSniffedVideos = extraVideos,
-                extraSniffedAudios = sniffedAudioUrls.distinct(),
-            )
-            _inspectorState.value = result
+            var observedHttpStatus: Int? = null
+            try {
+                val extraVideos = (snapshot?.domCandidateUrls.orEmpty() + domVideoUrls + sniffedVideoUrls).distinct()
+                val result = browserDownloadEngine.inspectStreamMetadata(
+                    pageUrl = cleanPageUrl,
+                    snapshot = snapshot,
+                    interceptedMedia = interceptedMedia,
+                    extraSniffedVideos = extraVideos,
+                    extraSniffedAudios = sniffedAudioUrls.distinct(),
+                )
+                if (result is VaultInspectorUiState.PreviewReady) {
+                    observedHttpStatus = 200
+                }
+                _inspectorState.value = result
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                _inspectorState.value = VaultInspectorUiState.Failed(
+                    reason = t.message ?: "تعذر فحص الرابط.",
+                    pageUrl = cleanPageUrl,
+                    lastUrlInput = cleanPageUrl,
+                )
+            } finally {
+                requestRateLimiter.releaseAndArmCooldown(observedHttpStatus)
+            }
         }
     }
 
@@ -384,12 +421,14 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
         browserDownloadJob = viewModelScope.launch {
             try {
+                val sanitizedOrigin = UrlSanitizer.sanitizePublicUrl(meta.pageUrl).cleanOrigin
+                    .ifBlank { meta.referer }
                 val ok = browserDownloadEngine.downloadResolvedCandidateToVault(
                     candidate = finalCandidate,
                     pageUrl = meta.pageUrl,
                     pageTitle = meta.title,
-                    sessionReferer = meta.referer,
-                    sessionCookies = meta.cookies,
+                    sessionReferer = sanitizedOrigin,
+                    sessionCookies = null,
                     isCancelled = { browserDownloadCancelled.get() },
                     onState = { dlState ->
                         _uiState.update { it.copy(browserDownloadState = dlState) }

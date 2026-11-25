@@ -1,13 +1,12 @@
 package com.example.vault.browser
 
 import android.util.Log
-import android.webkit.CookieManager
 import android.webkit.WebView
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * Immutable, fresh capture snapshot produced at the exact instant the user triggers
- * Pre-Download Inspection (never recycled across navigations or video switches).
+ * Immutable, privacy-safe snapshot produced strictly on explicit user tap.
+ * Never persists stale URLs across navigations and NEVER reads, extracts, or forwards Cookies.
  */
 data class VaultCaptureSnapshot(
     val pageUrl: String = "",
@@ -31,23 +30,24 @@ data class VaultCaptureSnapshot(
     )
 
     fun logSummary(): String {
-        val activeSrc = activeVideo?.currentSrc?.ifBlank { activeVideo.src } ?: "<none>"
         val playbackTime = activeVideo?.let {
             String.format("%.1fs / %.1fs (paused=%s)", it.currentTimeSeconds, it.durationSeconds, it.paused)
         } ?: "no-video-element"
         return buildString {
-            appendLine("pageUrl=$pageUrl")
-            appendLine("activeSrc=$activeSrc")
+            appendLine("sanitizedPageUrl=$pageUrl")
+            appendLine("refererOrigin=$referer")
             appendLine("playback=$playbackTime")
-            appendLine("domCandidates=${domCandidateUrls.size}, cookiesPresent=${cookies.isNotBlank()}")
+            appendLine("domCandidates=${domCandidateUrls.size}, cookiesForwarded=false")
         }.trim()
     }
 }
 
 /**
- * Session-aware WebView Inspector that guarantees a fresh playback snapshot on trigger,
- * collects active <video> telemetry across main document + accessible frames, captures live
- * Cookie + Referer headers, resets stale captures on navigation, and emits Logcat verification.
+ * Privacy-first, session-isolated WebView inspector:
+ * - Zero cookie extraction or forwarding
+ * - Sanitizes tracking/session parameters via UrlSanitizer
+ * - Only inspects the current page upon explicit user tap
+ * - Clears telemetry cleanly on navigation reset
  */
 class VaultWebViewInspector(
     val monitor: VaultWebViewMonitor = VaultWebViewMonitor(),
@@ -65,42 +65,40 @@ class VaultWebViewInspector(
 
     fun resetOnNavigation(tabId: String, nextUrl: String?) {
         monitor.resetForNavigation(tabId)
-        Log.d(TAG, "Reset playback snapshot on navigation (tab=$tabId, url=${nextUrl.orEmpty()})")
+        val cleanNext = UrlSanitizer.sanitizePublicUrl(nextUrl.orEmpty()).sanitizedUrl
+        Log.d(TAG, "Reset playback snapshot on navigation (tab=$tabId, url=$cleanNext)")
     }
 
     suspend fun captureFreshPlaybackSnapshot(
         webView: WebView?,
         currentPageUrl: String,
     ): VaultCaptureSnapshot {
-        // Clear any stale active telemetry before probing the live DOM
         monitor.clearActiveTelemetry()
 
         val live = monitor.captureFreshSnapshot(webView, currentPageUrl)
-        val resolvedPageUrl = live.pageUrl.ifBlank { currentPageUrl }.trim()
-        val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull()
-        val pageCookie = runCatching { cookieManager?.getCookie(resolvedPageUrl) }.getOrNull().orEmpty()
-        val activeSrcCookie = live.activeVideo?.bestDirectHttpUrl?.let { mediaUrl ->
-            runCatching { cookieManager?.getCookie(mediaUrl) }.getOrNull()
-        }.orEmpty()
-        val combinedCookies = when {
-            pageCookie.isNotBlank() && activeSrcCookie.isNotBlank() && pageCookie != activeSrcCookie ->
-                "$pageCookie; $activeSrcCookie"
-            pageCookie.isNotBlank() -> pageCookie
-            else -> activeSrcCookie
-        }
+        val rawPageUrl = live.pageUrl.ifBlank { currentPageUrl }.trim()
+        val sanitized = UrlSanitizer.sanitizePublicUrl(rawPageUrl)
+        val safePageUrl = if (sanitized.isValidPublicHttpUrl) sanitized.sanitizedUrl else rawPageUrl
 
+        val sanitizedDomUrls = live.domCandidateUrls
+            .mapNotNull { candidate ->
+                UrlSanitizer.sanitizePublicUrl(candidate).takeIf { it.isValidPublicHttpUrl }?.sanitizedUrl
+            }
+            .distinct()
+
+        // Privacy rule: NEVER extract or forward WebView cookies!
         val snapshot = VaultCaptureSnapshot(
-            pageUrl = resolvedPageUrl,
+            pageUrl = safePageUrl,
             pageTitle = live.pageTitle,
             pagePosterUrl = live.pagePosterUrl,
             activeVideo = live.activeVideo,
             allVideos = live.allVideos,
-            domCandidateUrls = live.domCandidateUrls,
-            cookies = combinedCookies,
-            referer = resolvedPageUrl,
+            domCandidateUrls = sanitizedDomUrls,
+            cookies = "",
+            referer = sanitized.cleanOrigin,
             capturedAtMs = System.currentTimeMillis(),
         )
-        Log.d(TAG, "Fresh Pre-Download Snapshot:\n${snapshot.logSummary()}")
+        Log.d(TAG, "User-Initiated Sanitized Snapshot:\n${snapshot.logSummary()}")
         return snapshot
     }
 

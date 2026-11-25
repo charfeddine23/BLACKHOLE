@@ -121,11 +121,9 @@ class VaultWebViewMonitor {
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun injectMonitor(webView: WebView?) {
-        if (webView == null) return
-        runCatching {
-            webView.evaluateJavascript(MONITOR_SCRIPT, null)
-        }
+        // Privacy & platform-compliance policy: never auto-inject background scripts on page load.
     }
 
     fun clearTab(tabId: String) {
@@ -211,8 +209,7 @@ class VaultWebViewMonitor {
             withContext(Dispatchers.Main) {
                 suspendCancellableCoroutine<VaultWebSnapshot?> { cont ->
                     runCatching {
-                        webView.evaluateJavascript(MONITOR_SCRIPT, null)
-                        webView.evaluateJavascript(CAPTURE_SNAPSHOT_SCRIPT) { raw ->
+                        webView.evaluateJavascript(USER_INITIATED_SNAPSHOT_SCRIPT) { raw ->
                             val parsed = parseEvaluateResult(raw, fallbackPageUrl)
                             if (parsed != null) {
                                 _trackedVideos.value = parsed.allVideos
@@ -414,344 +411,101 @@ class VaultWebViewMonitor {
             "doubleclick",
         )
 
-        val MONITOR_SCRIPT: String = """
+        /**
+         * Strictly one-shot, read-only script executed ONLY on explicit user tap.
+         * Zero MutationObservers, zero persistent listeners, zero multi-frame scraping.
+         */
+        val USER_INITIATED_SNAPSHOT_SCRIPT: String = """
             (function() {
               try {
-                if (window.__bhVaultMonitorInstalled) {
-                  if (typeof window.__bhPublishSnapshot === 'function') {
-                    window.__bhPublishSnapshot(true);
-                  }
-                  return;
-                }
-                window.__bhVaultMonitorInstalled = true;
-
-                var stateMap = new WeakMap();
-                var seq = 1;
-                var lastPushMs = 0;
-
-                function collectVideosFromRoot(root, out) {
-                  if (!root) return;
+                var videos = document.querySelectorAll ? document.querySelectorAll('video') : [];
+                var entries = [];
+                var now = Date.now();
+                for (var i = 0; i < videos.length && i < 8; i++) {
+                  var v = videos[i];
+                  var rect = v.getBoundingClientRect ? v.getBoundingClientRect() : { width: 0, height: 0, top: 0, bottom: 0 };
+                  var area = Math.max(0, Number(rect.width || 0)) * Math.max(0, Number(rect.height || 0));
+                  var isVisible = area > 400 && rect.bottom > 0 && rect.top < (window.innerHeight || 1000);
+                  var dur = (v.duration && isFinite(v.duration)) ? Number(v.duration) : 0;
+                  var curTime = Number(v.currentTime || 0);
+                  var vw = Number(v.videoWidth || 0);
+                  var vh = Number(v.videoHeight || 0);
+                  var poster = v.poster || v.getAttribute('poster') || '';
+                  var titleHint = (v.getAttribute('title') || v.getAttribute('aria-label') || '').trim();
+                  var sourceUrls = [];
                   try {
-                    var list = root.querySelectorAll ? root.querySelectorAll('video') : [];
-                    for (var i = 0; i < list.length; i++) {
-                      if (out.indexOf(list[i]) === -1) out.push(list[i]);
+                    var srcs = v.querySelectorAll('source');
+                    for (var s = 0; s < srcs.length; s++) {
+                      var su = srcs[s].src || srcs[s].getAttribute('data-src') || '';
+                      if (su && sourceUrls.indexOf(su) === -1) sourceUrls.push(su);
                     }
-                    var allEls = root.querySelectorAll ? root.querySelectorAll('*') : [];
-                    for (var j = 0; j < allEls.length; j++) {
-                      var el = allEls[j];
-                      if (el.shadowRoot) collectVideosFromRoot(el.shadowRoot, out);
-                    }
-                    var frames = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
-                    for (var k = 0; k < frames.length; k++) {
-                      try {
-                        var doc = frames[k].contentDocument;
-                        if (doc) collectVideosFromRoot(doc, out);
-                      } catch (crossOriginErr) {}
-                    }
-                  } catch (e) {}
-                }
-
-                function ensureState(video) {
-                  var st = stateMap.get(video);
-                  if (!st) {
-                    st = {
-                      id: 'v_' + (seq++),
-                      lastTime: Number(video.currentTime || 0),
-                      lastAdvanceMs: 0,
-                      lastPlayEventMs: 0,
-                      lastUpdatedMs: Date.now()
-                    };
-                    stateMap.set(video, st);
-                    bindVideoEvents(video);
-                  }
-                  return st;
-                }
-
-                function isLikelyAdElement(video, st) {
-                  var cls = ((video.className || '') + ' ' + (video.id || '')).toLowerCase();
-                  var srcStr = ((video.currentSrc || '') + ' ' + (video.getAttribute('src') || '')).toLowerCase();
-                  if (/(\bad[-_]?|preroll|vast|sponsored|doubleclick|googlesyndication)/.test(cls) ||
-                      /(doubleclick|googlesyndication|preroll|vast|adsystem)/.test(srcStr)) {
-                    return true;
-                  }
-                  return false;
-                }
-
-                function bindVideoEvents(video) {
-                  if (video.__bhBound) return;
-                  video.__bhBound = true;
-                  var onPlay = function() {
-                    var st = ensureState(video);
-                    st.lastPlayEventMs = Date.now();
-                    st.lastUpdatedMs = st.lastPlayEventMs;
-                    window.__bhPublishSnapshot(true);
-                  };
-                  var onTimeUpdate = function() {
-                    var st = ensureState(video);
-                    var now = Date.now();
-                    var cur = Number(video.currentTime || 0);
-                    if (Math.abs(cur - st.lastTime) > 0.04) {
-                      st.lastTime = cur;
-                      st.lastAdvanceMs = now;
-                    }
-                    st.lastUpdatedMs = now;
-                    window.__bhPublishSnapshot(false);
-                  };
-                  var onMeta = function() {
-                    var st = ensureState(video);
-                    st.lastUpdatedMs = Date.now();
-                    window.__bhPublishSnapshot(true);
-                  };
-                  video.addEventListener('play', onPlay, { passive: true });
-                  video.addEventListener('playing', onPlay, { passive: true });
-                  video.addEventListener('loadedmetadata', onMeta, { passive: true });
-                  video.addEventListener('pause', onMeta, { passive: true });
-                  video.addEventListener('ended', onMeta, { passive: true });
-                  video.addEventListener('timeupdate', onTimeUpdate, { passive: true });
-                }
-
-                function findPosterAndTitle(video, allowFrameCapture) {
-                  var poster = video.poster || video.getAttribute('poster') || video.getAttribute('data-poster') || '';
-                  var titleHint = (video.getAttribute('title') || video.getAttribute('aria-label') || '').trim();
-                  try {
-                    var container = video.closest ? video.closest('article, [role="article"], figure, ytm-video-with-context-renderer, ytd-video-renderer, [data-testid*="video"], .video-card, .post, li') : null;
-                    if (!container && video.parentElement) {
-                      container = video.parentElement.parentElement || video.parentElement;
-                    }
-                    if (container) {
-                      if (!poster) {
-                        var imgs = container.querySelectorAll ? container.querySelectorAll('img') : [];
-                        var bestImgScore = 0;
-                        for (var ii = 0; ii < imgs.length; ii++) {
-                          var img = imgs[ii];
-                          var imgSrc = img.currentSrc || img.src || img.getAttribute('data-src') || '';
-                          if (!imgSrc || /^data:image\/svg/i.test(imgSrc)) continue;
-                          var iw = Number(img.naturalWidth || img.width || 0);
-                          var ih = Number(img.naturalHeight || img.height || 0);
-                          var area = iw * ih;
-                          if ((iw >= 80 || ih >= 60 || area === 0) && area >= bestImgScore) {
-                            bestImgScore = area;
-                            poster = imgSrc;
-                          }
-                        }
-                      }
-                      if (!titleHint) {
-                        var heading = container.querySelector ? container.querySelector('h1, h2, h3, h4, [class*="title"], [class*="caption"], figcaption') : null;
-                        if (heading && heading.textContent) {
-                          titleHint = heading.textContent.trim().slice(0, 80);
-                        }
-                      }
-                    }
-                  } catch (domThumbErr) {}
-
-                  if (!poster && allowFrameCapture && Number(video.readyState || 0) >= 2 && Number(video.videoWidth || 0) > 0 && Number(video.videoHeight || 0) > 0) {
-                    try {
-                      var cw = 160;
-                      var ch = Math.max(68, Math.round((cw * Number(video.videoHeight)) / Number(video.videoWidth)));
-                      var canvas = document.createElement('canvas');
-                      canvas.width = cw;
-                      canvas.height = ch;
-                      var ctx = canvas.getContext('2d');
-                      if (ctx) {
-                        ctx.drawImage(video, 0, 0, cw, ch);
-                        poster = canvas.toDataURL('image/jpeg', 0.65);
-                      }
-                    } catch (corsErr) {}
-                  }
-                  return { poster: poster, titleHint: titleHint };
-                }
-
-                function buildSnapshotObject(includeFrames) {
-                  var videos = [];
-                  collectVideosFromRoot(document, videos);
-                  var now = Date.now();
-                  var entries = [];
-                  var hasLongUnmutedVideo = videos.some(function(v) {
-                    return !v.muted && (Number(v.duration || 0) > 20 || Number(v.videoHeight || 0) >= 480);
+                  } catch (e1) {}
+                  var score = 0;
+                  if (!v.paused && !v.ended) score += 8000;
+                  if (isVisible) score += 1200;
+                  if (vh > 0) score += Math.min(vh, 2160);
+                  if (dur > 0) score += Math.min(dur * 15, 1800);
+                  if (!v.muted) score += 600;
+                  if (v.currentSrc) score += 400;
+                  entries.push({
+                    elementId: 'v_' + (i + 1),
+                    currentSrc: v.currentSrc || '',
+                    src: v.getAttribute('src') || v.src || '',
+                    sourceUrls: sourceUrls,
+                    duration: dur,
+                    currentTime: curTime,
+                    videoWidth: vw,
+                    videoHeight: vh,
+                    paused: !!v.paused,
+                    ended: !!v.ended,
+                    muted: !!v.muted,
+                    isAdvancing: !v.paused && !v.ended,
+                    isVisible: isVisible,
+                    viewportArea: area,
+                    lastPlayEventMs: 0,
+                    lastAdvanceMs: 0,
+                    lastUpdatedMs: now,
+                    isLikelyAd: false,
+                    score: score,
+                    posterUrl: poster || '',
+                    titleHint: titleHint || ''
                   });
-
-                  for (var i = 0; i < videos.length; i++) {
-                    var v = videos[i];
-                    var st = ensureState(v);
-                    var curTime = Number(v.currentTime || 0);
-                    if (Math.abs(curTime - st.lastTime) > 0.04) {
-                      st.lastTime = curTime;
-                      st.lastAdvanceMs = now;
-                    }
-                    var isAdvancing = !v.paused && !v.ended && (
-                      (now - st.lastAdvanceMs) <= 2800 ||
-                      (now - st.lastPlayEventMs) <= 2800 ||
-                      Number(v.readyState || 0) >= 3
-                    );
-                    var rect = v.getBoundingClientRect ? v.getBoundingClientRect() : { width: 0, height: 0, top: 0, bottom: 0 };
-                    var area = Math.max(0, Number(rect.width || 0)) * Math.max(0, Number(rect.height || 0));
-                    var isVisible = area > 400 && rect.bottom > 0 && rect.top < (window.innerHeight || 1000);
-                    var dur = (v.duration && isFinite(v.duration)) ? Number(v.duration) : 0;
-                    var vw = Number(v.videoWidth || 0);
-                    var vh = Number(v.videoHeight || 0);
-                    var likelyAd = isLikelyAdElement(v, st) && (hasLongUnmutedVideo || videos.length > 1);
-                    var metaHint = findPosterAndTitle(v, !!includeFrames && entries.length < 8);
-
-                    var sourceUrls = [];
-                    try {
-                      var srcs = v.querySelectorAll('source');
-                      for (var s = 0; s < srcs.length; s++) {
-                        var su = srcs[s].src || srcs[s].getAttribute('data-src') || '';
-                        if (su && sourceUrls.indexOf(su) === -1) sourceUrls.push(su);
-                      }
-                    } catch (e2) {}
-
-                    var score = 0;
-                    if (!v.paused && !v.ended && isAdvancing) score += 10000;
-                    else if (!v.paused && !v.ended) score += 5000;
-                    if (st.lastAdvanceMs > 0) score += Math.max(0, 3000 - ((now - st.lastAdvanceMs) / 10));
-                    if (st.lastPlayEventMs > 0) score += Math.max(0, 2000 - ((now - st.lastPlayEventMs) / 10));
-                    if (isVisible) score += 1200;
-                    if (vh > 0) score += Math.min(vh, 2160);
-                    if (dur > 0) score += Math.min(dur * 15, 1800);
-                    if (!v.muted) score += 600;
-                    if (v.currentSrc) score += 400;
-                    if (likelyAd) score -= 9000;
-
-                    entries.push({
-                      elementId: st.id,
-                      currentSrc: v.currentSrc || '',
-                      src: v.getAttribute('src') || v.src || '',
-                      sourceUrls: sourceUrls,
-                      duration: dur,
-                      currentTime: curTime,
-                      videoWidth: vw,
-                      videoHeight: vh,
-                      paused: !!v.paused,
-                      ended: !!v.ended,
-                      muted: !!v.muted,
-                      isAdvancing: isAdvancing,
-                      isVisible: isVisible,
-                      viewportArea: area,
-                      lastPlayEventMs: st.lastPlayEventMs,
-                      lastAdvanceMs: st.lastAdvanceMs,
-                      lastUpdatedMs: st.lastUpdatedMs,
-                      isLikelyAd: likelyAd,
-                      score: score,
-                      posterUrl: metaHint.poster || '',
-                      titleHint: metaHint.titleHint || ''
-                    });
-                  }
-
-                  var activeIndex = -1;
-                  var bestScore = -999999;
-                  for (var idx = 0; idx < entries.length; idx++) {
-                    if (entries[idx].score > bestScore) {
-                      bestScore = entries[idx].score;
-                      activeIndex = idx;
-                    }
-                  }
-
-                  var domUrls = [];
-                  var pushDom = function(u) {
-                    if (u && typeof u === 'string' && /^https?:\/\//i.test(u) && domUrls.indexOf(u) === -1) {
-                      domUrls.push(u);
-                    }
-                  };
-                  if (activeIndex >= 0) {
-                    pushDom(entries[activeIndex].currentSrc);
-                    pushDom(entries[activeIndex].src);
-                    entries[activeIndex].sourceUrls.forEach(pushDom);
-                  }
-                  entries.forEach(function(item) {
-                    if (!item.isLikelyAd) {
-                      pushDom(item.currentSrc);
-                      pushDom(item.src);
-                      item.sourceUrls.forEach(pushDom);
-                    }
-                  });
-                  var pagePosterUrl = '';
-                  try {
-                    var ogImg = document.querySelector('meta[property="og:image"], meta[name="twitter:image"], link[rel="image_src"]');
-                    if (ogImg) {
-                      pagePosterUrl = ogImg.getAttribute('content') || ogImg.getAttribute('href') || '';
-                    }
-                    document.querySelectorAll('meta[property*="og:video"], meta[name*="twitter:player:stream"]').forEach(function(m) {
-                      pushDom(m.getAttribute('content'));
-                    });
-                  } catch (e3) {}
-                  try {
-                    if (window.performance && window.performance.getEntriesByType) {
-                      window.performance.getEntriesByType('resource').forEach(function(r) {
-                        var name = r && r.name ? r.name : '';
-                        if (/\.(mp4|m3u8|mpd|webm|mov|m4v)(\?|$|#)/i.test(name) || /videoplayback|mime=video/i.test(name)) {
-                          pushDom(name);
-                        }
-                      });
-                    }
-                  } catch (e4) {}
-
-                  return {
-                    pageUrl: window.location.href || '',
-                    pageTitle: document.title || '',
-                    pagePosterUrl: pagePosterUrl || '',
-                    activeIndex: activeIndex,
-                    videos: entries.slice(0, 12),
-                    domUrls: domUrls.slice(0, 20)
-                  };
                 }
-
-                window.__bhBuildSnapshotJson = function(includeFrames) {
-                  return JSON.stringify(buildSnapshotObject(!!includeFrames));
-                };
-
-                window.__bhPublishSnapshot = function(force) {
-                  var now = Date.now();
-                  if (!force && (now - lastPushMs) < 400) return;
-                  lastPushMs = now;
-                  try {
-                    var json = window.__bhBuildSnapshotJson();
-                    if (window.BlackholeVaultMonitor && window.BlackholeVaultMonitor.onVideoTelemetry) {
-                      window.BlackholeVaultMonitor.onVideoTelemetry(json);
-                    }
-                  } catch (e) {}
-                };
-
-                document.addEventListener('play', function(ev) {
-                  if (ev && ev.target && ev.target.tagName === 'VIDEO') {
-                    var st = ensureState(ev.target);
-                    st.lastPlayEventMs = Date.now();
-                    window.__bhPublishSnapshot(true);
+                var activeIndex = -1;
+                var bestScore = -999999;
+                for (var idx = 0; idx < entries.length; idx++) {
+                  if (entries[idx].score > bestScore) {
+                    bestScore = entries[idx].score;
+                    activeIndex = idx;
                   }
-                }, true);
-
-                document.addEventListener('playing', function(ev) {
-                  if (ev && ev.target && ev.target.tagName === 'VIDEO') {
-                    var st = ensureState(ev.target);
-                    st.lastPlayEventMs = Date.now();
-                    window.__bhPublishSnapshot(true);
+                }
+                var domUrls = [];
+                var pushDom = function(u) {
+                  if (u && typeof u === 'string' && /^https?:\/\//i.test(u) && domUrls.indexOf(u) === -1) {
+                    domUrls.push(u);
                   }
-                }, true);
-
+                };
+                if (activeIndex >= 0) {
+                  pushDom(entries[activeIndex].currentSrc);
+                  pushDom(entries[activeIndex].src);
+                  entries[activeIndex].sourceUrls.forEach(pushDom);
+                }
+                var pagePosterUrl = '';
                 try {
-                  var mo = new MutationObserver(function() {
-                    var vids = [];
-                    collectVideosFromRoot(document, vids);
-                    for (var i = 0; i < vids.length; i++) ensureState(vids[i]);
-                  });
-                  if (document.documentElement) {
-                    mo.observe(document.documentElement, { childList: true, subtree: true });
-                  }
-                } catch (e5) {}
-
-                window.__bhPublishSnapshot(true);
-              } catch (outerErr) {}
-            })();
-        """.trimIndent()
-
-        private val CAPTURE_SNAPSHOT_SCRIPT: String = """
-            (function() {
-              try {
-                if (typeof window.__bhBuildSnapshotJson === 'function') {
-                  return window.__bhBuildSnapshotJson(true);
-                }
-              } catch (e) {}
-              return null;
+                  var ogImg = document.querySelector('meta[property="og:image"], meta[name="twitter:image"], link[rel="image_src"]');
+                  if (ogImg) pagePosterUrl = ogImg.getAttribute('content') || ogImg.getAttribute('href') || '';
+                } catch (e2) {}
+                return JSON.stringify({
+                  pageUrl: window.location.href || '',
+                  pageTitle: document.title || '',
+                  pagePosterUrl: pagePosterUrl || '',
+                  activeIndex: activeIndex,
+                  videos: entries,
+                  domUrls: domUrls.slice(0, 10)
+                });
+              } catch (err) {
+                return null;
+              }
             })();
         """.trimIndent()
     }

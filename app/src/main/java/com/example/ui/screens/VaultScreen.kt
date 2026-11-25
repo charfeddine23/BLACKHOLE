@@ -92,6 +92,7 @@ import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.PlasmaViolet
 import com.example.ui.viewmodel.BlackholeViewModel
+import com.example.vault.browser.EphemeralSessionManager
 import com.example.vault.browser.VaultInspectorUiState
 import com.example.vault.browser.VaultWebViewInspector
 import com.example.vault.data.VaultCategory
@@ -113,8 +114,10 @@ fun VaultScreen(
     val blackholeUiState by viewModel.uiState.collectAsStateWithLifecycle()
     val noScreenshotEnabled by vaultViewModel.noScreenshotEnabled.collectAsStateWithLifecycle()
     val inspectorState by vaultViewModel.inspectorState.collectAsStateWithLifecycle()
+    val rateLimiterStatus by vaultViewModel.rateLimiterStatus.collectAsStateWithLifecycle()
     val ytDlpBackendUrl by vaultViewModel.ytDlpBackendUrl.collectAsStateWithLifecycle()
     val browserScope = rememberCoroutineScope()
+    val ephemeralSessionManager = remember { EphemeralSessionManager(initialEphemeralMode = true) }
     val vaultWebViewInspector = remember { VaultWebViewInspector() }
     val vaultWebViewMonitor = vaultWebViewInspector.monitor
     val activeDetectedVideo by vaultWebViewInspector.activeVideoTelemetry.collectAsStateWithLifecycle()
@@ -557,6 +560,8 @@ fun VaultScreen(
                             vaultViewModel.inspectCurrentPage(pageUrl = pageUrl)
                         },
                         webViewMonitor = vaultWebViewMonitor,
+                        ephemeralSessionManager = ephemeralSessionManager,
+                        rateLimiterStatus = rateLimiterStatus,
                         onPullCurrentPageWithMedia = { pageUrl, liveWebView, sniffedVideos, sniffedAudios, snapshot, interceptedMedia ->
                             browserScope.launch {
                                 val freshCapture = if (liveWebView != null) {
@@ -564,16 +569,14 @@ fun VaultScreen(
                                 } else {
                                     null
                                 }
-                                collectLiveWebViewMediaCandidates(liveWebView) { _, domUrls ->
-                                    vaultViewModel.inspectCurrentPage(
-                                        pageUrl = pageUrl,
-                                        snapshot = freshCapture,
-                                        domVideoUrls = (snapshot?.domCandidateUrls.orEmpty() + freshCapture?.domCandidateUrls.orEmpty() + domUrls).distinct(),
-                                        sniffedVideoUrls = sniffedVideos,
-                                        sniffedAudioUrls = sniffedAudios,
-                                        interceptedMedia = interceptedMedia,
-                                    )
-                                }
+                                vaultViewModel.inspectCurrentPage(
+                                    pageUrl = pageUrl,
+                                    snapshot = freshCapture,
+                                    domVideoUrls = (snapshot?.domCandidateUrls.orEmpty() + freshCapture?.domCandidateUrls.orEmpty()).distinct(),
+                                    sniffedVideoUrls = sniffedVideos,
+                                    sniffedAudioUrls = sniffedAudios,
+                                    interceptedMedia = interceptedMedia,
+                                )
                             }
                         },
                         onExitBrowser = vaultViewModel::closePrivateBrowser,
@@ -592,6 +595,7 @@ fun VaultScreen(
                                 sniffedCandidatesCount = if (isHomeTab) 0 else sniffedVideos.size,
                                 isPageActive = !isHomeTab,
                                 activeDetectedVideo = if (isHomeTab) null else activeDetectedVideo,
+                                rateLimiterStatus = rateLimiterStatus,
                                 onTapBlackhole = {
                                     val capturedIntercepted = if (isHomeTab) emptyList() else getInterceptedMedia()
                                     browserScope.launch {
@@ -600,16 +604,14 @@ fun VaultScreen(
                                         } else {
                                             null
                                         }
-                                        collectLiveWebViewMediaCandidates(activeWebView) { _, domUrls ->
-                                            vaultViewModel.inspectCurrentPage(
-                                                pageUrl = currentPageUrl,
-                                                snapshot = freshCapture,
-                                                domVideoUrls = (freshCapture?.domCandidateUrls.orEmpty() + domUrls).distinct(),
-                                                sniffedVideoUrls = sniffedVideos,
-                                                sniffedAudioUrls = sniffedAudios,
-                                                interceptedMedia = capturedIntercepted,
-                                            )
-                                        }
+                                        vaultViewModel.inspectCurrentPage(
+                                            pageUrl = currentPageUrl,
+                                            snapshot = freshCapture,
+                                            domVideoUrls = freshCapture?.domCandidateUrls.orEmpty().distinct(),
+                                            sniffedVideoUrls = sniffedVideos,
+                                            sniffedAudioUrls = sniffedAudios,
+                                            interceptedMedia = capturedIntercepted,
+                                        )
                                     }
                                 },
                                 onSelectCandidate = vaultViewModel::downloadSelectedCandidate,
@@ -738,6 +740,7 @@ fun VaultScreen(
                     onConfirmDownload = vaultViewModel::confirmInspectorDownload,
                     onSaveYtDlpBackendUrl = vaultViewModel::setYtDlpBackendUrl,
                     onCancelOrDismiss = vaultViewModel::dismissInspector,
+                    rateLimiterStatus = rateLimiterStatus,
                 )
             }
         }
