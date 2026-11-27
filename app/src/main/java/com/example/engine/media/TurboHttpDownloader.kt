@@ -47,6 +47,9 @@ object TurboHttpDownloader {
 
         val probeOutcome = runCatching {
             client.newCall(probeReq).execute().use { response ->
+                if (isNonMediaErrorResponse(response)) {
+                    return@use ProbeResult.AbortedHtmlOrError
+                }
                 when (response.code) {
                     206 -> {
                         val contentRange = response.header("Content-Range").orEmpty()
@@ -76,6 +79,7 @@ object TurboHttpDownloader {
         }
 
         return when (probeOutcome) {
+            is ProbeResult.AbortedHtmlOrError -> false
             is ProbeResult.AlreadyStreamed -> probeOutcome.success
             is ProbeResult.SupportsRange -> {
                 val total = probeOutcome.totalBytes
@@ -109,6 +113,7 @@ object TurboHttpDownloader {
         data class SupportsRange(val totalBytes: Long) : ProbeResult
         data class AlreadyStreamed(val success: Boolean) : ProbeResult
         data object FallbackSingleGet : ProbeResult
+        data object AbortedHtmlOrError : ProbeResult
     }
 
     private suspend fun downloadParallelRanges(
@@ -196,6 +201,7 @@ object TurboHttpDownloader {
             val chunkDone = runCatching {
                 client.newCall(req).execute().use { response ->
                     if (response.code != 206 && !response.isSuccessful) return@use false
+                    if (isNonMediaErrorResponse(response)) return@use false
                     // If server returned 200 instead of 206 for a non-zero offset, fail fast to single stream
                     if (response.code == 200 && reqStart > 0L) return@use false
 
@@ -256,9 +262,21 @@ object TurboHttpDownloader {
     ): Boolean {
         val req = buildRequest(url, headers)
         return client.newCall(req).execute().use { response ->
-            if (!response.isSuccessful) return@use false
+            if (!response.isSuccessful || isNonMediaErrorResponse(response)) return@use false
             streamResponseBody(response, destination, isCancelled, onBytes)
         }
+    }
+
+    private fun isNonMediaErrorResponse(response: Response): Boolean {
+        val contentType = response.header("Content-Type")
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase()
+            .orEmpty()
+        return contentType.startsWith("text/html") ||
+            contentType == "application/xhtml+xml" ||
+            contentType == "application/json" ||
+            contentType.startsWith("image/")
     }
 
     private fun streamResponseBody(
@@ -267,6 +285,7 @@ object TurboHttpDownloader {
         isCancelled: () -> Boolean,
         onBytes: (downloaded: Long, contentLength: Long) -> Unit,
     ): Boolean {
+        if (isNonMediaErrorResponse(response)) return false
         val body = response.body ?: return false
         val totalBytes = body.contentLength()
         var bytesDownloaded = 0L

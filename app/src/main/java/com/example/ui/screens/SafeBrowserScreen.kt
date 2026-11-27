@@ -1,9 +1,13 @@
 package com.example.ui.screens
 
 import android.annotation.SuppressLint
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.view.View
 import android.view.ViewGroup
+import android.webkit.PermissionRequest
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -150,6 +154,8 @@ fun SafeBrowserScreen(
     var sessionBannerMessage by remember { mutableStateOf<String?>(null) }
     var activePreview by remember { mutableStateOf<PublicLinkPreviewResult?>(null) }
     var previewError by remember { mutableStateOf<String?>(null) }
+    var customFullscreenView by remember { mutableStateOf<View?>(null) }
+    var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
     val previewHttpClient = remember {
         OkHttpClient.Builder()
@@ -159,8 +165,15 @@ fun SafeBrowserScreen(
             .build()
     }
 
+    fun exitFullscreenVideo() {
+        runCatching { customViewCallback?.onCustomViewHidden() }
+        customFullscreenView = null
+        customViewCallback = null
+    }
+
     DisposableEffect(sessionManager) {
         onDispose {
+            exitFullscreenVideo()
             sessionManager.disposeWebView(webViewRef)
             webViewRef = null
         }
@@ -168,10 +181,10 @@ fun SafeBrowserScreen(
 
     BackHandler {
         val wv = webViewRef
-        if (wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else {
-            onBack()
+        when {
+            customFullscreenView != null -> exitFullscreenVideo()
+            wv != null && wv.canGoBack() -> wv.goBack()
+            else -> onBack()
         }
     }
 
@@ -540,14 +553,71 @@ fun SafeBrowserScreen(
                                     canGoForward = view?.canGoForward() == true
                                 }
                             }
+                            webChromeClient = object : WebChromeClient() {
+                                override fun getDefaultVideoPoster(): Bitmap {
+                                    return SafeWebViewConfig.createDarkVideoPosterBitmap()
+                                }
+
+                                override fun onPermissionRequest(request: PermissionRequest?) {
+                                    val req = request ?: return
+                                    val allowedResources = req.resources.filter { res ->
+                                        res == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID
+                                    }.toTypedArray()
+                                    if (allowedResources.isNotEmpty()) {
+                                        runCatching { req.grant(allowedResources) }
+                                    } else {
+                                        runCatching { req.deny() }
+                                    }
+                                }
+
+                                override fun onShowCustomView(
+                                    view: View?,
+                                    callback: CustomViewCallback?,
+                                ) {
+                                    if (view == null) return
+                                    customViewCallback?.onCustomViewHidden()
+                                    customFullscreenView = view
+                                    customViewCallback = callback
+                                }
+
+                                override fun onHideCustomView() {
+                                    exitFullscreenVideo()
+                                }
+                            }
+                            onResume()
+                            resumeTimers()
                             webViewRef = this
                             loadUrl(currentUrl)
                         }
+                    },
+                    update = { wv ->
+                        wv.onResume()
+                        wv.resumeTimers()
                     },
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("safe_browser_webview"),
                 )
+
+                val fsView = customFullscreenView
+                if (fsView != null) {
+                    AndroidView(
+                        factory = { ctx ->
+                            FrameLayout(ctx).apply {
+                                setBackgroundColor(android.graphics.Color.BLACK)
+                                (fsView.parent as? ViewGroup)?.removeView(fsView)
+                                addView(
+                                    fsView,
+                                    FrameLayout.LayoutParams(
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ),
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
 
             // 3. Clean Separation Card: Sanitized Public Metadata Preview + Rate-Limited Action Trigger

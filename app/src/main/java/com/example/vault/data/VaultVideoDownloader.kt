@@ -2,6 +2,9 @@ package com.example.vault.data
 
 import android.content.Context
 import android.net.Uri
+import com.example.engine.media.LocalMediaMuxer
+import com.example.engine.media.TurboHttpDownloader
+import com.example.engine.network.ClientSpoofer
 import com.example.vault.browser.SafeWebViewConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -69,6 +72,8 @@ class VaultVideoDownloader(
         streamUrl: String,
         refererOrigin: String?,
         suggestedTitle: String,
+        audioStreamUrl: String? = null,
+        extraHeaders: Map<String, String> = emptyMap(),
     ): Flow<VaultDownloadEvent> = flow {
         val cleanUrl = streamUrl.trim()
         if (!cleanUrl.startsWith("http://", ignoreCase = true) &&
@@ -106,20 +111,31 @@ class VaultVideoDownloader(
         val safeTitle = sanitizeFileTitle(suggestedTitle)
         emit(VaultDownloadEvent.Starting(streamUrl = cleanUrl, title = safeTitle))
 
+        val baseHeaders = buildMap {
+            put("User-Agent", SafeWebViewConfig.STANDARD_ANDROID_CHROME_USER_AGENT)
+            put("Accept", "video/*,application/octet-stream;q=0.9,*/*;q=0.5")
+            val safeReferer = refererOrigin?.trim().orEmpty()
+            if (safeReferer.startsWith("http://", ignoreCase = true) ||
+                safeReferer.startsWith("https://", ignoreCase = true)
+            ) {
+                put("Referer", safeReferer)
+            }
+            extraHeaders.forEach { (k, v) ->
+                if (!k.equals("Cookie", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) {
+                    put(k, v)
+                }
+            }
+        }
+        val cleanRequestHeaders = ClientSpoofer.buildDownloadHeaders(cleanUrl, baseHeaders)
+
         val requestBuilder = Request.Builder()
             .url(cleanUrl)
             .get()
-            .header("User-Agent", SafeWebViewConfig.STANDARD_ANDROID_CHROME_USER_AGENT)
-            .header("Accept", "video/*,application/octet-stream;q=0.9,*/*;q=0.5")
-
-        val safeReferer = refererOrigin?.trim().orEmpty()
-        if (safeReferer.startsWith("http://", ignoreCase = true) ||
-            safeReferer.startsWith("https://", ignoreCase = true)
-        ) {
-            requestBuilder.header("Referer", safeReferer)
-        }
+        cleanRequestHeaders.forEach { (k, v) -> requestBuilder.header(k, v) }
 
         val tempPartFile = File(stagingDir, "${safeTitle}_${UUID.randomUUID().toString().take(8)}.mp4.part")
+        var audioPartFile: File? = null
+        var muxedPartFile: File? = null
         var finalizedTempFile: File? = null
 
         try {
@@ -242,6 +258,35 @@ class VaultVideoDownloader(
                     runCatching { tempPartFile.delete() }
                 }
 
+                val cleanAudioUrl = audioStreamUrl?.trim().orEmpty()
+                if (cleanAudioUrl.startsWith("http://", ignoreCase = true) ||
+                    cleanAudioUrl.startsWith("https://", ignoreCase = true)
+                ) {
+                    val tempAudio = File(stagingDir, "${safeTitle}_a_${UUID.randomUUID().toString().take(8)}.mp4")
+                    val tempMuxed = File(stagingDir, "${safeTitle}_m_${UUID.randomUUID().toString().take(8)}.mp4")
+                    audioPartFile = tempAudio
+                    muxedPartFile = tempMuxed
+                    val audioHeaders = ClientSpoofer.buildDownloadHeaders(cleanAudioUrl, baseHeaders)
+                    val audioOk = runCatching {
+                        TurboHttpDownloader.downloadToFile(
+                            client = okHttpClient,
+                            url = cleanAudioUrl,
+                            headers = audioHeaders,
+                            destination = tempAudio,
+                            isCancelled = { false },
+                            onBytes = { _, _ -> },
+                        )
+                    }.getOrDefault(false)
+                    if (audioOk && tempAudio.exists() && tempAudio.length() > 1024L &&
+                        LocalMediaMuxer.mergeVideoAndAudio(readyTempFile, tempAudio, tempMuxed) &&
+                        tempMuxed.exists() && tempMuxed.length() > MIN_VALID_VIDEO_BYTES
+                    ) {
+                        tempMuxed.copyTo(readyTempFile, overwrite = true)
+                    }
+                    runCatching { tempAudio.delete() }
+                    runCatching { tempMuxed.delete() }
+                }
+
                 emit(
                     VaultDownloadEvent.SavingToVault(
                         title = safeTitle,
@@ -309,6 +354,8 @@ class VaultVideoDownloader(
             )
         } finally {
             runCatching { if (tempPartFile.exists()) tempPartFile.delete() }
+            runCatching { audioPartFile?.let { if (it.exists()) it.delete() } }
+            runCatching { muxedPartFile?.let { if (it.exists()) it.delete() } }
             runCatching {
                 finalizedTempFile?.let { file ->
                     if (file.exists()) file.delete()

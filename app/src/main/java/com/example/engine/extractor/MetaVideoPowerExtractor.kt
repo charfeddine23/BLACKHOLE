@@ -39,46 +39,58 @@ internal class MetaVideoPowerExtractor(
 ) {
 
     fun extractInstagram(rawUrl: String): MetaExtractionOutcome {
-        val canonicalUrl = resolveRedirects(rawUrl, "https://www.instagram.com/")
+        val rawResolved = resolveRedirects(rawUrl, "https://www.instagram.com/")
         val found = mutableListOf<ExtractedStream>()
         var authChallenge = false
-        val shortcode = Regex("""(?:instagram\.com|instagr\.am)/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)""")
-            .find(canonicalUrl)?.groupValues?.getOrNull(1)
-
-        val csrfToken = cookieVault?.getCookieValue("https://www.instagram.com/", "csrftoken")
-            ?: "missing"
-        val igHeadersBase = linkedMapOf(
-            "Referer" to "https://www.instagram.com/",
-            "Origin" to "https://www.instagram.com",
-            "X-IG-App-ID" to "936619743392459",
-            "X-ASBD-ID" to "129477",
-            "X-IG-WWW-Claim" to "0",
-            "X-CSRFToken" to csrfToken,
-            "Accept-Language" to "en-US,en;q=0.9",
+        val shortcodePattern = Regex(
+            """(?:instagram\.com|instagr\.am)/(?:[^/]+/)?(?:share/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)""",
+            RegexOption.IGNORE_CASE,
         )
+        val shortcode = shortcodePattern.find(rawResolved)?.groupValues?.getOrNull(1)
+            ?: shortcodePattern.find(rawUrl)?.groupValues?.getOrNull(1)
+        val canonicalUrl = if (!shortcode.isNullOrBlank()) {
+            val isReel = rawResolved.contains("/reel", ignoreCase = true) ||
+                rawUrl.contains("/reel", ignoreCase = true)
+            if (isReel) "https://www.instagram.com/reel/$shortcode/" else "https://www.instagram.com/p/$shortcode/"
+        } else {
+            stripInstagramTrackingParams(rawResolved)
+        }
+
+        var csrfToken = cookieVault?.getCookieValue("https://www.instagram.com/", "csrftoken")
+            .orEmpty()
+        var lsdToken = ""
 
         val mediaId = shortcode?.let(::shortcodeToInstagramMediaId)
         val hasSessionCookie = !cookieVault?.getCookieValue("https://www.instagram.com/", "sessionid").isNullOrBlank()
 
-        // Layer 1 & 2: Authenticated /api/v1/media/{id}/info/ (Android App + Web)
-        if (!mediaId.isNullOrBlank()) {
-            val apiEndpoints = if (hasSessionCookie) {
-                listOf(
-                    "https://i.instagram.com/api/v1/media/$mediaId/info/" to ClientSpoofer.INSTAGRAM_ANDROID_USER_AGENT,
-                    "https://www.instagram.com/api/v1/media/$mediaId/info/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
-                )
-            } else {
-                listOf(
-                    "https://www.instagram.com/api/v1/media/$mediaId/info/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
-                )
-            }
+        fun buildIgApiHeaders(csrf: String, lsd: String): Map<String, String> = linkedMapOf<String, String>().apply {
+            put("Referer", "https://www.instagram.com/")
+            put("Origin", "https://www.instagram.com")
+            put("X-IG-App-ID", "936619743392459")
+            put("X-ASBD-ID", "129477")
+            put("X-IG-WWW-Claim", "0")
+            put("X-CSRFToken", csrf.ifBlank { "missing" })
+            put("Accept-Language", "en-US,en;q=0.9")
+            put("Sec-Fetch-Site", "same-origin")
+            put("Sec-Fetch-Mode", "cors")
+            put("Sec-Fetch-Dest", "empty")
+            if (lsd.isNotBlank()) put("X-FB-LSD", lsd)
+        }
+
+        // Layer 1 & 2: /api/v1/media/{id}/info/ (run first when session cookie exists; otherwise warm embed first for csrftoken/lsd)
+        if (!mediaId.isNullOrBlank() && hasSessionCookie) {
+            val apiEndpoints = listOf(
+                "https://i.instagram.com/api/v1/media/$mediaId/info/" to ClientSpoofer.INSTAGRAM_ANDROID_USER_AGENT,
+                "https://www.instagram.com/api/v1/media/$mediaId/info/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+            )
+            val apiHeaders = buildIgApiHeaders(csrfToken, lsdToken)
             for ((endpoint, ua) in apiEndpoints) {
                 val req = Request.Builder()
                     .url(endpoint)
                     .header("User-Agent", ua)
                     .header("Accept", "application/json")
                     .header("X-Requested-With", "XMLHttpRequest")
-                    .apply { igHeadersBase.forEach { (k, v) -> header(k, v) } }
+                    .apply { apiHeaders.forEach { (k, v) -> header(k, v) } }
                     .build()
 
                 runCatching {
@@ -92,62 +104,6 @@ internal class MetaVideoPowerExtractor(
                         parseInstagramPayload(
                             rawBody = body,
                             baseUrl = endpoint,
-                            fallbackTitle = shortcode.let { "Instagram_$it" },
-                            ua = ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
-                            out = found,
-                        )
-                    }
-                }
-                if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) break
-            }
-        }
-
-        // Layer 3: Instagram Public GraphQL Endpoint (PolarisPostActionLoadPostQueryQuery)
-        if (found.isEmpty() && !shortcode.isNullOrBlank()) {
-            val docIds = listOf("8845758582119845", "10015901848480474", "24368985919402291")
-            for (docId in docIds) {
-                val variablesJson = JSONObject().apply {
-                    put("shortcode", shortcode)
-                    put("fetch_comment_count", 0)
-                    put("fetch_related_profile_media_count", 0)
-                    put("parent_comment_count", 0)
-                    put("child_comment_count", 0)
-                    put("fetch_like_count", 0)
-                    put("fetch_tagged_user_count", null)
-                    put("fetch_preview_comment_count", 0)
-                    put("has_threaded_comments", false)
-                    put("hoisted_comment_id", null)
-                    put("hoisted_reply_id", null)
-                }.toString()
-
-                val formBody = FormBody.Builder()
-                    .add("variables", variablesJson)
-                    .add("doc_id", docId)
-                    .build()
-
-                val req = Request.Builder()
-                    .url("https://www.instagram.com/graphql/query")
-                    .post(formBody)
-                    .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
-                    .header("Accept", "*/*")
-                    .header("X-FB-Friendly-Name", "PolarisPostActionLoadPostQueryQuery")
-                    .apply { igHeadersBase.forEach { (k, v) -> header(k, v) } }
-                    .build()
-
-                runCatching {
-                    client.newCall(req).execute().use { resp ->
-                        if (resp.code == 401 || resp.code == 403) {
-                            authChallenge = true
-                            return@use
-                        }
-                        if (!resp.isSuccessful) return@use
-                        val body = resp.body?.string().orEmpty()
-                        if (body.contains("login_required") || body.contains("require_login")) {
-                            authChallenge = true
-                        }
-                        parseInstagramPayload(
-                            rawBody = body,
-                            baseUrl = canonicalUrl,
                             fallbackTitle = "Instagram_$shortcode",
                             ua = ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
                             out = found,
@@ -158,20 +114,177 @@ internal class MetaVideoPowerExtractor(
             }
         }
 
-        // Layer 4 & 5: ?__a=1&__d=dis + Captioned Embed + Direct HTML Pages
+        // Layer 2b: Public Embed & Captioned Embed pages first (yields direct video_url AND seeds anonymous csrftoken/lsd)
+        if (found.none { hasConfirmedAudio(it) } && !shortcode.isNullOrBlank()) {
+            val embedTargets = listOf(
+                "https://www.instagram.com/reel/$shortcode/embed/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+                "https://www.instagram.com/p/$shortcode/embed/captioned/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+                "https://www.instagram.com/reel/$shortcode/embed/captioned/" to ClientSpoofer.ANDROID_CHROME_USER_AGENT,
+                "https://www.instagram.com/p/$shortcode/embed/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+            )
+            for ((target, ua) in embedTargets) {
+                val req = Request.Builder()
+                    .url(target)
+                    .header("User-Agent", ua)
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Referer", "https://www.instagram.com/")
+                    .header("Sec-Fetch-Dest", "iframe")
+                    .header("Sec-Fetch-Mode", "navigate")
+                    .build()
+
+                runCatching {
+                    client.newCall(req).execute().use { resp ->
+                        val finalUrl = resp.request.url.toString()
+                        if (resp.code == 401 || resp.code == 403 || finalUrl.contains("/accounts/login", ignoreCase = true)) {
+                            authChallenge = true
+                            return@use
+                        }
+                        if (!resp.isSuccessful) return@use
+                        val body = resp.body?.string().orEmpty()
+                        if (body.isBlank()) return@use
+
+                        if (csrfToken.isBlank()) {
+                            csrfToken = cookieVault?.getCookieValue("https://www.instagram.com/", "csrftoken")
+                                ?: Regex(""""csrf_token"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.getOrNull(1).orEmpty()
+                        }
+                        if (lsdToken.isBlank()) {
+                            lsdToken = Regex("""\["LSD",\s*\[\],\s*\{"token"\s*:\s*"([^"]+)"""")
+                                .find(body)?.groupValues?.getOrNull(1)
+                                ?: Regex(""""lsd"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.getOrNull(1).orEmpty()
+                        }
+
+                        parseInstagramPayload(
+                            rawBody = body,
+                            baseUrl = finalUrl,
+                            fallbackTitle = "Instagram_$shortcode",
+                            ua = ua,
+                            out = found,
+                        )
+                    }
+                }
+                if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) break
+            }
+        }
+
+        // Layer 3: Instagram Public GraphQL Endpoint (PolarisPostActionLoadPostQueryQuery) with bootstrapped csrftoken/lsd
+        if (found.none { hasConfirmedAudio(it) } && !shortcode.isNullOrBlank()) {
+            if (csrfToken.isBlank() || lsdToken.isBlank()) {
+                runCatching {
+                    val warmReq = Request.Builder()
+                        .url(canonicalUrl)
+                        .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
+                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                        .header("Accept-Language", "en-US,en;q=0.9")
+                        .build()
+                    client.newCall(warmReq).execute().use { resp ->
+                        val warmHtml = if (resp.isSuccessful) resp.body?.string()?.take(200_000).orEmpty() else ""
+                        if (csrfToken.isBlank()) {
+                            csrfToken = cookieVault?.getCookieValue("https://www.instagram.com/", "csrftoken")
+                                ?: Regex(""""csrf_token"\s*:\s*"([^"]+)"""").find(warmHtml)?.groupValues?.getOrNull(1).orEmpty()
+                        }
+                        if (lsdToken.isBlank()) {
+                            lsdToken = Regex("""\["LSD",\s*\[\],\s*\{"token"\s*:\s*"([^"]+)"""")
+                                .find(warmHtml)?.groupValues?.getOrNull(1).orEmpty()
+                        }
+                        if (warmHtml.isNotBlank() && !resp.request.url.toString().contains("/accounts/login", ignoreCase = true)) {
+                            parseInstagramPayload(
+                                rawBody = warmHtml,
+                                baseUrl = resp.request.url.toString(),
+                                fallbackTitle = "Instagram_$shortcode",
+                                ua = ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+                                out = found,
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (found.none { hasConfirmedAudio(it) }) {
+                val docIds = listOf("8845758582119845", "10015901848480474", "24368985919402291", "27451289061152180")
+                val graphqlEndpoints = listOf(
+                    "https://www.instagram.com/graphql/query",
+                    "https://www.instagram.com/api/graphql",
+                )
+                val gqlHeaders = buildIgApiHeaders(csrfToken, lsdToken)
+
+                outerGql@ for (docId in docIds) {
+                    val variablesJson = JSONObject().apply {
+                        put("shortcode", shortcode)
+                        put("fetch_comment_count", 0)
+                        put("fetch_related_profile_media_count", 0)
+                        put("parent_comment_count", 0)
+                        put("child_comment_count", 0)
+                        put("fetch_like_count", 0)
+                        put("fetch_tagged_user_count", null)
+                        put("fetch_preview_comment_count", 0)
+                        put("has_threaded_comments", false)
+                        put("hoisted_comment_id", null)
+                        put("hoisted_reply_id", null)
+                    }.toString()
+
+                    for (gqlEndpoint in graphqlEndpoints) {
+                        val formBuilder = FormBody.Builder()
+                            .add("variables", variablesJson)
+                            .add("doc_id", docId)
+                        if (lsdToken.isNotBlank()) {
+                            formBuilder.add("lsd", lsdToken)
+                        }
+
+                        val req = Request.Builder()
+                            .url(gqlEndpoint)
+                            .post(formBuilder.build())
+                            .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
+                            .header("Accept", "*/*")
+                            .header("X-FB-Friendly-Name", "PolarisPostActionLoadPostQueryQuery")
+                            .apply { gqlHeaders.forEach { (k, v) -> header(k, v) } }
+                            .build()
+
+                        runCatching {
+                            client.newCall(req).execute().use { resp ->
+                                if (resp.code == 401 || resp.code == 403) {
+                                    authChallenge = true
+                                    return@use
+                                }
+                                if (!resp.isSuccessful) return@use
+                                val body = resp.body?.string().orEmpty()
+                                if (body.contains("login_required") || body.contains("require_login")) {
+                                    authChallenge = true
+                                }
+                                parseInstagramPayload(
+                                    rawBody = body,
+                                    baseUrl = canonicalUrl,
+                                    fallbackTitle = "Instagram_$shortcode",
+                                    ua = ClientSpoofer.CHROME_DESKTOP_USER_AGENT,
+                                    out = found,
+                                )
+                            }
+                        }
+                        if (found.any { it.resolutionHeight >= 1080 && hasConfirmedAudio(it) }) break@outerGql
+                        if (found.isNotEmpty()) break@outerGql
+                    }
+                }
+            }
+        }
+
+        // Layer 4 & 5: ?__a=1&__d=dis, /api/v1/media/{id}/info/ fallback, and Direct HTML Pages
         if (found.none { hasConfirmedAudio(it) }) {
-            val htmlTargets = buildList {
+            val apiHeaders = buildIgApiHeaders(csrfToken, lsdToken)
+            val fallbackTargets = buildList {
                 if (!shortcode.isNullOrBlank()) {
-                    add("https://www.instagram.com/reel/$shortcode/embed/captioned/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
-                    add("https://www.instagram.com/p/$shortcode/embed/captioned/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
                     add("https://www.instagram.com/reel/$shortcode/?__a=1&__d=dis" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
+                    add("https://www.instagram.com/p/$shortcode/?__a=1&__d=dis" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
+                }
+                if (!mediaId.isNullOrBlank() && !hasSessionCookie) {
+                    add("https://www.instagram.com/api/v1/media/$mediaId/info/" to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
                 }
                 add(canonicalUrl to ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
                 add(canonicalUrl to ClientSpoofer.ANDROID_CHROME_USER_AGENT)
-            }
+                add(canonicalUrl to "facebookexternalhit/1.1")
+            }.distinctBy { it.first to it.second }
 
-            for ((target, ua) in htmlTargets) {
-                val isJson = target.contains("__a=1")
+            for ((target, ua) in fallbackTargets) {
+                val isJson = target.contains("__a=1") || target.contains("/api/v1/")
                 val req = Request.Builder()
                     .url(target)
                     .header("User-Agent", ua)
@@ -179,7 +292,14 @@ internal class MetaVideoPowerExtractor(
                         "Accept",
                         if (isJson) "application/json" else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     )
-                    .apply { igHeadersBase.forEach { (k, v) -> header(k, v) } }
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Referer", "https://www.instagram.com/")
+                    .apply {
+                        if (isJson) {
+                            header("X-Requested-With", "XMLHttpRequest")
+                            apiHeaders.forEach { (k, v) -> header(k, v) }
+                        }
+                    }
                     .build()
 
                 runCatching {
@@ -267,11 +387,24 @@ internal class MetaVideoPowerExtractor(
                 blob.contains("video_url") ||
                 blob.contains("dash_manifest") ||
                 blob.contains("playable_url") ||
-                blob.contains("audio_url")
+                blob.contains("audio_url") ||
+                blob.contains("contextJSON")
             ) {
                 runCatching {
                     val obj = JSONObject(blob)
                     extractInstagramFromJsonTree(obj, title, streamHeaders, localCandidates, audioPool)
+                }
+            }
+        }
+
+        // 2b. Extract Instagram /embed/ "contextJSON" escaped string or object payload
+        val contextJsonRegex = Regex(""""contextJSON"\s*:\s*"((?:[^"\\]|\\.)+)"""")
+        contextJsonRegex.findAll(rawBody).forEach { match ->
+            val escapedInner = "\"${match.groupValues[1]}\""
+            runCatching {
+                val decodedJson = org.json.JSONTokener(escapedInner).nextValue()?.toString().orEmpty()
+                if (decodedJson.trimStart().startsWith("{")) {
+                    extractInstagramFromJsonTree(JSONObject(decodedJson), title, streamHeaders, localCandidates, audioPool)
                 }
             }
         }
@@ -318,9 +451,9 @@ internal class MetaVideoPowerExtractor(
             searchFrom = idx + 16
         }
 
-        // 4. Direct fields (video_url, playable_url_quality_hd, playable_url, contentUrl, audio_url)
+        // 4. Direct fields (video_url, browser_native_hd_url, playable_url, playback_url, contentUrl, audio_url)
         val directRegex = Regex(
-            """"(video_url|playable_url_quality_hd|playable_url|contentUrl|audio_url)"\s*:\s*"(https?://[^"]+)"""",
+            """"(video_url|videoUrl|browser_native_hd_url|browser_native_sd_url|playable_url_quality_hd|playable_url|playback_url|hd_url|sd_url|media_url|contentUrl|audio_url)"\s*:\s*"(https?://[^"]+)"""",
             RegexOption.IGNORE_CASE,
         )
         directRegex.findAll(unescaped).forEach { match ->
@@ -335,7 +468,7 @@ internal class MetaVideoPowerExtractor(
                     audioPool.add(mediaUrl)
                     return@forEach
                 }
-                val tier = if (key.contains("hd") || key == "video_url") 1080 else 720
+                val tier = if (key.contains("hd") || key == "video_url" || key == "videourl") 1080 else 720
                 localCandidates.add(
                     ExtractedStream(
                         streamUrl = mediaUrl,
@@ -346,9 +479,37 @@ internal class MetaVideoPowerExtractor(
                         mimeType = "video/mp4",
                         estimatedBytes = -1L,
                         headers = streamHeaders,
-                        bitrateBps = if (key.contains("hd") || key == "video_url") 3_000_000L else 1_200_000L,
+                        bitrateBps = if (tier >= 1080) 3_000_000L else 1_200_000L,
                     ),
                 )
+            }
+        }
+
+        // 4b. Broad CDN .mp4 URL fallback inside unescaped embed/GraphQL JSON ("url":"https://scontent...mp4...")
+        val cdnMp4Regex = Regex(
+            """"url"\s*:\s*"(https?://[^"]*(?:cdninstagram\.com|fbcdn\.net)[^"]*\.mp4[^"]*)"""",
+            RegexOption.IGNORE_CASE,
+        )
+        cdnMp4Regex.findAll(unescaped).forEach { match ->
+            val mediaUrl = sanitizeCdnUrl(match.groupValues[1])
+            if (mediaUrl.startsWith("http")) {
+                if (isMetaAudioOnlyUrl(mediaUrl)) {
+                    audioPool.add(mediaUrl)
+                } else if (localCandidates.none { it.streamUrl == mediaUrl }) {
+                    localCandidates.add(
+                        ExtractedStream(
+                            streamUrl = mediaUrl,
+                            title = title,
+                            platform = PlatformBadge.INSTAGRAM,
+                            qualityLabel = "1080p",
+                            resolutionHeight = 1080,
+                            mimeType = "video/mp4",
+                            estimatedBytes = -1L,
+                            headers = streamHeaders,
+                            bitrateBps = 2_600_000L,
+                        ),
+                    )
+                }
             }
         }
 
@@ -913,28 +1074,49 @@ internal class MetaVideoPowerExtractor(
         val verified = mutableListOf<ExtractedStream>()
         for (stream in sorted.take(8)) {
             val fullBytes = probeVerifiedContentLength(stream.streamUrl, stream.headers)
-            if (fullBytes != null && (fullBytes == -1L || fullBytes >= 16_384L)) {
+            if (fullBytes != null && (fullBytes == -1L || fullBytes >= 4_096L)) {
                 val audioOk = stream.audioStreamUrl.isNullOrBlank() ||
                     probeVerifiedContentLength(stream.audioStreamUrl, stream.headers) != null
                 if (audioOk) {
                     verified.add(stream.copy(estimatedBytes = if (fullBytes > 0L) fullBytes else stream.estimatedBytes))
+                } else {
+                    // Retain video even if separate audio probe returned 403/timeout so download pipeline can still fallback
+                    verified.add(stream.copy(estimatedBytes = if (fullBytes > 0L) fullBytes else stream.estimatedBytes))
                 }
             }
         }
-        return verified
+        return if (verified.isNotEmpty()) verified else sorted.take(4)
     }
 
     private fun probeVerifiedContentLength(url: String, headers: Map<String, String>): Long? {
+        val cleanHeaders = ClientSpoofer.buildDownloadHeaders(url, headers)
         val rangeBuilder = Request.Builder().url(url).header("Range", "bytes=0-0")
-        headers.forEach { (k, v) -> rangeBuilder.header(k, v) }
-        return runCatching {
+        cleanHeaders.forEach { (k, v) -> rangeBuilder.header(k, v) }
+        val rangeRes = runCatching {
             client.newCall(rangeBuilder.build()).execute().use { resp ->
+                val ct = resp.header("Content-Type").orEmpty().lowercase()
+                if (ct.startsWith("text/html")) return@use null
                 if (resp.isSuccessful || resp.code == 206) {
                     resp.header("Content-Range")
                         ?.substringAfterLast("/")
                         ?.toLongOrNull()
                         ?: resp.header("Content-Length")?.toLongOrNull()
                         ?: -1L
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
+        if (rangeRes != null) return rangeRes
+
+        val headBuilder = Request.Builder().url(url).head()
+        cleanHeaders.forEach { (k, v) -> headBuilder.header(k, v) }
+        return runCatching {
+            client.newCall(headBuilder.build()).execute().use { resp ->
+                val ct = resp.header("Content-Type").orEmpty().lowercase()
+                if (ct.startsWith("text/html")) return@use null
+                if (resp.isSuccessful) {
+                    resp.header("Content-Length")?.toLongOrNull() ?: -1L
                 } else {
                     null
                 }
@@ -964,28 +1146,89 @@ internal class MetaVideoPowerExtractor(
         return canonicalUrl
             .replace("://www.facebook.com", "://mbasic.facebook.com", ignoreCase = true)
             .replace("://m.facebook.com", "://mbasic.facebook.com", ignoreCase = true)
+            .replace("://facebook.com", "://mbasic.facebook.com", ignoreCase = true)
             .takeIf { it.contains("mbasic.facebook.com", ignoreCase = true) }
     }
 
+    private fun stripInstagramTrackingParams(rawUrl: String): String {
+        val parsed = rawUrl.toHttpUrlOrNull() ?: return rawUrl
+        val builder = parsed.newBuilder()
+        listOf("igsh", "igshid", "utm_source", "utm_medium", "utm_campaign", "fbclid")
+            .forEach { builder.removeAllQueryParameters(it) }
+        return builder.build().toString()
+    }
+
     private fun resolveRedirects(url: String, referer: String): String {
-        val req = Request.Builder()
-            .url(url)
-            .header("User-Agent", ClientSpoofer.CHROME_DESKTOP_USER_AGENT)
-            .header("Referer", referer)
+        val noRedirectClient = client.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build()
-        return runCatching {
-            client.newCall(req).execute().use { resp ->
-                val resolved = resp.request.url.toString()
-                if (resolved.startsWith("http") &&
-                    !resolved.contains("/login", ignoreCase = true) &&
-                    !resolved.contains("/accounts/login", ignoreCase = true)
+        val uas = listOf(ClientSpoofer.ANDROID_CHROME_USER_AGENT, "facebookexternalhit/1.1")
+        for (ua in uas) {
+            var current = url
+            for (hop in 0 until 6) {
+                val req = Request.Builder()
+                    .url(current)
+                    .header("User-Agent", ua)
+                    .header("Referer", referer)
+                    .build()
+                val nextTarget: String? = runCatching {
+                    noRedirectClient.newCall(req).execute().use { resp ->
+                        val location = resp.header("Location")?.trim()
+                        if (resp.code in 300..399 && !location.isNullOrBlank()) {
+                            val absolute = runCatching { URI(current).resolve(location).toString() }.getOrDefault(location)
+                            if (absolute.contains("/accounts/login", ignoreCase = true) ||
+                                absolute.contains("/login", ignoreCase = true)
+                            ) {
+                                val nextParam = absolute.toHttpUrlOrNull()?.queryParameter("next")
+                                if (!nextParam.isNullOrBlank()) {
+                                    val decoded = runCatching { URLDecoder.decode(nextParam, "UTF-8") }.getOrDefault(nextParam)
+                                    val normalized = when {
+                                        decoded.startsWith("http", ignoreCase = true) -> decoded
+                                        decoded.startsWith("/") -> "${resp.request.url.scheme}://${resp.request.url.host}$decoded"
+                                        else -> ""
+                                    }
+                                    if (normalized.startsWith("http", ignoreCase = true) &&
+                                        !normalized.contains("/login", ignoreCase = true)
+                                    ) {
+                                        return@use normalized
+                                    }
+                                }
+                                return@use null
+                            }
+                            return@use absolute
+                        }
+
+                        if (current.contains("/share/", ignoreCase = true) && resp.isSuccessful) {
+                            val snippet = resp.body?.string()?.take(65_536).orEmpty()
+                            val canonicalMatch = Regex(
+                                """(?:property=["']og:url["'][^>]+content=["']|rel=["']canonical["'][^>]+href=["'])(https?://[^"']+)["']""",
+                                RegexOption.IGNORE_CASE,
+                            ).find(snippet)?.groupValues?.getOrNull(1)
+                            if (!canonicalMatch.isNullOrBlank() &&
+                                !canonicalMatch.contains("/login", ignoreCase = true) &&
+                                !canonicalMatch.contains("/share/", ignoreCase = true)
+                            ) {
+                                return@use canonicalMatch
+                            }
+                        }
+                        null
+                    }
+                }.getOrNull()
+
+                if (nextTarget.isNullOrBlank() || nextTarget == current) break
+                current = nextTarget
+                if (Regex("""instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/[A-Za-z0-9_-]+""", RegexOption.IGNORE_CASE)
+                        .containsMatchIn(current)
                 ) {
-                    resolved
-                } else {
-                    url
+                    return current
                 }
             }
-        }.getOrDefault(url)
+            if (!current.contains("/share/", ignoreCase = true) && current != url) {
+                return current
+            }
+        }
+        return url
     }
 
     private fun sanitizeCdnUrl(raw: String): String {
@@ -1014,7 +1257,16 @@ internal class MetaVideoPowerExtractor(
             .replace("\\u003c", "<", ignoreCase = true)
             .replace("\\\\u003e", ">", ignoreCase = true)
             .replace("\\u003e", ">", ignoreCase = true)
+            .replace("\\\\u003d", "=", ignoreCase = true)
+            .replace("\\u003d", "=", ignoreCase = true)
+            .replace("\\\\u003f", "?", ignoreCase = true)
+            .replace("\\u003f", "?", ignoreCase = true)
+            .replace("\\\\u003a", ":", ignoreCase = true)
+            .replace("\\u003a", ":", ignoreCase = true)
+            .replace("\\\\u002d", "-", ignoreCase = true)
+            .replace("\\u002d", "-", ignoreCase = true)
             .replace("\\n", "\n")
+            .replace("\\\\\"", "\"")
             .replace("\\\"", "\"")
             .replace("&lt;", "<", ignoreCase = true)
             .replace("&gt;", ">", ignoreCase = true)

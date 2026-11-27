@@ -271,6 +271,10 @@ class VaultBrowserDownloadEngine(
 
         return try {
             var completed = false
+            var silentFallbackFile: File? = null
+            var silentFallbackCandidate: ExtractedStream? = null
+            var silentFallbackTitle = ""
+
             for ((index, candidate) in combinedCandidates.withIndex()) {
                 if (isCancelled()) throw CancellationException("Cancelled")
                 val hasLaterCandidate = index < combinedCandidates.lastIndex
@@ -333,7 +337,7 @@ class VaultBrowserDownloadEngine(
                     }
                 }
 
-                if (!downloadedOk || !stagingFile.exists() || stagingFile.length() <= 16_384L) {
+                if (!downloadedOk || !stagingFile.exists() || stagingFile.length() <= 4_096L) {
                     runCatching { stagingFile.delete() }
                     continue
                 }
@@ -371,7 +375,13 @@ class VaultBrowserDownloadEngine(
                         }
                     }
                     if (!recovered && hasLaterCandidate) {
-                        runCatching { stagingFile.delete() }
+                        if (silentFallbackFile == null) {
+                            silentFallbackFile = stagingFile
+                            silentFallbackCandidate = candidate
+                            silentFallbackTitle = resolvedTitle
+                        } else {
+                            runCatching { stagingFile.delete() }
+                        }
                         continue
                     }
                 }
@@ -427,6 +437,43 @@ class VaultBrowserDownloadEngine(
                     )
                     completed = true
                     break
+                }
+            }
+
+            if (!completed && silentFallbackFile != null && silentFallbackFile.exists() && silentFallbackCandidate != null) {
+                val fallbackStream = silentFallbackCandidate
+                onState(
+                    VaultBrowserDownloadState(
+                        phase = VaultBrowserDownloadPhase.ENCRYPTING,
+                        progress = 0.9f,
+                        title = silentFallbackTitle,
+                        qualityLabel = fallbackStream.qualityLabel,
+                        bytesDownloaded = silentFallbackFile.length(),
+                        totalBytes = silentFallbackFile.length(),
+                        message = "جاري التشفير بـ AES-256 والحفظ في مجلد الفيديوهات بالخزنة...",
+                    ),
+                )
+                var storedFallback = false
+                vaultRepository.moveMediaToVault(
+                    sourceUri = Uri.fromFile(silentFallbackFile),
+                    fallbackCategory = VaultCategory.VIDEOS,
+                    deleteOriginal = true,
+                ).collect { transfer ->
+                    if (transfer.stage == VaultTransferStage.COMPLETED) {
+                        storedFallback = true
+                    }
+                }
+                if (storedFallback) {
+                    onState(
+                        VaultBrowserDownloadState(
+                            phase = VaultBrowserDownloadPhase.COMPLETED,
+                            progress = 1f,
+                            title = silentFallbackTitle,
+                            qualityLabel = fallbackStream.qualityLabel,
+                            message = "تم التحميل (${fallbackStream.qualityLabel}) والتشفير في مجلد الفيديوهات بالخزنة.",
+                        ),
+                    )
+                    completed = true
                 }
             }
 

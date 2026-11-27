@@ -106,6 +106,138 @@ class WebViewStreamSniffer(
                     }
                 }
 
+                var triedIgEmbedFallback = false
+                val igShortcode = Regex(
+                    """(?:instagram\.com|instagr\.am)/(?:[^/]+/)?(?:share/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)""",
+                    RegexOption.IGNORE_CASE,
+                ).find(targetUrl)?.groupValues?.getOrNull(1)
+
+                fun probeDomMedia(view: WebView?, attempt: Int, looksLikeLogin: Boolean) {
+                    if (resumed || view == null) return
+                    view.evaluateJavascript(
+                        """
+                        (function() {
+                          var out = { videos: [], audios: [], title: document.title || '' };
+                          try {
+                            document.querySelectorAll('video, source').forEach(function(el) {
+                              try { if (el.tagName === 'VIDEO' && el.paused) { el.muted = true; el.play().catch(function(){}); } } catch (e0) {}
+                              if (el.currentSrc && el.currentSrc.startsWith('http')) out.videos.push(el.currentSrc);
+                              if (el.src && el.src.startsWith('http')) out.videos.push(el.src);
+                            });
+                            try {
+                              var consentBtn = document.querySelector('form[action*="consent"] button, button[aria-label*="Accept"], button[aria-label*="Accepter"]');
+                              if (consentBtn && !window.ytInitialPlayerResponse) { consentBtn.click(); }
+                            } catch (e2) {}
+                            if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData) {
+                              var sd = window.ytInitialPlayerResponse.streamingData;
+                              if (sd.hlsManifestUrl) out.videos.push(sd.hlsManifestUrl);
+                              (sd.formats || []).forEach(function(f) { if (f.url) out.videos.push(f.url); });
+                              (sd.adaptiveFormats || []).forEach(function(f) {
+                                if (!f.url) return;
+                                var m = (f.mimeType || '').toLowerCase();
+                                if (m.indexOf('audio/mp4') === 0) out.audios.push(f.url);
+                                else if (m.indexOf('video/mp4') === 0) out.videos.push(f.url);
+                              });
+                            }
+                            var scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
+                            var urlRegex = /"((?:browser_native_hd_url|browser_native_sd_url|playable_url_quality_hd|hd_src|video_url|videoUrl|playable_url|playback_url|contentUrl|audio_url))"\s*:\s*"(https?:[^"]+)"/g;
+                            var cdnMp4Regex = /"(?:url|src)"\s*:\s*"(https?:[^"]*(?:cdninstagram\.com|fbcdn\.net)[^"]*\.mp4[^"]*)"/gi;
+                            var baseUrlRegex = /<BaseURL[^>]*>\s*(https?:\/\/[^<\s]+)\s*<\/BaseURL>/gi;
+                            for (var i = 0; i < Math.min(scripts.length, 64); i++) {
+                              var rawTxt = scripts[i].textContent || '';
+                              if (rawTxt.length > 0 && rawTxt.length < 450000) {
+                                var txt = rawTxt
+                                  .replace(/\\\\\//g, '/')
+                                  .replace(/\\\//g, '/')
+                                  .replace(/\\\\u0026/gi, '&')
+                                  .replace(/\\u0026/gi, '&')
+                                  .replace(/\\\\u0025/gi, '%')
+                                  .replace(/\\u0025/gi, '%')
+                                  .replace(/\\\\u002f/gi, '/')
+                                  .replace(/\\u002f/gi, '/')
+                                  .replace(/\\\\u003c/gi, '<')
+                                  .replace(/\\u003c/gi, '<')
+                                  .replace(/\\\\u003e/gi, '>')
+                                  .replace(/\\u003e/gi, '>')
+                                  .replace(/\\\\u003d/gi, '=')
+                                  .replace(/\\u003d/gi, '=')
+                                  .replace(/\\\\u003f/gi, '?')
+                                  .replace(/\\u003f/gi, '?')
+                                  .replace(/\\\\u003a/gi, ':')
+                                  .replace(/\\u003a/gi, ':')
+                                  .replace(/\\\\u002d/gi, '-')
+                                  .replace(/\\u002d/gi, '-')
+                                  .replace(/\\"/g, '"')
+                                  .replace(/&amp;/gi, '&');
+                                var match;
+                                while ((match = urlRegex.exec(txt)) !== null) {
+                                  var key = (match[1] || '').toLowerCase();
+                                  var clean = match[2];
+                                  if (clean.indexOf('http') === 0) {
+                                    if (key === 'audio_url') out.audios.push(clean);
+                                    else out.videos.push(clean);
+                                  }
+                                }
+                                var cMatch;
+                                while ((cMatch = cdnMp4Regex.exec(txt)) !== null) {
+                                  var cu = cMatch[1];
+                                  if (cu && cu.indexOf('http') === 0) out.videos.push(cu);
+                                }
+                                var bMatch;
+                                while ((bMatch = baseUrlRegex.exec(txt)) !== null) {
+                                  var bu = bMatch[1];
+                                  if (bu && bu.indexOf('http') === 0) out.videos.push(bu);
+                                }
+                              }
+                            }
+                          } catch (e) {}
+                          return JSON.stringify(out);
+                        })();
+                        """.trimIndent(),
+                    ) { jsonRaw ->
+                        runCatching {
+                            val cleaned = decodeEvaluateJsString(jsonRaw)
+                            if (cleaned.startsWith("{")) {
+                                val obj = JSONObject(cleaned)
+                                val domTitle = obj.optString("title").takeIf { it.isNotBlank() }
+                                if (domTitle != null) resolvedTitle = domTitle
+                                val vArr = obj.optJSONArray("videos") ?: JSONArray()
+                                for (i in 0 until vArr.length()) {
+                                    val candidate = vArr.optString(i)
+                                    if (candidate.startsWith("http") && !candidate.startsWith("blob:")) {
+                                        val stripped = stripRangeQueryParams(candidate)
+                                        if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(stripped)) {
+                                            capturedAudios.add(stripped)
+                                        } else {
+                                            capturedVideos.add(stripped)
+                                        }
+                                    }
+                                }
+                                val aArr = obj.optJSONArray("audios") ?: JSONArray()
+                                for (i in 0 until aArr.length()) {
+                                    val candidate = aArr.optString(i)
+                                    if (candidate.startsWith("http") && !candidate.startsWith("blob:")) {
+                                        capturedAudios.add(stripRangeQueryParams(candidate))
+                                    }
+                                }
+                            }
+                        }
+
+                        if (capturedVideos.isNotEmpty()) {
+                            view.postDelayed({ finish(loginGate = false) }, 1_200L)
+                        } else if (!triedIgEmbedFallback && !igShortcode.isNullOrBlank() &&
+                            (looksLikeLogin || attempt >= 1)
+                        ) {
+                            triedIgEmbedFallback = true
+                            view.loadUrl("https://www.instagram.com/reel/$igShortcode/embed/")
+                        } else if (attempt < 2) {
+                            view.postDelayed({ probeDomMedia(view, attempt + 1, looksLikeLogin) }, 1_800L)
+                        } else {
+                            finish(loginGate = looksLikeLogin)
+                        }
+                    }
+                }
+
                 webView.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(
                         view: WebView?,
@@ -131,7 +263,7 @@ class WebViewStreamSniffer(
                                     !lower.contains("cdninstagram.com") &&
                                     cleaned.contains(".mp4", ignoreCase = true))
                             ) {
-                                view?.postDelayed({ finish(loginGate = false) }, 2_000L)
+                                view?.postDelayed({ finish(loginGate = false) }, 1_500L)
                             }
                         }
                         return super.shouldInterceptRequest(view, request)
@@ -145,94 +277,13 @@ class WebViewStreamSniffer(
                             currentUrl.contains("/signin") ||
                             currentUrl.contains("accounts/login")
 
-                        // Probe hydrated DOM <video>, YouTube playerData, and Meta/IG JSON blobs inside live V8
-                        view?.evaluateJavascript(
-                            """
-                            (function() {
-                              var out = { videos: [], audios: [], title: document.title || '' };
-                              try {
-                                document.querySelectorAll('video, source').forEach(function(el) {
-                                  if (el.currentSrc && el.currentSrc.startsWith('http')) out.videos.push(el.currentSrc);
-                                  if (el.src && el.src.startsWith('http')) out.videos.push(el.src);
-                                });
-                                try {
-                                  var consentBtn = document.querySelector('form[action*="consent"] button, button[aria-label*="Accept"], button[aria-label*="Accepter"]');
-                                  if (consentBtn && !window.ytInitialPlayerResponse) { consentBtn.click(); }
-                                } catch (e2) {}
-                                if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData) {
-                                  var sd = window.ytInitialPlayerResponse.streamingData;
-                                  if (sd.hlsManifestUrl) out.videos.push(sd.hlsManifestUrl);
-                                  (sd.formats || []).forEach(function(f) { if (f.url) out.videos.push(f.url); });
-                                  (sd.adaptiveFormats || []).forEach(function(f) {
-                                    if (!f.url) return;
-                                    var m = (f.mimeType || '').toLowerCase();
-                                    if (m.indexOf('audio/mp4') === 0) out.audios.push(f.url);
-                                    else if (m.indexOf('video/mp4') === 0) out.videos.push(f.url);
-                                  });
-                                }
-                                var scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
-                                var urlRegex = /"((?:browser_native_hd_url|playable_url_quality_hd|hd_src|video_url|playable_url|contentUrl|audio_url))"\s*:\s*"(https?:[^"]+)"/g;
-                                var baseUrlRegex = /<BaseURL[^>]*>\s*(https?:\/\/[^<\s]+)\s*<\/BaseURL>/gi;
-                                for (var i = 0; i < Math.min(scripts.length, 48); i++) {
-                                  var rawTxt = scripts[i].textContent || '';
-                                  if (rawTxt.length > 0 && rawTxt.length < 450000) {
-                                    var txt = rawTxt
-                                      .replace(/\\\//g, '/')
-                                      .replace(/\\u0026/gi, '&')
-                                      .replace(/\\u002f/gi, '/')
-                                      .replace(/\\u003c/gi, '<')
-                                      .replace(/\\u003e/gi, '>')
-                                      .replace(/&amp;/gi, '&');
-                                    var match;
-                                    while ((match = urlRegex.exec(txt)) !== null) {
-                                      var key = (match[1] || '').toLowerCase();
-                                      var clean = match[2];
-                                      if (clean.indexOf('http') === 0) {
-                                        if (key === 'audio_url') out.audios.push(clean);
-                                        else out.videos.push(clean);
-                                      }
-                                    }
-                                    var bMatch;
-                                    while ((bMatch = baseUrlRegex.exec(txt)) !== null) {
-                                      var bu = bMatch[1];
-                                      if (bu && bu.indexOf('http') === 0) out.videos.push(bu);
-                                    }
-                                  }
-                                }
-                              } catch (e) {}
-                              return JSON.stringify(out);
-                            })();
-                            """.trimIndent(),
-                        ) { jsonRaw ->
-                            runCatching {
-                                val cleaned = decodeEvaluateJsString(jsonRaw)
-                                if (cleaned.startsWith("{")) {
-                                    val obj = JSONObject(cleaned)
-                                    val domTitle = obj.optString("title").takeIf { it.isNotBlank() }
-                                    if (domTitle != null) resolvedTitle = domTitle
-                                    val vArr = obj.optJSONArray("videos") ?: JSONArray()
-                                    for (i in 0 until vArr.length()) {
-                                        val candidate = vArr.optString(i)
-                                        if (candidate.startsWith("http") && !candidate.startsWith("blob:")) {
-                                            val stripped = stripRangeQueryParams(candidate)
-                                            if (MetaVideoPowerExtractor.isMetaAudioOnlyUrl(stripped)) {
-                                                capturedAudios.add(stripped)
-                                            } else {
-                                                capturedVideos.add(stripped)
-                                            }
-                                        }
-                                    }
-                                    val aArr = obj.optJSONArray("audios") ?: JSONArray()
-                                    for (i in 0 until aArr.length()) {
-                                        val candidate = aArr.optString(i)
-                                        if (candidate.startsWith("http") && !candidate.startsWith("blob:")) {
-                                            capturedAudios.add(stripRangeQueryParams(candidate))
-                                        }
-                                    }
-                                }
-                            }
-                            view.postDelayed({ finish(loginGate = looksLikeLogin) }, 2_200L)
+                        if (looksLikeLogin && !triedIgEmbedFallback && !igShortcode.isNullOrBlank()) {
+                            triedIgEmbedFallback = true
+                            view?.loadUrl("https://www.instagram.com/reel/$igShortcode/embed/")
+                            return
                         }
+
+                        probeDomMedia(view, attempt = 0, looksLikeLogin = looksLikeLogin)
                     }
                 }
 

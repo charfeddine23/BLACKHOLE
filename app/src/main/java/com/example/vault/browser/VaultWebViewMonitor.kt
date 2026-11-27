@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import com.example.engine.extractor.MetaVideoPowerExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -11,6 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
@@ -150,13 +152,14 @@ class VaultWebViewMonitor {
         currentPageUrl: String,
     ): InterceptedMediaRequest? {
         if (request == null) return null
-        val url = request.url?.toString()?.trim().orEmpty()
-        if (!url.startsWith("http://", ignoreCase = true) &&
-            !url.startsWith("https://", ignoreCase = true)
+        val rawUrl = request.url?.toString()?.trim().orEmpty()
+        if (!rawUrl.startsWith("http://", ignoreCase = true) &&
+            !rawUrl.startsWith("https://", ignoreCase = true)
         ) {
             return null
         }
 
+        val url = stripPartialRangeQueryParams(rawUrl)
         val headers = request.requestHeaders.orEmpty()
         val acceptHeader = headers["Accept"] ?: headers["accept"] ?: ""
         val referer = headers["Referer"] ?: headers["referer"] ?: currentPageUrl
@@ -323,6 +326,19 @@ class VaultWebViewMonitor {
         private const val MAX_INTERCEPTED_PER_TAB = 64
         private const val SNAPSHOT_TIMEOUT_MS = 750L
 
+        internal fun stripPartialRangeQueryParams(rawUrl: String): String {
+            val parsed = rawUrl.toHttpUrlOrNull() ?: return rawUrl
+            val builder = parsed.newBuilder()
+            var changed = false
+            listOf("bytestart", "byteend", "range", "rbuf", "rn").forEach { key ->
+                if (parsed.queryParameterValues(key).isNotEmpty()) {
+                    builder.removeAllQueryParameters(key)
+                    changed = true
+                }
+            }
+            return if (changed) builder.build().toString() else rawUrl
+        }
+
         internal fun classifyMediaUrl(url: String, acceptOrMimeHint: String = ""): InterceptedMediaKind? {
             val lower = url.lowercase()
             val pathOnly = lower.substringBefore("?").substringBefore("#")
@@ -352,16 +368,22 @@ class VaultWebViewMonitor {
                 pathOnly.endsWith(".m4a") ||
                     pathOnly.endsWith(".aac") ||
                     lower.contains("mime=audio") ||
-                    lower.contains("mime_type=audio") ->
+                    lower.contains("mime_type=audio") ||
+                    MetaVideoPowerExtractor.isMetaAudioOnlyUrl(url) ->
                     InterceptedMediaKind.AUDIO_STREAM
                 pathOnly.endsWith(".mp4") ||
                     pathOnly.endsWith(".m4v") ||
                     pathOnly.endsWith(".webm") ||
                     pathOnly.endsWith(".mov") ||
+                    pathOnly.endsWith(".mkv") ||
+                    pathOnly.endsWith(".ogv") ||
+                    pathOnly.endsWith(".3gp") ||
+                    pathOnly.endsWith(".flv") ||
                     lower.contains(".mp4?") ||
                     lower.contains("mime=video") ||
                     lower.contains("mime_type=video") ||
                     lower.contains("video/mp4") ||
+                    lower.contains("video/webm") ||
                     lower.contains("videoplayback") ||
                     acceptOrMimeHint.startsWith("video/", ignoreCase = true) ->
                     InterceptedMediaKind.VIDEO_DIRECT
@@ -418,59 +440,80 @@ class VaultWebViewMonitor {
         val USER_INITIATED_SNAPSHOT_SCRIPT: String = """
             (function() {
               try {
-                var videos = document.querySelectorAll ? document.querySelectorAll('video') : [];
                 var entries = [];
                 var now = Date.now();
-                for (var i = 0; i < videos.length && i < 8; i++) {
-                  var v = videos[i];
-                  var rect = v.getBoundingClientRect ? v.getBoundingClientRect() : { width: 0, height: 0, top: 0, bottom: 0 };
-                  var area = Math.max(0, Number(rect.width || 0)) * Math.max(0, Number(rect.height || 0));
-                  var isVisible = area > 400 && rect.bottom > 0 && rect.top < (window.innerHeight || 1000);
-                  var dur = (v.duration && isFinite(v.duration)) ? Number(v.duration) : 0;
-                  var curTime = Number(v.currentTime || 0);
-                  var vw = Number(v.videoWidth || 0);
-                  var vh = Number(v.videoHeight || 0);
-                  var poster = v.poster || v.getAttribute('poster') || '';
-                  var titleHint = (v.getAttribute('title') || v.getAttribute('aria-label') || '').trim();
-                  var sourceUrls = [];
+                function collectFromRoot(root) {
+                  if (!root || !root.querySelectorAll || entries.length >= 12) return;
+                  var videos = root.querySelectorAll('video');
+                  for (var i = 0; i < videos.length && entries.length < 12; i++) {
+                    var v = videos[i];
+                    var rect = v.getBoundingClientRect ? v.getBoundingClientRect() : { width: 0, height: 0, top: 0, bottom: 0 };
+                    var area = Math.max(0, Number(rect.width || 0)) * Math.max(0, Number(rect.height || 0));
+                    var isVisible = area > 400 && rect.bottom > 0 && rect.top < (window.innerHeight || 1000);
+                    var dur = (v.duration && isFinite(v.duration)) ? Number(v.duration) : 0;
+                    var curTime = Number(v.currentTime || 0);
+                    var vw = Number(v.videoWidth || 0);
+                    var vh = Number(v.videoHeight || 0);
+                    var poster = v.poster || v.getAttribute('poster') || '';
+                    var titleHint = (v.getAttribute('title') || v.getAttribute('aria-label') || '').trim();
+                    var sourceUrls = [];
+                    try {
+                      var srcs = v.querySelectorAll('source');
+                      for (var s = 0; s < srcs.length; s++) {
+                        var su = srcs[s].src || srcs[s].getAttribute('data-src') || '';
+                        if (su && sourceUrls.indexOf(su) === -1) sourceUrls.push(su);
+                      }
+                    } catch (e1) {}
+                    var score = 0;
+                    if (!v.paused && !v.ended) score += 8000;
+                    if (isVisible) score += 1200;
+                    if (vh > 0) score += Math.min(vh, 2160);
+                    if (dur > 0) score += Math.min(dur * 15, 1800);
+                    if (!v.muted) score += 600;
+                    if (v.currentSrc) score += 400;
+                    entries.push({
+                      elementId: 'v_' + (entries.length + 1),
+                      currentSrc: v.currentSrc || '',
+                      src: v.getAttribute('src') || v.src || '',
+                      sourceUrls: sourceUrls,
+                      duration: dur,
+                      currentTime: curTime,
+                      videoWidth: vw,
+                      videoHeight: vh,
+                      paused: !!v.paused,
+                      ended: !!v.ended,
+                      muted: !!v.muted,
+                      isAdvancing: !v.paused && !v.ended,
+                      isVisible: isVisible,
+                      viewportArea: area,
+                      lastPlayEventMs: 0,
+                      lastAdvanceMs: 0,
+                      lastUpdatedMs: now,
+                      isLikelyAd: false,
+                      score: score,
+                      posterUrl: poster || '',
+                      titleHint: titleHint || ''
+                    });
+                  }
                   try {
-                    var srcs = v.querySelectorAll('source');
-                    for (var s = 0; s < srcs.length; s++) {
-                      var su = srcs[s].src || srcs[s].getAttribute('data-src') || '';
-                      if (su && sourceUrls.indexOf(su) === -1) sourceUrls.push(su);
+                    var allEls = root.querySelectorAll('*');
+                    for (var k = 0; k < allEls.length && entries.length < 12; k++) {
+                      if (allEls[k].shadowRoot) {
+                        collectFromRoot(allEls[k].shadowRoot);
+                      }
                     }
-                  } catch (e1) {}
-                  var score = 0;
-                  if (!v.paused && !v.ended) score += 8000;
-                  if (isVisible) score += 1200;
-                  if (vh > 0) score += Math.min(vh, 2160);
-                  if (dur > 0) score += Math.min(dur * 15, 1800);
-                  if (!v.muted) score += 600;
-                  if (v.currentSrc) score += 400;
-                  entries.push({
-                    elementId: 'v_' + (i + 1),
-                    currentSrc: v.currentSrc || '',
-                    src: v.getAttribute('src') || v.src || '',
-                    sourceUrls: sourceUrls,
-                    duration: dur,
-                    currentTime: curTime,
-                    videoWidth: vw,
-                    videoHeight: vh,
-                    paused: !!v.paused,
-                    ended: !!v.ended,
-                    muted: !!v.muted,
-                    isAdvancing: !v.paused && !v.ended,
-                    isVisible: isVisible,
-                    viewportArea: area,
-                    lastPlayEventMs: 0,
-                    lastAdvanceMs: 0,
-                    lastUpdatedMs: now,
-                    isLikelyAd: false,
-                    score: score,
-                    posterUrl: poster || '',
-                    titleHint: titleHint || ''
-                  });
+                  } catch (eShadow) {}
                 }
+                collectFromRoot(document);
+                try {
+                  var iframes = document.querySelectorAll('iframe');
+                  for (var f = 0; f < iframes.length && entries.length < 12; f++) {
+                    try {
+                      var fDoc = iframes[f].contentDocument || (iframes[f].contentWindow && iframes[f].contentWindow.document);
+                      if (fDoc) collectFromRoot(fDoc);
+                    } catch (eFrame) {}
+                  }
+                } catch (eFrames) {}
                 var activeIndex = -1;
                 var bestScore = -999999;
                 for (var idx = 0; idx < entries.length; idx++) {

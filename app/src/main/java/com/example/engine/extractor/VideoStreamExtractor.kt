@@ -1096,7 +1096,7 @@ class VideoStreamExtractor(
             }
 
         val jsonStreamPatterns = listOf(
-            Regex(""""(?:contentUrl|browser_native_hd_url|playable_url_quality_hd|hd_src_no_ratelimit|hd_src|browser_native_sd_url|playable_url|sd_src|playAddr|downloadAddr|video_url|playbackUrl|hlsUrl|mp4Url|url)"\s*:\s*"(https?://[^"]+\.(?:mp4|m4a|aac|m3u8|webm|mov|m4v)[^"]*)"""", RegexOption.IGNORE_CASE),
+            Regex(""""(?:contentUrl|browser_native_hd_url|playable_url_quality_hd|hd_src_no_ratelimit|hd_src|browser_native_sd_url|playable_url|playback_url|sd_src|playAddr|downloadAddr|video_url|videoUrl|playbackUrl|hlsUrl|mp4Url|url)"\s*:\s*"(https?://[^"]+\.(?:mp4|m4a|aac|m3u8|webm|mov|m4v)[^"]*)"""", RegexOption.IGNORE_CASE),
             Regex("""(https?://[^\s"'<>\\]+\.(?:mp4|m4a|aac|m3u8|webm|mov|m4v)(?:\?[^\s"'<>\\]*)?)""", RegexOption.IGNORE_CASE),
         )
         jsonStreamPatterns.forEach { regex ->
@@ -1197,12 +1197,23 @@ class VideoStreamExtractor(
             .replace("\\/", "/")
             .replace("\\\\u0026", "&", ignoreCase = true)
             .replace("\\u0026", "&", ignoreCase = true)
+            .replace("\\\\u0025", "%", ignoreCase = true)
+            .replace("\\u0025", "%", ignoreCase = true)
             .replace("\\\\u002f", "/", ignoreCase = true)
             .replace("\\u002f", "/", ignoreCase = true)
             .replace("\\\\u003c", "<", ignoreCase = true)
             .replace("\\u003c", "<", ignoreCase = true)
             .replace("\\\\u003e", ">", ignoreCase = true)
             .replace("\\u003e", ">", ignoreCase = true)
+            .replace("\\\\u003d", "=", ignoreCase = true)
+            .replace("\\u003d", "=", ignoreCase = true)
+            .replace("\\\\u003f", "?", ignoreCase = true)
+            .replace("\\u003f", "?", ignoreCase = true)
+            .replace("\\\\u003a", ":", ignoreCase = true)
+            .replace("\\u003a", ":", ignoreCase = true)
+            .replace("\\\\u002d", "-", ignoreCase = true)
+            .replace("\\u002d", "-", ignoreCase = true)
+            .replace("\\\\\"", "\"")
             .replace("\\\"", "\"")
             .replace("&lt;", "<", ignoreCase = true)
             .replace("&gt;", ">", ignoreCase = true)

@@ -13,6 +13,7 @@ import android.os.Environment
 import android.os.Message
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -166,6 +167,7 @@ import com.example.data.local.BrowserPinnedSite
 import com.example.data.local.BrowserPreferencesStore
 import com.example.data.local.BrowserSearchEngine
 import com.example.data.local.SiteLogoFetcher
+import com.example.engine.extractor.MetaVideoPowerExtractor
 import com.example.engine.network.CloudflareDnsVpnService
 import com.example.vault.browser.EphemeralSessionManager
 import com.example.vault.browser.InterceptedMediaRequest
@@ -174,6 +176,7 @@ import com.example.vault.browser.SafeWebViewConfig
 import com.example.vault.browser.UrlSanitizer
 import com.example.vault.browser.VaultWebSnapshot
 import com.example.vault.browser.VaultWebViewMonitor
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONObject
 import com.example.ui.theme.AbyssalSurface
 import com.example.ui.theme.AmberWarning
@@ -1524,22 +1527,24 @@ fun DownloadedVideosBrowserPanel(
                                         }
                                         val reqUrl = request?.url?.toString().orEmpty()
                                         if (reqUrl.isNotBlank()) {
+                                            val cleanMediaUrl = stripPartialRangeQueryParams(reqUrl)
                                             val activePage = tabs.firstOrNull { it.id == tabId }?.url.orEmpty()
                                             webViewMonitor.recordInterceptedRequest(tabId, request, activePage)
                                             when {
-                                                isInterceptableAudioStream(reqUrl) -> {
+                                                isInterceptableAudioStream(cleanMediaUrl) ||
+                                                    MetaVideoPowerExtractor.isMetaAudioOnlyUrl(cleanMediaUrl) -> {
                                                     view?.post {
                                                         val prev = sniffedAudioUrlsByTab[tabId].orEmpty()
-                                                        if (reqUrl !in prev) {
-                                                            sniffedAudioUrlsByTab[tabId] = (listOf(reqUrl) + prev).take(10)
+                                                        if (cleanMediaUrl !in prev) {
+                                                            sniffedAudioUrlsByTab[tabId] = (listOf(cleanMediaUrl) + prev).take(10)
                                                         }
                                                     }
                                                 }
-                                                isInterceptableVideoStream(reqUrl) -> {
+                                                isInterceptableVideoStream(cleanMediaUrl) -> {
                                                     view?.post {
                                                         val prev = sniffedVideoUrlsByTab[tabId].orEmpty()
-                                                        if (reqUrl !in prev) {
-                                                            sniffedVideoUrlsByTab[tabId] = (listOf(reqUrl) + prev).take(16)
+                                                        if (cleanMediaUrl !in prev) {
+                                                            sniffedVideoUrlsByTab[tabId] = (listOf(cleanMediaUrl) + prev).take(16)
                                                         }
                                                     }
                                                 }
@@ -1730,6 +1735,22 @@ fun DownloadedVideosBrowserPanel(
                                         return true
                                     }
 
+                                    override fun getDefaultVideoPoster(): Bitmap {
+                                        return SafeWebViewConfig.createDarkVideoPosterBitmap()
+                                    }
+
+                                    override fun onPermissionRequest(request: PermissionRequest?) {
+                                        val req = request ?: return
+                                        val allowedResources = req.resources.filter { res ->
+                                            res == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID
+                                        }.toTypedArray()
+                                        if (allowedResources.isNotEmpty()) {
+                                            runCatching { req.grant(allowedResources) }
+                                        } else {
+                                            runCatching { req.deny() }
+                                        }
+                                    }
+
                                     override fun onShowCustomView(
                                         view: View?,
                                         callback: CustomViewCallback?,
@@ -1741,18 +1762,21 @@ fun DownloadedVideosBrowserPanel(
                                     }
 
                                     override fun onHideCustomView() {
-                                        customFullscreenView = null
-                                        customViewCallback = null
+                                        exitFullscreenVideo()
                                     }
                                 }
 
                                 webViews[tabId] = this
                                 webViewMonitor.attachTo(this)
                                 onBindWebViewRef(this)
+                                onResume()
+                                resumeTimers()
                                 loadUrl(activeTab.url)
                             }
                         },
                         update = { wv ->
+                            wv.onResume()
+                            wv.resumeTimers()
                             updateTabById(tabId) {
                                 if (it.canGoBack != wv.canGoBack() || it.canGoForward != wv.canGoForward()) {
                                     it.copy(canGoBack = wv.canGoBack(), canGoForward = wv.canGoForward())
@@ -3610,6 +3634,19 @@ private fun isAdOrTrackerRequest(request: WebResourceRequest?): Boolean {
     }
 }
 
+private fun stripPartialRangeQueryParams(rawUrl: String): String {
+    val parsed = rawUrl.toHttpUrlOrNull() ?: return rawUrl
+    val builder = parsed.newBuilder()
+    var modified = false
+    listOf("bytestart", "byteend", "range", "rbuf", "rn").forEach { param ->
+        if (parsed.queryParameterValues(param).isNotEmpty()) {
+            builder.removeAllQueryParameters(param)
+            modified = true
+        }
+    }
+    return if (modified) builder.build().toString() else rawUrl
+}
+
 private fun isInterceptableVideoStream(url: String): Boolean {
     val lower = url.lowercase()
     if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
@@ -3621,15 +3658,24 @@ private fun isInterceptableVideoStream(url: String): Boolean {
         return false
     }
     return pathOnly.endsWith(".m3u8") ||
+        pathOnly.endsWith(".mpd") ||
         pathOnly.endsWith(".mp4") ||
         pathOnly.endsWith(".m4v") ||
         pathOnly.endsWith(".webm") ||
         pathOnly.endsWith(".mov") ||
+        pathOnly.endsWith(".mkv") ||
+        pathOnly.endsWith(".ogv") ||
+        pathOnly.endsWith(".3gp") ||
+        pathOnly.endsWith(".flv") ||
         lower.contains(".m3u8?") ||
+        lower.contains(".mpd?") ||
         lower.contains(".mp4?") ||
         lower.contains("mime=video") ||
         lower.contains("mime_type=video") ||
-        lower.contains("video/mp4")
+        lower.contains("video/mp4") ||
+        lower.contains("video/webm") ||
+        lower.contains("application/dash+xml") ||
+        lower.contains("application/vnd.apple.mpegurl")
 }
 
 private fun isInterceptableAudioStream(url: String): Boolean {

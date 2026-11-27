@@ -1,7 +1,10 @@
 package com.example.ui.screens
 
 import android.annotation.SuppressLint
+import android.graphics.Bitmap
+import android.view.View
 import android.view.ViewGroup
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -161,6 +164,8 @@ fun VaultAutoDownloadScreen(
     var canGoForward by remember { mutableStateOf(false) }
     var showBackendDialog by remember { mutableStateOf(false) }
     var lastNotifiedCompletionKey by remember { mutableStateOf<String?>(null) }
+    var customFullscreenView by remember { mutableStateOf<View?>(null) }
+    var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
     val completedState = downloadState as? AutoVideoDownloadState.Completed
     if (completedState != null) {
@@ -171,8 +176,15 @@ fun VaultAutoDownloadScreen(
         }
     }
 
+    fun exitFullscreenVideo() {
+        runCatching { customViewCallback?.onCustomViewHidden() }
+        customFullscreenView = null
+        customViewCallback = null
+    }
+
     DisposableEffect(controller, sessionManager) {
         onDispose {
+            exitFullscreenVideo()
             controller.cancelActiveDownload()
             controller.detachFromWebView(webViewRef)
             controller.cleanup()
@@ -183,10 +195,10 @@ fun VaultAutoDownloadScreen(
 
     BackHandler {
         val wv = webViewRef
-        if (wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else {
-            onBack()
+        when {
+            customFullscreenView != null -> exitFullscreenVideo()
+            wv != null && wv.canGoBack() -> wv.goBack()
+            else -> onBack()
         }
     }
 
@@ -516,16 +528,70 @@ fun VaultAutoDownloadScreen(
                                 override fun onReceivedTitle(view: WebView?, title: String?) {
                                     if (!title.isNullOrBlank()) pageTitle = title
                                 }
+
+                                override fun getDefaultVideoPoster(): Bitmap {
+                                    return SafeWebViewConfig.createDarkVideoPosterBitmap()
+                                }
+
+                                override fun onPermissionRequest(request: PermissionRequest?) {
+                                    val req = request ?: return
+                                    val allowedResources = req.resources.filter { res ->
+                                        res == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID
+                                    }.toTypedArray()
+                                    if (allowedResources.isNotEmpty()) {
+                                        runCatching { req.grant(allowedResources) }
+                                    } else {
+                                        runCatching { req.deny() }
+                                    }
+                                }
+
+                                override fun onShowCustomView(
+                                    view: View?,
+                                    callback: CustomViewCallback?,
+                                ) {
+                                    if (view == null) return
+                                    customViewCallback?.onCustomViewHidden()
+                                    customFullscreenView = view
+                                    customViewCallback = callback
+                                }
+
+                                override fun onHideCustomView() {
+                                    exitFullscreenVideo()
+                                }
                             }
+                            onResume()
+                            resumeTimers()
                             loadUrl(initialUrl)
                             webViewRef = this
                         }
                     },
                     update = { wv ->
+                        wv.onResume()
+                        wv.resumeTimers()
                         webViewRef = wv
                     },
                     modifier = Modifier.fillMaxSize(),
                 )
+
+                val fsView = customFullscreenView
+                if (fsView != null) {
+                    AndroidView(
+                        factory = { ctx ->
+                            FrameLayout(ctx).apply {
+                                setBackgroundColor(android.graphics.Color.BLACK)
+                                (fsView.parent as? ViewGroup)?.removeView(fsView)
+                                addView(
+                                    fsView,
+                                    FrameLayout.LayoutParams(
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ),
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
 
             // Bottom Auto-Download Dock

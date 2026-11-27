@@ -68,18 +68,75 @@ class UniversalDownloader(
 
         val profile = ClientSpoofer.profiles.first()
         val headers = ClientSpoofer.buildHeadersForUrl(url, profile)
-        val reqBuilder = Request.Builder().url(url).get()
-        headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+        val noRedirectClient = httpClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
 
-        return runCatching {
-            httpClient.newCall(reqBuilder.build()).execute().use { response ->
-                val resolved = response.request.url.toString()
-                if (resolved.startsWith("http") && !resolved.contains("/login", ignoreCase = true)) {
-                    resolved
-                } else {
-                    url
+        var current = url
+        for (hop in 0 until 6) {
+            val reqBuilder = Request.Builder().url(current).get()
+            headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+
+            val nextUrl: String? = runCatching {
+                noRedirectClient.newCall(reqBuilder.build()).execute().use { response ->
+                    val location = response.header("Location")?.trim()
+                    if (response.code in 300..399 && !location.isNullOrBlank()) {
+                        val absolute = runCatching {
+                            java.net.URI(current).resolve(location).toString()
+                        }.getOrDefault(location)
+                        if (absolute.contains("/accounts/login", ignoreCase = true) ||
+                            absolute.contains("/login", ignoreCase = true)
+                        ) {
+                            val nextParam = runCatching {
+                                android.net.Uri.parse(absolute).getQueryParameter("next")
+                            }.getOrNull()
+                            val decoded = nextParam?.let {
+                                runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
+                            }.orEmpty()
+                            val normalizedNext = when {
+                                decoded.startsWith("http", ignoreCase = true) -> decoded
+                                decoded.startsWith("/") -> {
+                                    val uri = java.net.URI(current)
+                                    "${uri.scheme}://${uri.authority}$decoded"
+                                }
+                                else -> ""
+                            }
+                            if (normalizedNext.startsWith("http", ignoreCase = true) &&
+                                !normalizedNext.contains("/login", ignoreCase = true)
+                            ) {
+                                return@use normalizedNext
+                            }
+                            return@use null
+                        }
+                        return@use absolute
+                    }
+
+                    if (response.isSuccessful && current.contains("/share/", ignoreCase = true)) {
+                        val html = response.body?.string()?.take(65_536).orEmpty()
+                        val canonical = Regex(
+                            """(?:property=["']og:url["'][^>]+content=["']|rel=["']canonical["'][^>]+href=["'])(https?://[^"']+)["']""",
+                            RegexOption.IGNORE_CASE,
+                        ).find(html)?.groupValues?.getOrNull(1)
+                        if (!canonical.isNullOrBlank() &&
+                            !canonical.contains("/login", ignoreCase = true) &&
+                            !canonical.contains("/share/", ignoreCase = true)
+                        ) {
+                            return@use canonical
+                        }
+                    }
+                    null
                 }
+            }.getOrNull()
+
+            if (nextUrl.isNullOrBlank() || nextUrl == current) break
+            current = nextUrl
+            if (Regex("""instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/[A-Za-z0-9_-]+""", RegexOption.IGNORE_CASE)
+                    .containsMatchIn(current)
+            ) {
+                break
             }
-        }.getOrDefault(url)
+        }
+        return current
     }
 }

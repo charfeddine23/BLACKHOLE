@@ -1,7 +1,9 @@
 package com.example.vault.browser
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Build
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebSettings
@@ -13,7 +15,7 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Privacy-first WebView configuration enforcing consistent User-Agent identity,
- * form-data suppression, third-party cookie isolation, and ephemeral caching.
+ * form-data suppression, ephemeral cleanup on disposal, and full HTML5/MSE/HLS/DASH video playback.
  */
 object SafeWebViewConfig {
 
@@ -21,49 +23,60 @@ object SafeWebViewConfig {
      * Consistent, standard Android Chrome Mobile User-Agent (zero randomized spoofing).
      */
     const val STANDARD_ANDROID_CHROME_USER_AGENT: String =
-        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
     fun resolveConsistentUserAgent(context: Context): String {
         val systemUa = runCatching { WebSettings.getDefaultUserAgent(context) }.getOrNull().orEmpty()
         return if (systemUa.contains("Chrome/", ignoreCase = true) && systemUa.contains("Mobile", ignoreCase = true)) {
-            systemUa.replace("; wv)", ")")
+            systemUa
+                .replace("; wv)", ")")
+                .replace("; wv;", ";")
+                .replace(Regex("""\s+Version/\d+\.\d+"""), "")
         } else {
             STANDARD_ANDROID_CHROME_USER_AGENT
         }
     }
 
+    fun createDarkVideoPosterBitmap(): Bitmap {
+        return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(android.graphics.Color.parseColor("#050709"))
+        }
+    }
+
     fun configure(
         webView: WebView,
-        isEphemeralSession: Boolean = true,
+        @Suppress("UNUSED_PARAMETER") isEphemeralSession: Boolean = true,
     ) {
         val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull()
         runCatching {
-            cookieManager?.setAcceptCookie(!isEphemeralSession)
-            cookieManager?.setAcceptThirdPartyCookies(webView, false)
+            // Allow cookies inside the isolated WebView sandbox so video CDNs & HTML5 players stream properly;
+            // EphemeralSessionManager still wipes cookies/storage on exit, and cookies are NEVER forwarded externally.
+            cookieManager?.setAcceptCookie(true)
+            cookieManager?.setAcceptThirdPartyCookies(webView, true)
+        }
+
+        runCatching {
+            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         }
 
         webView.settings.apply {
             javaScriptEnabled = true
             javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(false)
-            domStorageEnabled = !isEphemeralSession
-            databaseEnabled = !isEphemeralSession
+            domStorageEnabled = true
+            databaseEnabled = true
             @Suppress("DEPRECATION")
             saveFormData = false
-            cacheMode = if (isEphemeralSession) {
-                WebSettings.LOAD_NO_CACHE
-            } else {
-                WebSettings.LOAD_DEFAULT
-            }
+            cacheMode = WebSettings.LOAD_DEFAULT
             useWideViewPort = true
             loadWithOverviewMode = true
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
-            mediaPlaybackRequiresUserGesture = true
-            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            mediaPlaybackRequiresUserGesture = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             allowFileAccess = false
-            allowContentAccess = false
+            allowContentAccess = true
             userAgentString = resolveConsistentUserAgent(webView.context)
         }
     }

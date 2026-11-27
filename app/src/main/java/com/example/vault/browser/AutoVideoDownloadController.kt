@@ -3,6 +3,10 @@ package com.example.vault.browser
 import android.annotation.SuppressLint
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import com.example.engine.extractor.MetaVideoPowerExtractor
+import com.example.engine.extractor.VideoStreamExtractor
+import com.example.engine.model.ExtractionResult
+import com.example.engine.model.PlatformBadge
 import com.example.vault.data.VaultDownloadEvent
 import com.example.vault.data.VaultVideoDownloader
 import kotlinx.coroutines.CancellationException
@@ -79,6 +83,8 @@ sealed interface PageStreamResolution {
         val streamUrl: String,
         val title: String,
         val qualityLabel: String = "",
+        val audioStreamUrl: String? = null,
+        val headers: Map<String, String> = emptyMap(),
     ) : PageStreamResolution
 
     data class UnsupportedOrDrm(
@@ -187,6 +193,30 @@ class YtDlpAndPublicPageResolver(
             }
         }
 
+        // Cookie-free Meta & multi-platform public stream extractor fallback (never uses account cookies)
+        val platform = PlatformBadge.fromUrl(sanitizedPageUrl)
+        if (platform == PlatformBadge.INSTAGRAM || platform == PlatformBadge.FACEBOOK) {
+            val metaExtractor = MetaVideoPowerExtractor(okHttpClient, cookieVault = null)
+            val outcome = runCatching {
+                if (platform == PlatformBadge.INSTAGRAM) {
+                    metaExtractor.extractInstagram(sanitizedPageUrl)
+                } else {
+                    metaExtractor.extractFacebook(sanitizedPageUrl)
+                }
+            }.getOrNull()
+            val bestMeta = outcome?.streams
+                ?.firstOrNull { !it.isHls && it.streamUrl.startsWith("http", ignoreCase = true) }
+            if (bestMeta != null) {
+                return@withContext PageStreamResolution.Resolved(
+                    streamUrl = bestMeta.streamUrl,
+                    title = bestMeta.title.ifBlank { "Vault_Video" },
+                    qualityLabel = bestMeta.qualityLabel,
+                    audioStreamUrl = bestMeta.audioStreamUrl,
+                    headers = bestMeta.headers.filterKeys { !it.equals("Cookie", ignoreCase = true) },
+                )
+            }
+        }
+
         // Cookie-free public HTML inspection for OpenGraph / direct <video> URLs
         val request = Request.Builder()
             .url(sanitizedPageUrl)
@@ -211,6 +241,56 @@ class YtDlpAndPublicPageResolver(
                 httpStatusCode = statusCode,
             )
         }
+        if (statusCode in 200..299 && html.isNotBlank()) {
+            if (html.contains("widevine", ignoreCase = true) ||
+                html.contains("com.widevine.alpha", ignoreCase = true) ||
+                html.contains("playready", ignoreCase = true)
+            ) {
+                return@withContext PageStreamResolution.UnsupportedOrDrm(
+                    "Detected DRM-protected player configuration on this page.",
+                )
+            }
+
+            val ogVideo = extractMetaContent(html, "og:video:secure_url")
+                ?: extractMetaContent(html, "og:video:url")
+                ?: extractMetaContent(html, "og:video")
+                ?: extractMetaContent(html, "twitter:player:stream")
+                ?: extractDirectMp4FromHtml(html)
+
+            val pageTitle = extractMetaContent(html, "og:title")
+                ?: Regex("""<title[^>]*>([^<]+)</title>""", RegexOption.IGNORE_CASE)
+                    .find(html)?.groupValues?.getOrNull(1)?.trim()
+                ?: "Vault_Video"
+
+            val cleanMediaUrl = ogVideo?.trim()?.replace("&amp;", "&").orEmpty()
+            if (cleanMediaUrl.startsWith("http://", ignoreCase = true) ||
+                cleanMediaUrl.startsWith("https://", ignoreCase = true)
+            ) {
+                return@withContext PageStreamResolution.Resolved(
+                    streamUrl = cleanMediaUrl,
+                    title = pageTitle,
+                )
+            }
+        }
+
+        // General cookie-free public extractor fallback for supported public platforms
+        val publicExtractor = VideoStreamExtractor(okHttpClient, webViewSniffer = null, cookieVault = null)
+        val publicResult = runCatching { publicExtractor.extractHighestQuality(sanitizedPageUrl) }.getOrNull()
+        if (publicResult is ExtractionResult.Success) {
+            val bestPublic = publicResult.candidates
+                .firstOrNull { !it.isHls && it.streamUrl.startsWith("http", ignoreCase = true) }
+                ?: publicResult.bestStream.takeIf { !it.isHls && it.streamUrl.startsWith("http", ignoreCase = true) }
+            if (bestPublic != null) {
+                return@withContext PageStreamResolution.Resolved(
+                    streamUrl = bestPublic.streamUrl,
+                    title = bestPublic.title.ifBlank { "Vault_Video" },
+                    qualityLabel = bestPublic.qualityLabel,
+                    audioStreamUrl = bestPublic.audioStreamUrl,
+                    headers = bestPublic.headers.filterKeys { !it.equals("Cookie", ignoreCase = true) },
+                )
+            }
+        }
+
         if (statusCode !in 200..299 || html.isBlank()) {
             return@withContext PageStreamResolution.Failed(
                 reason = if (backendEndpoint.isBlank()) {
@@ -219,36 +299,6 @@ class YtDlpAndPublicPageResolver(
                     "Page resolution failed (HTTP $statusCode)."
                 },
                 httpStatusCode = statusCode,
-            )
-        }
-
-        if (html.contains("widevine", ignoreCase = true) ||
-            html.contains("com.widevine.alpha", ignoreCase = true) ||
-            html.contains("playready", ignoreCase = true)
-        ) {
-            return@withContext PageStreamResolution.UnsupportedOrDrm(
-                "Detected DRM-protected player configuration on this page.",
-            )
-        }
-
-        val ogVideo = extractMetaContent(html, "og:video:secure_url")
-            ?: extractMetaContent(html, "og:video:url")
-            ?: extractMetaContent(html, "og:video")
-            ?: extractMetaContent(html, "twitter:player:stream")
-            ?: extractDirectMp4FromHtml(html)
-
-        val pageTitle = extractMetaContent(html, "og:title")
-            ?: Regex("""<title[^>]*>([^<]+)</title>""", RegexOption.IGNORE_CASE)
-                .find(html)?.groupValues?.getOrNull(1)?.trim()
-            ?: "Vault_Video"
-
-        val cleanMediaUrl = ogVideo?.trim()?.replace("&amp;", "&").orEmpty()
-        if (cleanMediaUrl.startsWith("http://", ignoreCase = true) ||
-            cleanMediaUrl.startsWith("https://", ignoreCase = true)
-        ) {
-            return@withContext PageStreamResolution.Resolved(
-                streamUrl = cleanMediaUrl,
-                title = pageTitle,
             )
         }
 
@@ -563,6 +613,8 @@ class AutoVideoDownloadController(
                             streamUrl = resolvedUrl,
                             refererOrigin = cleanOrigin,
                             suggestedTitle = resolvedTitle,
+                            audioStreamUrl = resolved.audioStreamUrl,
+                            extraHeaders = resolved.headers,
                         ).collect { event ->
                             when (event) {
                                 is VaultDownloadEvent.Starting -> {

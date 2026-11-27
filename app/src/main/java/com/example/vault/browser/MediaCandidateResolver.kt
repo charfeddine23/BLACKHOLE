@@ -433,6 +433,8 @@ class MediaCandidateResolver(
             } else if (
                 extractor.looksLikeHlsUrl(rawUrl) ||
                 extractor.looksLikeDownloadableVideoUrl(rawUrl) ||
+                rawUrl.contains("cdninstagram.com", ignoreCase = true) ||
+                rawUrl.contains("fbcdn.net", ignoreCase = true) ||
                 rawUrl in verifiedLiveUrls
             ) {
                 val isHls = extractor.looksLikeHlsUrl(rawUrl)
@@ -440,7 +442,9 @@ class MediaCandidateResolver(
                 val needsAudio = !isHls && fallbackAudio != null && (
                     rawUrl.contains("mime=video", ignoreCase = true) ||
                         platform == PlatformBadge.YOUTUBE ||
-                        MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(rawUrl)
+                        MetaVideoPowerExtractor.isMetaVideoOnlyDashUrl(rawUrl) ||
+                        ((platform == PlatformBadge.INSTAGRAM || platform == PlatformBadge.FACEBOOK) &&
+                            !MetaVideoPowerExtractor.isMetaProgressiveUrl(rawUrl))
                     )
                 out.add(
                     ExtractedStream(

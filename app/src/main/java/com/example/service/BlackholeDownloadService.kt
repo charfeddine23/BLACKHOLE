@@ -25,6 +25,7 @@ import com.example.data.local.DownloadedVideoEntity
 import com.example.data.repository.VideoVaultRepository
 import com.example.engine.UniversalDownloader
 import com.example.engine.cookies.CookieVaultManager
+import com.example.engine.extractor.MetaVideoPowerExtractor
 import com.example.engine.extractor.VideoStreamExtractor
 import com.example.engine.extractor.WebViewStreamSniffer
 import com.example.engine.media.HlsSegmentDownloader
@@ -146,17 +147,36 @@ class BlackholeDownloadService : Service() {
                     val candidatesToTry = extraction.candidates.ifEmpty { listOf(extraction.bestStream) }.take(6)
                     val fallbackAudioUrl = extraction.candidates.firstNotNullOfOrNull { it.audioStreamUrl }
                     var completed = false
+                    var silentBackup: Pair<File, ExtractedStream>? = null
                     for ((index, candidate) in candidatesToTry.withIndex()) {
-                        val hasLaterCandidate = index < candidatesToTry.lastIndex
-                        if (streamAndSaveVideo(
-                                sourceUrl = routed.canonicalUrl,
-                                stream = candidate,
-                                fallbackAudioUrl = fallbackAudioUrl,
-                                rejectSilentMetaVideo = hasLaterCandidate,
-                            )
-                        ) {
+                        val remainingMayHaveAudio = candidatesToTry.drop(index + 1).any {
+                            !it.audioStreamUrl.isNullOrBlank() || MetaVideoPowerExtractor.isMetaProgressiveUrl(it.streamUrl)
+                        }
+                        val saved = streamAndSaveVideo(
+                            sourceUrl = routed.canonicalUrl,
+                            stream = candidate,
+                            fallbackAudioUrl = fallbackAudioUrl,
+                            rejectSilentMetaVideo = remainingMayHaveAudio,
+                            onSilentBackup = { file, st ->
+                                if (silentBackup == null) {
+                                    silentBackup = file to st
+                                } else {
+                                    runCatching { file.delete() }
+                                }
+                            },
+                        )
+                        if (saved) {
                             completed = true
+                            silentBackup?.first?.let { runCatching { it.delete() } }
+                            silentBackup = null
                             break
+                        }
+                    }
+                    if (!completed && silentBackup != null) {
+                        val (backupFile, backupStream) = silentBackup!!
+                        if (backupFile.exists() && backupFile.length() > 4_096L) {
+                            finalizeDownloadedFile(routed.canonicalUrl, backupStream, backupFile)
+                            completed = true
                         }
                     }
                     if (!completed && DownloadStateCoordinator.telemetry.value.phase !=
@@ -194,6 +214,7 @@ class BlackholeDownloadService : Service() {
         stream: ExtractedStream,
         fallbackAudioUrl: String? = null,
         rejectSilentMetaVideo: Boolean = false,
+        onSilentBackup: ((File, ExtractedStream) -> Unit)? = null,
     ): Boolean {
         val extension = if (stream.isHls) "mp4" else extensionForMime(stream.mimeType)
         val safeFileBase = stream.title
@@ -236,7 +257,7 @@ class BlackholeDownloadService : Service() {
             }
         }
 
-        if (!succeeded || !localFile.exists() || localFile.length() <= 0L) {
+        if (!succeeded || !localFile.exists() || localFile.length() <= 4_096L) {
             localFile.delete()
             return false
         }
@@ -268,11 +289,25 @@ class BlackholeDownloadService : Service() {
                 }
             }
             if (!recoveredAudio && rejectSilentMetaVideo) {
-                localFile.delete()
+                if (onSilentBackup != null) {
+                    onSilentBackup(localFile, stream)
+                } else {
+                    localFile.delete()
+                }
                 return false
             }
         }
 
+        finalizeDownloadedFile(sourceUrl, stream, localFile)
+        return true
+    }
+
+    private suspend fun finalizeDownloadedFile(
+        sourceUrl: String,
+        stream: ExtractedStream,
+        localFile: File,
+    ) {
+        val fileName = localFile.name
         val exportedUri = exportToMediaStoreIfSupported(localFile, fileName, stream.mimeType)
         val contentUri = exportedUri ?: FileProvider.getUriForFile(
             applicationContext,
@@ -309,7 +344,6 @@ class BlackholeDownloadService : Service() {
             title = "Captured in Vault",
             text = "${stream.title} (${stream.qualityLabel})",
         )
-        return true
     }
 
     private suspend fun downloadHlsStream(

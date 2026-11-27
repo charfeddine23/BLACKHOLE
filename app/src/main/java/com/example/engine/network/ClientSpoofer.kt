@@ -99,7 +99,15 @@ object ClientSpoofer {
         streamUrl: String,
         streamHeaders: Map<String, String>,
     ): Map<String, String> {
-        val sanitizedStreamHeaders = streamHeaders.filterKeys { !it.equals("Cookie", ignoreCase = true) }
+        val lower = streamUrl.lowercase()
+        val isMediaCdn = lower.contains("cdninstagram.com") ||
+            lower.contains("fbcdn.net") ||
+            lower.contains("googlevideo.com") ||
+            lower.contains("tiktokcdn.com")
+        val sanitizedStreamHeaders = streamHeaders.filterKeys { key ->
+            !key.equals("Cookie", ignoreCase = true) &&
+                (!isMediaCdn || (!key.startsWith("Sec-CH-UA", ignoreCase = true) && !key.equals("Origin", ignoreCase = true)))
+        }
         val ua = sanitizedStreamHeaders["User-Agent"].orEmpty()
         if (ua.isNotBlank()) {
             val out = LinkedHashMap<String, String>(sanitizedStreamHeaders)
@@ -108,6 +116,9 @@ object ClientSpoofer {
             out.putIfAbsent("Referer", refererForUrl(streamUrl))
             return out
         }
-        return buildHeadersForUrl(streamUrl, profiles.first()) + sanitizedStreamHeaders
+        return buildHeadersForUrl(streamUrl, profiles.first())
+            .filterKeys { key ->
+                !isMediaCdn || (!key.startsWith("Sec-CH-UA", ignoreCase = true) && !key.equals("Origin", ignoreCase = true))
+            } + sanitizedStreamHeaders
     }
 }
